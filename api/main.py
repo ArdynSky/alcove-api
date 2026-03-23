@@ -17,6 +17,7 @@ app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
+        
         "http://127.0.0.1:5500",
         "http://localhost:5500",
         "https://euphonious-banoffee-1c8215.netlify.app",
@@ -216,8 +217,8 @@ class DownloadFailedPayload(BaseModel):
 
 
 class ManualReadyPayload(BaseModel):
-    local_filename: str
-    local_path: str
+    local_filename: str = ""
+    local_path: str = ""
     video_title: str | None = None
 
 
@@ -312,13 +313,17 @@ def entry_is_download_ready(entry: dict) -> bool:
     return entry.get("download_status") in {"ready", "manual_ready"}
 
 
+def entry_is_spin_eligible(entry: dict) -> bool:
+    """An entry is eligible for the wheel spin if it was approved by the host and hasn't been played yet."""
+    return entry.get("approval_status") == "approved" and not entry.get("played", False)
+
+
 def get_ready_unplayed_entries(round_number: int):
     return [
         entry
         for entry in wheel_entries
         if entry.get("round_id") == round_number
-        and not entry.get("played", False)
-        and entry_is_download_ready(entry)
+        and entry_is_spin_eligible(entry)
     ]
 
 
@@ -837,8 +842,8 @@ def set_spin_result(payload: dict):
     if not entry:
         return {"status": "error", "message": "winner entry not found"}
 
-    if not entry_is_download_ready(entry):
-        return {"status": "error", "message": "winner is not download-ready"}
+    if not entry_is_spin_eligible(entry):
+        return {"status": "error", "message": "winner entry is not approved or has already been played"}
 
     current_winner = {
         "entry_id": entry["id"],
