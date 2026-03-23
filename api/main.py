@@ -14,6 +14,8 @@ from websocket_manager import manager
 
 app = FastAPI()
 
+API_BUILD = "2026-03-23.1"
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -407,7 +409,7 @@ async def websocket_endpoint(websocket: WebSocket):
 
 @app.get("/")
 def root():
-    return {"status": "Alcove API running"}
+    return {"status": "Alcove API running", "build": API_BUILD}
 
 
 @app.get("/api/app-state")
@@ -426,6 +428,7 @@ def get_app_state():
     )
 
     return {
+        "build": API_BUILD,
         "current_round": current_round,
         "round_status": state["round_status"],
         "modules": state["modules"],
@@ -1109,6 +1112,14 @@ def approve_entry(entry_id: int):
     
     entry["approval_status"] = "approved"
     entry["approval_time"] = now_iso()
+    # For domains configured without auto-download, immediately make the entry
+    # wheel-eligible so approved submissions are not blocked in pending state.
+    domain_cfg = get_domain_config(entry.get("submitted_url") or "") or {}
+    if not domain_cfg.get("auto_download", False):
+        entry["download_status"] = "manual_ready"
+        entry["download_error"] = None
+        entry["download_method"] = "manual"
+        entry["download_completed_at"] = now_iso()
     add_notification("system", f"Entry approved: {entry['data'].get('display_name', 'Unknown')}", False)
     ws_broadcast_bundle()
     
