@@ -1458,6 +1458,12 @@ def submit_spotlight(entry: SpotlightEntry):
     if not nominee:
         return {"status": "error", "message": "That user is not a verified Alcove resident."}
 
+    if not entry.nominator_user_id and not entry.nominator_username:
+        return {
+            "status": "error",
+            "message": "Could not identify who submitted this Spotlight. Please open the Mini App from Telegram and try again.",
+        }
+
     nominator = find_verified_alcove_user(entry.nominator_user_id, entry.nominator_username)
     if entry.nominator_user_id and nominee.get("user_id") == entry.nominator_user_id:
         return {"status": "error", "message": "You cannot nominate yourself."}
@@ -1482,6 +1488,13 @@ def submit_spotlight(entry: SpotlightEntry):
         data["nominator_user_id"] = nominator.get("user_id")
         data["nominator_username"] = nominator.get("username")
         data["nominator_display_name"] = nominator.get("display_name") or nominator.get("label")
+    else:
+        data["nominator_user_id"] = entry.nominator_user_id
+        data["nominator_username"] = (entry.nominator_username or "").lstrip("@") or None
+        data["nominator_display_name"] = (
+            entry.nominator_display_name
+            or (f"@{entry.nominator_username.lstrip('@')}" if entry.nominator_username else None)
+        )
     spotlight_entries.append(data)
     add_notification("spotlight", f"Spotlight submitted for {entry.nominee_display_name}", False)
     return {"status": "ok", "spotlight_id": data["id"], "spotlights": len(spotlight_entries)}
