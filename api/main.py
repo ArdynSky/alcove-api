@@ -3,6 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from urllib.parse import urlparse
 from pathlib import Path
+from zoneinfo import ZoneInfo
 import datetime
 import os
 import shutil
@@ -156,6 +157,8 @@ archived_wheel_entries = []
 asmr_entries = []
 story_entries = []
 spotlight_entries = []
+pulse_entries = []
+pulse_receipts = []
 synced_alcove_users = []
 synced_alcove_analytics = {}
 last_bot_sync_at = None
@@ -171,6 +174,8 @@ notification_feed = []
 wheel_submission_limits = {}
 muted_users = set()
 current_winner = None
+PULSE_HEAT_THRESHOLD = int(os.getenv("PULSE_HEAT_THRESHOLD", "50"))
+UK_TZ = ZoneInfo("Europe/London")
 
 state = {
     "current_round": 1,
@@ -197,6 +202,23 @@ DEFAULT_FEATURE_FLAGS = {
         "spotlight": True,
         "pulse": True,
     },
+}
+
+PULSE_QUESTIONS = {
+    "green": [
+        "What has helped you feel a little steadier recently?",
+        "What is one small thing you wish someone had told you earlier?",
+        "What helps you feel more connected when you feel distant?",
+        "What is one kind thing you are trying to practise with yourself?",
+        "What helps you get through a difficult hour?",
+    ],
+    "red": [
+        "What is one honest thing you want to say without being identified?",
+        "What do you wish people understood about temptation or craving?",
+        "What helps you pause before chasing a risky impulse?",
+        "What does support look like when things feel intense?",
+        "What would you say to someone trying not to spiral tonight?",
+    ],
 }
 
 # ---------------------------------
@@ -266,6 +288,20 @@ class SpotlightEntry(BaseModel):
     nominator_display_name: str | None = None
 
 
+class PulseEntry(BaseModel):
+    user_id: int | None = None
+    username: str | None = None
+    display_name: str | None = None
+    pulse_type: str = "green"
+    question: str
+    answer: str
+
+
+class PulseReceiptAck(BaseModel):
+    user_id: int | None = None
+    username: str | None = None
+
+
 class BotSyncPayload(BaseModel):
     users: list[dict] = []
     analytics: dict = {}
@@ -292,6 +328,23 @@ class FeatureFlagsUpdate(BaseModel):
 
 def now_iso() -> str:
     return datetime.datetime.utcnow().isoformat()
+
+
+def uk_now() -> datetime.datetime:
+    return datetime.datetime.now(UK_TZ)
+
+
+def pulse_day_key(at: datetime.datetime | None = None) -> str:
+    return (at or uk_now()).strftime("%Y-%m-%d")
+
+
+def pulse_day_label(day_key: str | None = None) -> str:
+    raw = day_key or pulse_day_key()
+    try:
+        parsed = datetime.date.fromisoformat(raw)
+    except ValueError:
+        return raw
+    return parsed.strftime("%d %B %Y")
 
 
 def verify_bot_sync_secret(x_bot_sync_secret: str | None):
@@ -541,6 +594,145 @@ def find_verified_alcove_user(user_id=None, username=None):
             return user
         if username and (user.get("username") or "").lower() == username:
             return user
+    return None
+
+
+def clean_username(username: str | None) -> str | None:
+    cleaned = (username or "").strip().lstrip("@")
+    return cleaned or None
+
+
+def pulse_user_identity(user_id=None, username=None):
+    user = find_verified_alcove_user(user_id, username)
+    if user:
+        return user
+    if not user_id and not username:
+        return None
+    return {
+        "user_id": user_id,
+        "username": clean_username(username),
+        "display_name": clean_username(username) or str(user_id or "Unknown"),
+        "label": f"@{clean_username(username)}" if clean_username(username) else str(user_id or "Unknown"),
+    }
+
+
+def pulse_entries_for_day(day_key: str | None = None):
+    day = day_key or pulse_day_key()
+    return [entry for entry in pulse_entries if entry.get("day_key") == day]
+
+
+def pulse_sent_today_count(day_key: str | None = None):
+    return len(pulse_entries_for_day(day_key))
+
+
+def pulse_base_green_slots(now: datetime.datetime | None = None):
+    current = now or uk_now()
+    return 2 if current.hour >= 12 else 1
+
+
+def pulse_heat_unlocked(day_key: str | None = None):
+    return pulse_sent_today_count(day_key) >= PULSE_HEAT_THRESHOLD
+
+
+def pulse_user_sent_entries(user_id, username=None, day_key: str | None = None):
+    day = day_key or pulse_day_key()
+    uname = (username or "").lower().lstrip("@")
+    rows = []
+    for entry in pulse_entries_for_day(day):
+        if user_id is not None and int(entry.get("sender_user_id") or 0) == int(user_id):
+            rows.append(entry)
+        elif uname and (entry.get("sender_username") or "").lower() == uname:
+            rows.append(entry)
+    return rows
+
+
+def pulse_slot_state(user_id=None, username=None, now: datetime.datetime | None = None):
+    current = now or uk_now()
+    day = pulse_day_key(current)
+    sent = pulse_user_sent_entries(user_id, username, day)
+    green_used = len([entry for entry in sent if entry.get("pulse_type") == "green"])
+    red_used = len([entry for entry in sent if entry.get("pulse_type") == "red"])
+    green_total = pulse_base_green_slots(current)
+    red_unlocked = pulse_heat_unlocked(day)
+    return {
+        "day_key": day,
+        "day_label": pulse_day_label(day),
+        "green_total": green_total,
+        "green_used": green_used,
+        "green_available": max(green_total - green_used, 0),
+        "red_unlocked": red_unlocked,
+        "red_used": red_used,
+        "red_available": 1 if red_unlocked and red_used == 0 else 0,
+        "sent_today": pulse_sent_today_count(day),
+        "heat_threshold": PULSE_HEAT_THRESHOLD,
+        "next_green_unlock_at": "12:00" if current.hour < 12 else None,
+    }
+
+
+def public_pulse_payload(entry):
+    if not entry:
+        return None
+    return {
+        "pulse_id": entry.get("id"),
+        "pulse_type": entry.get("pulse_type"),
+        "question": entry.get("question"),
+        "answer": entry.get("answer"),
+        "sent_at": entry.get("sent_at"),
+        "day_key": entry.get("day_key"),
+    }
+
+
+def pulse_receipts_for_user(user_id=None, username=None):
+    uname = (username or "").lower().lstrip("@")
+    rows = []
+    for receipt in pulse_receipts:
+        if user_id is not None and int(receipt.get("recipient_user_id") or 0) == int(user_id):
+            rows.append(receipt)
+        elif uname and (receipt.get("recipient_username") or "").lower() == uname:
+            rows.append(receipt)
+    return rows
+
+
+def pulse_receipt_payload(receipt):
+    entry = next((item for item in pulse_entries if item.get("id") == receipt.get("pulse_id")), None)
+    payload = public_pulse_payload(entry)
+    if not payload:
+        return None
+    payload.update({
+        "receipt_id": receipt.get("id"),
+        "received_at": receipt.get("received_at"),
+        "acknowledged_at": receipt.get("acknowledged_at"),
+    })
+    return payload
+
+
+def pulse_match_next_receiver(receiver):
+    day = pulse_day_key()
+    receiver_id = receiver.get("user_id")
+    receiver_username = (receiver.get("username") or "").lower()
+    for entry in pulse_entries:
+        if entry.get("day_key") != day or entry.get("status") != "queued":
+            continue
+        if receiver_id is not None and int(entry.get("sender_user_id") or 0) == int(receiver_id):
+            continue
+        if receiver_username and (entry.get("sender_username") or "").lower() == receiver_username:
+            continue
+        entry["status"] = "delivered"
+        entry["delivered_to_user_id"] = receiver.get("user_id")
+        entry["delivered_to_username"] = receiver.get("username")
+        entry["delivered_to_display_name"] = receiver.get("display_name") or receiver.get("label")
+        entry["delivered_at"] = now_iso()
+        receipt = {
+            "id": len(pulse_receipts) + 1,
+            "pulse_id": entry.get("id"),
+            "recipient_user_id": receiver.get("user_id"),
+            "recipient_username": receiver.get("username"),
+            "recipient_display_name": receiver.get("display_name") or receiver.get("label"),
+            "received_at": entry["delivered_at"],
+            "acknowledged_at": None,
+        }
+        pulse_receipts.append(receipt)
+        return receipt
     return None
 
 
@@ -1617,6 +1809,115 @@ def bot_update_spotlight(entry_id: int, payload: SpotlightReviewUpdate, x_bot_sy
         entry["reviewed_at"] = payload.reviewed_at
 
     return {"status": "ok", "entry": entry}
+
+
+@app.get("/api/pulse-questions")
+def get_pulse_questions():
+    return {
+        "status": "ok",
+        "questions": PULSE_QUESTIONS,
+        "heat_threshold": PULSE_HEAT_THRESHOLD,
+    }
+
+
+@app.get("/api/pulse-status")
+def get_pulse_status(user_id: int | None = None, username: str | None = None):
+    identity = pulse_user_identity(user_id, username)
+    if not identity:
+        return {"status": "error", "message": "Could not identify this Pulse user."}
+
+    slots = pulse_slot_state(identity.get("user_id"), identity.get("username"))
+    receipts = [
+        payload for payload in (pulse_receipt_payload(receipt) for receipt in pulse_receipts_for_user(identity.get("user_id"), identity.get("username")))
+        if payload
+    ]
+    sent = [
+        public_pulse_payload(entry)
+        for entry in pulse_user_sent_entries(identity.get("user_id"), identity.get("username"))
+    ]
+    return {
+        "status": "ok",
+        "user": identity,
+        "slots": slots,
+        "received": receipts,
+        "sent": sent,
+        "pending_queue": len([entry for entry in pulse_entries_for_day() if entry.get("status") == "queued"]),
+    }
+
+
+@app.post("/api/pulse-entry")
+def submit_pulse(entry: PulseEntry):
+    identity = pulse_user_identity(entry.user_id, entry.username)
+    if not identity:
+        return {"status": "error", "message": "Could not identify your Telegram account. Please open the Mini App from Telegram and try again."}
+
+    pulse_type = (entry.pulse_type or "green").strip().lower()
+    if pulse_type not in ("green", "red"):
+        return {"status": "error", "message": "Unknown Pulse type."}
+
+    answer = (entry.answer or "").strip()
+    question = (entry.question or "").strip()
+    if len(answer) < 3:
+        return {"status": "error", "message": "Please add a little more before sending your Pulse."}
+    if question not in PULSE_QUESTIONS[pulse_type]:
+        return {"status": "error", "message": "Please choose one of the current Pulse questions."}
+
+    slots = pulse_slot_state(identity.get("user_id"), identity.get("username"))
+    if pulse_type == "green" and slots["green_available"] <= 0:
+        return {"status": "error", "message": "You do not have a green Pulse available right now."}
+    if pulse_type == "red" and slots["red_available"] <= 0:
+        return {"status": "error", "message": "A red Pulse is not available right now."}
+
+    data = {
+        "id": len(pulse_entries) + 1,
+        "day_key": pulse_day_key(),
+        "pulse_type": pulse_type,
+        "question": question,
+        "answer": answer,
+        "sender_user_id": identity.get("user_id"),
+        "sender_username": identity.get("username"),
+        "sender_display_name": identity.get("display_name") or identity.get("label"),
+        "sent_at": now_iso(),
+        "status": "queued",
+        "delivered_to_user_id": None,
+        "delivered_to_username": None,
+        "delivered_to_display_name": None,
+        "delivered_at": None,
+    }
+    pulse_entries.append(data)
+    received = pulse_match_next_receiver(identity)
+    updated_slots = pulse_slot_state(identity.get("user_id"), identity.get("username"))
+    add_notification("pulse", "Anonymous Pulse submitted", False)
+    return {
+        "status": "ok",
+        "pulse_id": data["id"],
+        "slots": updated_slots,
+        "received": pulse_receipt_payload(received) if received else None,
+        "queued": received is None,
+    }
+
+
+@app.post("/api/pulse-receipts/{receipt_id}/ack")
+def acknowledge_pulse_receipt(receipt_id: int, payload: PulseReceiptAck):
+    receipt = next((item for item in pulse_receipts if item.get("id") == receipt_id), None)
+    if not receipt:
+        return {"status": "error", "message": "Pulse receipt not found."}
+
+    identity = pulse_user_identity(payload.user_id, payload.username)
+    if not identity:
+        return {"status": "error", "message": "Could not identify this Pulse user."}
+    if identity.get("user_id") is not None and int(receipt.get("recipient_user_id") or 0) != int(identity.get("user_id")):
+        return {"status": "error", "message": "That Pulse is not assigned to you."}
+
+    receipt["acknowledged_at"] = now_iso()
+    return {"status": "ok", "receipt": pulse_receipt_payload(receipt)}
+
+
+@app.get("/api/bot-sync/pulses/pending")
+def bot_pending_pulses(x_bot_sync_secret: str | None = Header(default=None)):
+    verify_bot_sync_secret(x_bot_sync_secret)
+    queued = [entry for entry in pulse_entries_for_day() if entry.get("status") == "queued"]
+    return {"status": "ok", "entries": queued}
 
 
 @app.post("/api/asmr-entry")
