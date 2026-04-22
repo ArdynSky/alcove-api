@@ -11,7 +11,7 @@ import json
 import random
 import sqlite3
 from fastapi import Header, HTTPException, WebSocket, WebSocketDisconnect
-from websocket_manager import manager
+from .websocket_manager import manager
 
 app = FastAPI()
 
