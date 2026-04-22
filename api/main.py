@@ -9,17 +9,15 @@ import shutil
 import asyncio
 import json
 import random
-from fastapi import WebSocket, WebSocketDisconnect
+import sqlite3
+from fastapi import Header, HTTPException, WebSocket, WebSocketDisconnect
 from websocket_manager import manager
 
 app = FastAPI()
 
-API_BUILD = "2026-03-23.1"
-
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
-        
         "http://127.0.0.1:5500",
         "http://localhost:5500",
         "https://euphonious-banoffee-1c8215.netlify.app",
@@ -44,6 +42,11 @@ READY_DIR = os.path.join(ALCOVE_ROOT, "Ready")
 ARCHIVE_DIR = os.path.join(ALCOVE_ROOT, "Archive")
 PLAYOUT_DIR = os.path.join(ALCOVE_ROOT, "Playout")
 CURRENT_PICK_PATH = os.path.join(PLAYOUT_DIR, "current_pick.mp4")
+FOX_LOGS_DB_PATH = os.getenv(
+    "FOX_LOGS_DB_PATH",
+    os.path.join(ALCOVE_ROOT, "Bot-Review", "ALCOVE_FOX", "fox_logs.db"),
+)
+BOT_SYNC_SECRET = os.getenv("BOT_SYNC_SECRET", "")
 
 for path in [DOWNLOADS_DIR, READY_DIR, ARCHIVE_DIR, PLAYOUT_DIR]:
     os.makedirs(path, exist_ok=True)
@@ -148,6 +151,10 @@ wheel_entries = []
 archived_wheel_entries = []
 asmr_entries = []
 story_entries = []
+spotlight_entries = []
+synced_alcove_users = []
+synced_alcove_analytics = {}
+last_bot_sync_at = None
 
 current_now_playing = None
 video_reviews = []
@@ -219,13 +226,38 @@ class DownloadFailedPayload(BaseModel):
 
 
 class ManualReadyPayload(BaseModel):
-    local_filename: str = ""
-    local_path: str = ""
+    local_filename: str
+    local_path: str
     video_title: str | None = None
 
 
 class PayoutPayload(BaseModel):
     copy_from_path: str | None = None
+
+
+class SpotlightEntry(BaseModel):
+    nominee_user_id: int | None = None
+    nominee_username: str | None = None
+    nominee_display_name: str
+    reason: str
+    style: str
+    nominator_user_id: int | None = None
+    nominator_username: str | None = None
+    nominator_display_name: str | None = None
+
+
+class BotSyncPayload(BaseModel):
+    users: list[dict] = []
+    analytics: dict = {}
+    synced_at: str | None = None
+
+
+class SpotlightReviewUpdate(BaseModel):
+    status: str | None = None
+    edited_reason: str | None = None
+    review_message_sent: bool | None = None
+    reviewed_by: int | None = None
+    reviewed_at: str | None = None
 
 
 # ---------------------------------
@@ -234,6 +266,279 @@ class PayoutPayload(BaseModel):
 
 def now_iso() -> str:
     return datetime.datetime.utcnow().isoformat()
+
+
+def verify_bot_sync_secret(x_bot_sync_secret: str | None):
+    if not BOT_SYNC_SECRET:
+        raise HTTPException(status_code=503, detail="Bot sync secret is not configured")
+    if x_bot_sync_secret != BOT_SYNC_SECRET:
+        raise HTTPException(status_code=403, detail="Invalid bot sync secret")
+
+
+def fox_db_rows(query: str, params=()):
+    if not os.path.exists(FOX_LOGS_DB_PATH):
+        return []
+
+    try:
+        with sqlite3.connect(FOX_LOGS_DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            ensure_fox_read_tables(conn)
+            return [dict(row) for row in conn.execute(query, params).fetchall()]
+    except sqlite3.Error:
+        return []
+
+
+def ensure_fox_read_tables(conn):
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS user_profiles (
+            user_id INTEGER PRIMARY KEY,
+            username TEXT,
+            first_name TEXT,
+            last_name TEXT,
+            display_name TEXT,
+            first_seen TEXT,
+            last_seen TEXT,
+            verified_at TEXT,
+            source TEXT
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS verified_users (
+            user_id INTEGER PRIMARY KEY,
+            verified_at TEXT
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS messages (
+            message_id INTEGER PRIMARY KEY,
+            user_id INTEGER,
+            timestamp TEXT,
+            contains_link INTEGER
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS link_violations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            message_id INTEGER,
+            user_id INTEGER,
+            username TEXT,
+            display_name TEXT,
+            message_excerpt TEXT,
+            link_samples TEXT,
+            logged_at TEXT
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS tone_flags (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            message_id INTEGER,
+            user_id INTEGER,
+            username TEXT,
+            display_name TEXT,
+            categories TEXT,
+            severity TEXT,
+            score INTEGER,
+            matched_terms TEXT,
+            message_excerpt TEXT,
+            logged_at TEXT
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS user_strikes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            admin_user_id INTEGER,
+            reason TEXT,
+            active INTEGER DEFAULT 1,
+            created_at TEXT,
+            removed_at TEXT,
+            removed_by INTEGER
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS captcha_attempts (
+            user_id INTEGER,
+            attempt_time TEXT,
+            success INTEGER
+        )
+        """
+    )
+    conn.commit()
+
+
+def fox_db_value(query: str, params=(), default=0):
+    rows = fox_db_rows(query, params)
+    if not rows:
+        return default
+    value = next(iter(rows[0].values()))
+    return default if value is None else value
+
+
+def period_start(period: str):
+    now = datetime.datetime.utcnow()
+    if period == "today":
+        return datetime.datetime(now.year, now.month, now.day).isoformat()
+    if period == "week":
+        return (now - datetime.timedelta(days=7)).isoformat()
+    return None
+
+
+def since_clause(column: str, since: str | None):
+    if not since:
+        return "", ()
+    return f" WHERE {column} >= ?", (since,)
+
+
+def get_verified_alcove_users():
+    if synced_alcove_users:
+        return synced_alcove_users
+
+    rows = fox_db_rows(
+        """
+        SELECT
+            p.user_id,
+            COALESCE(p.username, '') AS username,
+            COALESCE(p.display_name, '') AS display_name,
+            COALESCE(p.first_name, '') AS first_name,
+            COALESCE(p.last_name, '') AS last_name,
+            COALESCE(p.first_seen, '') AS first_seen,
+            COALESCE(p.last_seen, '') AS last_seen,
+            COALESCE(p.verified_at, v.verified_at, '') AS verified_at,
+            COALESCE(p.source, '') AS source,
+            COALESCE(m.message_count, 0) AS message_count,
+            COALESCE(l.link_count, 0) AS link_attempts,
+            COALESCE(t.tone_count, 0) AS tone_flags,
+            COALESCE(s.active_strikes, 0) AS active_strikes
+        FROM user_profiles p
+        JOIN verified_users v ON v.user_id = p.user_id
+        LEFT JOIN (
+            SELECT user_id, COUNT(*) AS message_count
+            FROM messages
+            GROUP BY user_id
+        ) m ON m.user_id = p.user_id
+        LEFT JOIN (
+            SELECT user_id, COUNT(*) AS link_count
+            FROM link_violations
+            GROUP BY user_id
+        ) l ON l.user_id = p.user_id
+        LEFT JOIN (
+            SELECT user_id, COUNT(*) AS tone_count
+            FROM tone_flags
+            GROUP BY user_id
+        ) t ON t.user_id = p.user_id
+        LEFT JOIN (
+            SELECT user_id, COUNT(*) AS active_strikes
+            FROM user_strikes
+            WHERE active = 1
+            GROUP BY user_id
+        ) s ON s.user_id = p.user_id
+        WHERE COALESCE(p.verified_at, v.verified_at, '') != ''
+        ORDER BY lower(COALESCE(p.username, p.display_name, CAST(p.user_id AS TEXT)))
+        """
+    )
+
+    users = []
+    for row in rows:
+        username = row.get("username") or ""
+        display_name = row.get("display_name") or username or str(row.get("user_id"))
+        users.append(
+            {
+                "user_id": row.get("user_id"),
+                "username": username,
+                "display_name": display_name,
+                "label": f"@{username}" if username else display_name,
+                "first_seen": row.get("first_seen") or None,
+                "last_seen": row.get("last_seen") or None,
+                "verified_at": row.get("verified_at") or None,
+                "source": row.get("source") or None,
+                "message_count": row.get("message_count") or 0,
+                "link_attempts": row.get("link_attempts") or 0,
+                "tone_flags": row.get("tone_flags") or 0,
+                "active_strikes": row.get("active_strikes") or 0,
+            }
+        )
+
+    return users
+
+
+def find_verified_alcove_user(user_id=None, username=None):
+    username = (username or "").lstrip("@").lower()
+    for user in get_verified_alcove_users():
+        if user_id is not None and int(user.get("user_id") or 0) == int(user_id):
+            return user
+        if username and (user.get("username") or "").lower() == username:
+            return user
+    return None
+
+
+def spotlight_today_exists(nominator_user_id=None, nominator_username=None):
+    today = datetime.datetime.utcnow().date().isoformat()
+    nominator_username = (nominator_username or "").lower()
+    for entry in spotlight_entries:
+        if not str(entry.get("time", "")).startswith(today):
+            continue
+        if nominator_user_id and entry.get("nominator_user_id") == nominator_user_id:
+            return True
+        if nominator_username and (entry.get("nominator_username") or "").lower() == nominator_username:
+            return True
+    return False
+
+
+def get_spotlight_entry(entry_id: int):
+    for entry in spotlight_entries:
+        if int(entry.get("id") or 0) == int(entry_id):
+            return entry
+    return None
+
+
+def build_alcove_analytics(period: str):
+    if synced_alcove_analytics and period in synced_alcove_analytics:
+        return synced_alcove_analytics[period]
+
+    since = period_start(period)
+    message_where, message_params = since_clause("timestamp", since)
+    verified_where, verified_params = since_clause("verified_at", since)
+    link_where, link_params = since_clause("logged_at", since)
+    captcha_where, captcha_params = since_clause("attempt_time", since)
+
+    if since:
+        spotlight_count = len([
+            entry for entry in spotlight_entries
+            if entry.get("time", "") >= since
+        ])
+    else:
+        spotlight_count = len(spotlight_entries)
+
+    return {
+        "newResidents": fox_db_value(f"SELECT COUNT(*) FROM verified_users{verified_where}", verified_params),
+        "totalResidents": len(get_verified_alcove_users()),
+        "posts": fox_db_value(f"SELECT COUNT(*) FROM messages{message_where}", message_params),
+        "replies": 0,
+        "reactions": 0,
+        "botBlocked": fox_db_value(
+            f"SELECT COUNT(*) FROM captcha_attempts{captcha_where}" + (" AND success = 0" if captcha_where else " WHERE success = 0"),
+            captcha_params,
+        ),
+        "linksRemoved": fox_db_value(f"SELECT COUNT(*) FROM link_violations{link_where}", link_params),
+        "spotlights": spotlight_count,
+        "pulses": 0,
+        "videosPlayed": len([entry for entry in archived_wheel_entries if not since or entry.get("played_at", entry.get("archived_at", "")) >= since]),
+        "storiesActed": len([entry for entry in story_entries if not since or entry.get("time", "") >= since]),
+        "audioSessions": len([entry for entry in asmr_entries if not since or entry.get("time", "") >= since]),
+    }
 
 
 def add_notification(kind: str, text: str, public: bool = True):
@@ -315,17 +620,13 @@ def entry_is_download_ready(entry: dict) -> bool:
     return entry.get("download_status") in {"ready", "manual_ready"}
 
 
-def entry_is_spin_eligible(entry: dict) -> bool:
-    """An entry is eligible for the wheel spin if it was approved by the host and hasn't been played yet."""
-    return entry.get("approval_status") == "approved" and not entry.get("played", False)
-
-
 def get_ready_unplayed_entries(round_number: int):
     return [
         entry
         for entry in wheel_entries
         if entry.get("round_id") == round_number
-        and entry_is_spin_eligible(entry)
+        and not entry.get("played", False)
+        and entry_is_download_ready(entry)
     ]
 
 
@@ -409,7 +710,50 @@ async def websocket_endpoint(websocket: WebSocket):
 
 @app.get("/")
 def root():
-    return {"status": "Alcove API running", "build": API_BUILD}
+    return {"status": "Alcove API running"}
+
+
+@app.get("/api/alcove-users")
+def alcove_users():
+    users = get_verified_alcove_users()
+    return {
+        "status": "ok",
+        "count": len(users),
+        "users": users,
+        "source": "bot_sync" if synced_alcove_users else "fox_logs",
+        "last_bot_sync_at": last_bot_sync_at,
+        "db_available": os.path.exists(FOX_LOGS_DB_PATH),
+    }
+
+
+@app.get("/api/alcove-analytics")
+def alcove_analytics():
+    return {
+        "status": "ok",
+        "today": build_alcove_analytics("today"),
+        "week": build_alcove_analytics("week"),
+        "allTime": build_alcove_analytics("allTime"),
+        "source": "bot_sync" if synced_alcove_analytics else "fox_logs",
+        "last_bot_sync_at": last_bot_sync_at,
+        "db_available": os.path.exists(FOX_LOGS_DB_PATH),
+    }
+
+
+@app.post("/api/bot-sync/alcove")
+def bot_sync_alcove(payload: BotSyncPayload, x_bot_sync_secret: str | None = Header(default=None)):
+    global synced_alcove_users, synced_alcove_analytics, last_bot_sync_at
+
+    verify_bot_sync_secret(x_bot_sync_secret)
+
+    synced_alcove_users = payload.users or []
+    synced_alcove_analytics = payload.analytics or {}
+    last_bot_sync_at = payload.synced_at or now_iso()
+
+    return {
+        "status": "ok",
+        "users": len(synced_alcove_users),
+        "synced_at": last_bot_sync_at,
+    }
 
 
 @app.get("/api/app-state")
@@ -428,7 +772,6 @@ def get_app_state():
     )
 
     return {
-        "build": API_BUILD,
         "current_round": current_round,
         "round_status": state["round_status"],
         "modules": state["modules"],
@@ -639,8 +982,6 @@ def submit_wheel(entry: WheelEntry):
         "local_path": None,
         "download_started_at": None,
         "download_completed_at": None,
-        "approval_status": "pending",  # pending | approved | rejected
-        "approval_time": None,
     }
 
     wheel_entries.append(new_entry)
@@ -845,8 +1186,8 @@ def set_spin_result(payload: dict):
     if not entry:
         return {"status": "error", "message": "winner entry not found"}
 
-    if not entry_is_spin_eligible(entry):
-        return {"status": "error", "message": "winner entry is not approved or has already been played"}
+    if not entry_is_download_ready(entry):
+        return {"status": "error", "message": "winner is not download-ready"}
 
     current_winner = {
         "entry_id": entry["id"],
@@ -1100,94 +1441,6 @@ def archive_wheel_entry(entry_id: int):
 
 
 # ---------------------------------
-# Entry Moderation (Basic approval system)
-# ---------------------------------
-
-@app.post("/api/entry/approve/{entry_id}")
-def approve_entry(entry_id: int):
-    """Host approves an entry for potential wheel inclusion."""
-    entry = find_entry(entry_id)
-    if not entry:
-        return {"status": "error", "message": "Entry not found"}
-    
-    entry["approval_status"] = "approved"
-    entry["approval_time"] = now_iso()
-    # For domains configured without auto-download, immediately make the entry
-    # wheel-eligible so approved submissions are not blocked in pending state.
-    domain_cfg = get_domain_config(entry.get("submitted_url") or "") or {}
-    if not domain_cfg.get("auto_download", False):
-        entry["download_status"] = "manual_ready"
-        entry["download_error"] = None
-        entry["download_method"] = "manual"
-        entry["download_completed_at"] = now_iso()
-    add_notification("system", f"Entry approved: {entry['data'].get('display_name', 'Unknown')}", False)
-    ws_broadcast_bundle()
-    
-    return {
-        "status": "ok",
-        "message": f"Entry {entry_id} approved",
-    }
-
-
-@app.post("/api/entry/reject/{entry_id}")
-def reject_entry(entry_id: int):
-    """Host rejects an entry."""
-    entry = find_entry(entry_id)
-    if not entry:
-        return {"status": "error", "message": "Entry not found"}
-    
-    entry["approval_status"] = "rejected"
-    entry["approval_time"] = now_iso()
-    add_notification("system", f"Entry rejected: {entry['data'].get('display_name', 'Unknown')}", False)
-    ws_broadcast_bundle()
-    
-    return {
-        "status": "ok",
-        "message": f"Entry {entry_id} rejected",
-    }
-
-
-@app.get("/api/entries/pending-approval")
-def list_pending_approval():
-    """List entries pending host review/approval."""
-    current_round = state["current_round"]
-    pending = [
-        {
-            "entry_id": e["id"],
-            "round_id": e["round_id"],
-            "display_name": e["data"].get("display_name"),
-            "video_title": e["data"].get("video_title"),
-            "note": e["data"].get("note"),
-            "submitted_url": e.get("submitted_url"),
-            "submitted_time": e.get("time"),
-            "approval_status": e.get("approval_status"),
-        }
-        for e in wheel_entries
-        if e.get("round_id") == current_round and e.get("approval_status") == "pending"
-    ]
-    return pending
-
-
-@app.get("/api/entries/approved")
-def list_approved_entries():
-    """List approved entries ready for download/wheel."""
-    current_round = state["current_round"]
-    approved = [
-        {
-            "entry_id": e["id"],
-            "round_id": e["round_id"],
-            "display_name": e["data"].get("display_name"),
-            "video_title": e["data"].get("video_title"),
-            "submitted_url": e.get("submitted_url"),
-            "approval_time": e.get("approval_time"),
-        }
-        for e in wheel_entries
-        if e.get("round_id") == current_round and e.get("approval_status") == "approved"
-    ]
-    return approved
-
-
-# ---------------------------------
 # Legacy / extra sections
 # ---------------------------------
 
@@ -1197,6 +1450,80 @@ def allow_more(payload: dict):
     limit = wheel_submission_limits.get(name, 1)
     wheel_submission_limits[name] = limit + 1
     return {"status": "ok"}
+
+
+@app.post("/api/spotlight-entry")
+def submit_spotlight(entry: SpotlightEntry):
+    nominee = find_verified_alcove_user(entry.nominee_user_id, entry.nominee_username)
+    if not nominee:
+        return {"status": "error", "message": "That user is not a verified Alcove resident."}
+
+    nominator = find_verified_alcove_user(entry.nominator_user_id, entry.nominator_username)
+    if entry.nominator_user_id and nominee.get("user_id") == entry.nominator_user_id:
+        return {"status": "error", "message": "You cannot nominate yourself."}
+    if entry.nominator_username and (nominee.get("username") or "").lower() == entry.nominator_username.lower():
+        return {"status": "error", "message": "You cannot nominate yourself."}
+
+    if spotlight_today_exists(entry.nominator_user_id, entry.nominator_username):
+        return {"status": "error", "message": "You have already submitted a Spotlight today."}
+
+    data = entry.dict()
+    data["id"] = len(spotlight_entries) + 1
+    data["time"] = now_iso()
+    data["status"] = "pending_review"
+    data["edited_reason"] = None
+    data["review_message_sent"] = False
+    data["reviewed_by"] = None
+    data["reviewed_at"] = None
+    data["nominee_user_id"] = nominee.get("user_id")
+    data["nominee_username"] = nominee.get("username")
+    data["nominee_display_name"] = nominee.get("display_name") or nominee.get("label")
+    if nominator:
+        data["nominator_user_id"] = nominator.get("user_id")
+        data["nominator_username"] = nominator.get("username")
+        data["nominator_display_name"] = nominator.get("display_name") or nominator.get("label")
+    spotlight_entries.append(data)
+    add_notification("spotlight", f"Spotlight submitted for {entry.nominee_display_name}", False)
+    return {"status": "ok", "spotlight_id": data["id"], "spotlights": len(spotlight_entries)}
+
+
+@app.get("/api/spotlight-entries")
+def list_spotlights(status: str | None = None):
+    entries = spotlight_entries
+    if status:
+        entries = [entry for entry in entries if entry.get("status") == status]
+    return {"status": "ok", "entries": entries}
+
+
+@app.get("/api/bot-sync/spotlights/pending")
+def bot_pending_spotlights(x_bot_sync_secret: str | None = Header(default=None)):
+    verify_bot_sync_secret(x_bot_sync_secret)
+    entries = [
+        entry for entry in spotlight_entries
+        if entry.get("status") == "pending_review" and not entry.get("review_message_sent")
+    ]
+    return {"status": "ok", "entries": entries}
+
+
+@app.post("/api/bot-sync/spotlights/{entry_id}")
+def bot_update_spotlight(entry_id: int, payload: SpotlightReviewUpdate, x_bot_sync_secret: str | None = Header(default=None)):
+    verify_bot_sync_secret(x_bot_sync_secret)
+    entry = get_spotlight_entry(entry_id)
+    if not entry:
+        return {"status": "error", "message": "Spotlight not found"}
+
+    if payload.status is not None:
+        entry["status"] = payload.status
+    if payload.edited_reason is not None:
+        entry["edited_reason"] = payload.edited_reason
+    if payload.review_message_sent is not None:
+        entry["review_message_sent"] = payload.review_message_sent
+    if payload.reviewed_by is not None:
+        entry["reviewed_by"] = payload.reviewed_by
+    if payload.reviewed_at is not None:
+        entry["reviewed_at"] = payload.reviewed_at
+
+    return {"status": "ok", "entry": entry}
 
 
 @app.post("/api/asmr-entry")
