@@ -283,6 +283,7 @@ class SpotlightReviewUpdate(BaseModel):
 class FeatureFlagsUpdate(BaseModel):
     pages: dict[str, bool] | None = None
     wellbeing: dict[str, bool] | None = None
+    admin_secret: str | None = None
 
 
 # ---------------------------------
@@ -956,7 +957,7 @@ def get_feature_flags():
 
 @app.post("/api/feature-flags")
 def update_feature_flags(payload: FeatureFlagsUpdate, x_bot_sync_secret: str | None = Header(default=None)):
-    verify_bot_sync_secret(x_bot_sync_secret)
+    verify_bot_sync_secret(x_bot_sync_secret or payload.admin_secret)
     flags = load_feature_flags()
     incoming = payload.dict(exclude_none=True)
     for group, values in incoming.items():
