@@ -47,6 +47,10 @@ FOX_LOGS_DB_PATH = os.getenv(
     os.path.join(ALCOVE_ROOT, "Bot-Review", "ALCOVE_FOX", "fox_logs.db"),
 )
 BOT_SYNC_SECRET = os.getenv("BOT_SYNC_SECRET", "")
+FEATURE_FLAGS_PATH = os.getenv(
+    "FEATURE_FLAGS_PATH",
+    os.path.join(os.getcwd(), "feature_flags.json"),
+)
 
 for path in [DOWNLOADS_DIR, READY_DIR, ARCHIVE_DIR, PLAYOUT_DIR]:
     os.makedirs(path, exist_ok=True)
@@ -179,6 +183,22 @@ state = {
     },
 }
 
+DEFAULT_FEATURE_FLAGS = {
+    "pages": {
+        "video_chat": True,
+        "archive": True,
+        "info": True,
+        "wellbeing": True,
+        "pulse": False,
+        "connect": False,
+    },
+    "wellbeing": {
+        "daily_checkin": True,
+        "spotlight": True,
+        "pulse": True,
+    },
+}
+
 # ---------------------------------
 # Models
 # ---------------------------------
@@ -260,6 +280,11 @@ class SpotlightReviewUpdate(BaseModel):
     reviewed_at: str | None = None
 
 
+class FeatureFlagsUpdate(BaseModel):
+    pages: dict[str, bool] | None = None
+    wellbeing: dict[str, bool] | None = None
+
+
 # ---------------------------------
 # Helpers
 # ---------------------------------
@@ -273,6 +298,40 @@ def verify_bot_sync_secret(x_bot_sync_secret: str | None):
         raise HTTPException(status_code=503, detail="Bot sync secret is not configured")
     if x_bot_sync_secret != BOT_SYNC_SECRET:
         raise HTTPException(status_code=403, detail="Invalid bot sync secret")
+
+
+def merged_feature_flags(saved: dict | None = None) -> dict:
+    flags = {
+        group: values.copy()
+        for group, values in DEFAULT_FEATURE_FLAGS.items()
+    }
+    if not isinstance(saved, dict):
+        return flags
+    for group, values in saved.items():
+        if group not in flags or not isinstance(values, dict):
+            continue
+        for key, value in values.items():
+            if key in flags[group]:
+                flags[group][key] = bool(value)
+    return flags
+
+
+def load_feature_flags() -> dict:
+    if not os.path.exists(FEATURE_FLAGS_PATH):
+        return merged_feature_flags()
+    try:
+        with open(FEATURE_FLAGS_PATH, "r", encoding="utf-8") as handle:
+            return merged_feature_flags(json.load(handle))
+    except (OSError, json.JSONDecodeError):
+        return merged_feature_flags()
+
+
+def save_feature_flags(flags: dict) -> None:
+    directory = os.path.dirname(FEATURE_FLAGS_PATH)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    with open(FEATURE_FLAGS_PATH, "w", encoding="utf-8") as handle:
+        json.dump(flags, handle, indent=2, sort_keys=True)
 
 
 def fox_db_rows(query: str, params=()):
@@ -888,6 +947,26 @@ def get_modules():
 def update_modules(payload: ModuleStateUpdate):
     state["modules"] = payload.dict()
     return {"status": "ok", "modules": state["modules"]}
+
+
+@app.get("/api/feature-flags")
+def get_feature_flags():
+    return {"status": "ok", "features": load_feature_flags()}
+
+
+@app.post("/api/feature-flags")
+def update_feature_flags(payload: FeatureFlagsUpdate, x_bot_sync_secret: str | None = Header(default=None)):
+    verify_bot_sync_secret(x_bot_sync_secret)
+    flags = load_feature_flags()
+    incoming = payload.dict(exclude_none=True)
+    for group, values in incoming.items():
+        if group not in flags or not isinstance(values, dict):
+            continue
+        for key, value in values.items():
+            if key in flags[group]:
+                flags[group][key] = bool(value)
+    save_feature_flags(flags)
+    return {"status": "ok", "features": flags}
 
 @app.get("/api/debug/domains")
 def debug_domains():
