@@ -52,6 +52,10 @@ FEATURE_FLAGS_PATH = os.getenv(
     "FEATURE_FLAGS_PATH",
     os.path.join(os.getcwd(), "feature_flags.json"),
 )
+PULSE_SETTINGS_PATH = os.getenv(
+    "PULSE_SETTINGS_PATH",
+    os.path.join(os.getcwd(), "pulse_settings.json"),
+)
 
 for path in [DOWNLOADS_DIR, READY_DIR, ARCHIVE_DIR, PLAYOUT_DIR]:
     os.makedirs(path, exist_ok=True)
@@ -174,7 +178,7 @@ notification_feed = []
 wheel_submission_limits = {}
 muted_users = set()
 current_winner = None
-PULSE_HEAT_THRESHOLD = int(os.getenv("PULSE_HEAT_THRESHOLD", "50"))
+PULSE_DEFAULT_HEAT_THRESHOLD = int(os.getenv("PULSE_HEAT_THRESHOLD", "50"))
 UK_TZ = ZoneInfo("Europe/London")
 
 state = {
@@ -302,6 +306,11 @@ class PulseReceiptAck(BaseModel):
     username: str | None = None
 
 
+class PulseSettingsUpdate(BaseModel):
+    heat_threshold: int
+    admin_secret: str | None = None
+
+
 class BotSyncPayload(BaseModel):
     users: list[dict] = []
     analytics: dict = {}
@@ -386,6 +395,59 @@ def save_feature_flags(flags: dict) -> None:
         os.makedirs(directory, exist_ok=True)
     with open(FEATURE_FLAGS_PATH, "w", encoding="utf-8") as handle:
         json.dump(flags, handle, indent=2, sort_keys=True)
+
+
+def normalized_pulse_threshold(value) -> int:
+    try:
+        return max(1, min(999, int(value)))
+    except (TypeError, ValueError):
+        return max(1, min(999, PULSE_DEFAULT_HEAT_THRESHOLD))
+
+
+def default_pulse_settings() -> dict:
+    return {"heat_threshold": normalized_pulse_threshold(PULSE_DEFAULT_HEAT_THRESHOLD)}
+
+
+def load_pulse_settings() -> dict:
+    settings = default_pulse_settings()
+    if not os.path.exists(PULSE_SETTINGS_PATH):
+        return settings
+    try:
+        with open(PULSE_SETTINGS_PATH, "r", encoding="utf-8") as handle:
+            saved = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return settings
+    if isinstance(saved, dict):
+        settings["heat_threshold"] = normalized_pulse_threshold(saved.get("heat_threshold"))
+    return settings
+
+
+def save_pulse_settings(settings: dict) -> None:
+    directory = os.path.dirname(PULSE_SETTINGS_PATH)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    normalized = {"heat_threshold": normalized_pulse_threshold(settings.get("heat_threshold"))}
+    with open(PULSE_SETTINGS_PATH, "w", encoding="utf-8") as handle:
+        json.dump(normalized, handle, indent=2, sort_keys=True)
+
+
+def pulse_heat_threshold() -> int:
+    return load_pulse_settings()["heat_threshold"]
+
+
+def pulse_progress_payload(day_key: str | None = None) -> dict:
+    threshold = pulse_heat_threshold()
+    sent = pulse_sent_today_count(day_key)
+    remaining = max(threshold - sent, 0)
+    return {
+        "heat_threshold": threshold,
+        "sent_today": sent,
+        "remaining_today": remaining,
+        "progress_percent": min(100, int((sent / max(threshold, 1)) * 100)),
+        "red_unlocked": sent >= threshold,
+        "day_key": day_key or pulse_day_key(),
+        "day_label": pulse_day_label(day_key),
+    }
 
 
 def fox_db_rows(query: str, params=()):
@@ -631,7 +693,7 @@ def pulse_base_green_slots(now: datetime.datetime | None = None):
 
 
 def pulse_heat_unlocked(day_key: str | None = None):
-    return pulse_sent_today_count(day_key) >= PULSE_HEAT_THRESHOLD
+    return pulse_sent_today_count(day_key) >= pulse_heat_threshold()
 
 
 def pulse_user_sent_entries(user_id, username=None, day_key: str | None = None):
@@ -654,6 +716,8 @@ def pulse_slot_state(user_id=None, username=None, now: datetime.datetime | None 
     red_used = len([entry for entry in sent if entry.get("pulse_type") == "red"])
     green_total = pulse_base_green_slots(current)
     red_unlocked = pulse_heat_unlocked(day)
+    sent_today = pulse_sent_today_count(day)
+    threshold = pulse_heat_threshold()
     return {
         "day_key": day,
         "day_label": pulse_day_label(day),
@@ -663,8 +727,9 @@ def pulse_slot_state(user_id=None, username=None, now: datetime.datetime | None 
         "red_unlocked": red_unlocked,
         "red_used": red_used,
         "red_available": 1 if red_unlocked and red_used == 0 else 0,
-        "sent_today": pulse_sent_today_count(day),
-        "heat_threshold": PULSE_HEAT_THRESHOLD,
+        "sent_today": sent_today,
+        "heat_threshold": threshold,
+        "remaining_today": max(threshold - sent_today, 0),
         "next_green_unlock_at": "12:00" if current.hour < 12 else None,
     }
 
@@ -1160,6 +1225,21 @@ def update_feature_flags(payload: FeatureFlagsUpdate, x_bot_sync_secret: str | N
                 flags[group][key] = bool(value)
     save_feature_flags(flags)
     return {"status": "ok", "features": flags}
+
+
+@app.get("/api/pulse-settings")
+def get_pulse_settings():
+    progress = pulse_progress_payload()
+    return {"status": "ok", "settings": load_pulse_settings(), "progress": progress}
+
+
+@app.post("/api/pulse-settings")
+def update_pulse_settings(payload: PulseSettingsUpdate, x_bot_sync_secret: str | None = Header(default=None)):
+    verify_bot_sync_secret(x_bot_sync_secret or payload.admin_secret)
+    settings = {"heat_threshold": normalized_pulse_threshold(payload.heat_threshold)}
+    save_pulse_settings(settings)
+    return {"status": "ok", "settings": settings, "progress": pulse_progress_payload()}
+
 
 @app.get("/api/debug/domains")
 def debug_domains():
@@ -1816,7 +1896,7 @@ def get_pulse_questions():
     return {
         "status": "ok",
         "questions": PULSE_QUESTIONS,
-        "heat_threshold": PULSE_HEAT_THRESHOLD,
+        "heat_threshold": pulse_heat_threshold(),
     }
 
 
