@@ -345,6 +345,23 @@ def now_iso() -> str:
     return datetime.datetime.utcnow().isoformat()
 
 
+def iso_in_seconds(seconds: int) -> str:
+    return (datetime.datetime.utcnow() + datetime.timedelta(seconds=seconds)).isoformat()
+
+
+def pulse_notification_due_at() -> str:
+    return iso_in_seconds(random.randint(120, 180))
+
+
+def iso_has_passed(value: str | None) -> bool:
+    if not value:
+        return True
+    try:
+        return datetime.datetime.fromisoformat(value) <= datetime.datetime.utcnow()
+    except ValueError:
+        return True
+
+
 def uk_now() -> datetime.datetime:
     return datetime.datetime.now(UK_TZ)
 
@@ -798,6 +815,7 @@ def pulse_receipt_payload(receipt):
         "received_at": receipt.get("received_at"),
         "acknowledged_at": receipt.get("acknowledged_at"),
         "notified_at": receipt.get("notified_at"),
+        "notify_after": receipt.get("notify_after"),
     })
     return payload
 
@@ -821,6 +839,7 @@ def pulse_match_next_receiver(receiver, exclude_entry_id=None):
         entry["delivered_to_display_name"] = receiver.get("display_name") or receiver.get("label")
         entry["delivered_at"] = now_iso()
         entry["assignment_notified_at"] = None
+        entry["assignment_notify_after"] = pulse_notification_due_at()
         return entry
     return None
 
@@ -2014,6 +2033,7 @@ def submit_pulse(entry: PulseEntry):
         "delivered_to_display_name": None,
         "delivered_at": None,
         "assignment_notified_at": None,
+        "assignment_notify_after": None,
         "response_answer": None,
         "responded_at": None,
     }
@@ -2065,6 +2085,7 @@ def respond_to_pulse_assignment(pulse_id: int, payload: PulseAssignmentResponse)
         "received_at": entry["responded_at"],
         "acknowledged_at": None,
         "notified_at": None,
+        "notify_after": pulse_notification_due_at(),
     }
     pulse_receipts.append(receipt)
     return {"status": "ok", "receipt": pulse_receipt_payload(receipt)}
@@ -2100,6 +2121,8 @@ def bot_pending_pulse_notifications(x_bot_sync_secret: str | None = Header(defau
     for entry in pulse_entries:
         if entry.get("status") != "awaiting_response" or entry.get("assignment_notified_at"):
             continue
+        if not iso_has_passed(entry.get("assignment_notify_after")):
+            continue
         payload = public_pulse_payload(entry)
         if not payload:
             continue
@@ -2111,10 +2134,13 @@ def bot_pending_pulse_notifications(x_bot_sync_secret: str | None = Header(defau
             "recipient_username": entry.get("delivered_to_username"),
             "recipient_display_name": entry.get("delivered_to_display_name"),
             "received_at": entry.get("delivered_at"),
+            "notify_after": entry.get("assignment_notify_after"),
             "pulse": payload,
         })
     for receipt in pulse_receipts:
         if receipt.get("notified_at") or receipt.get("acknowledged_at"):
+            continue
+        if not iso_has_passed(receipt.get("notify_after")):
             continue
         payload = pulse_receipt_payload(receipt)
         if not payload:
@@ -2127,6 +2153,7 @@ def bot_pending_pulse_notifications(x_bot_sync_secret: str | None = Header(defau
             "recipient_username": receipt.get("recipient_username"),
             "recipient_display_name": receipt.get("recipient_display_name"),
             "received_at": receipt.get("received_at"),
+            "notify_after": receipt.get("notify_after"),
             "pulse": payload,
         })
     return {"status": "ok", "notifications": rows}
