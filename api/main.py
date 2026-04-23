@@ -795,9 +795,24 @@ def pulse_assignments_for_user(user_id=None, username=None):
     for entry in pulse_entries:
         if entry.get("status") != "awaiting_response":
             continue
+        if not iso_has_passed(entry.get("assignment_notify_after")):
+            continue
         if user_id is not None and int(entry.get("delivered_to_user_id") or 0) == int(user_id):
             rows.append(entry)
         elif uname and (entry.get("delivered_to_username") or "").lower() == uname:
+            rows.append(entry)
+    return rows
+
+
+def pulse_responded_by_user(user_id=None, username=None):
+    uname = (username or "").lower().lstrip("@")
+    rows = []
+    for entry in pulse_entries:
+        if entry.get("status") != "completed":
+            continue
+        if user_id is not None and int(entry.get("responder_user_id") or 0) == int(user_id):
+            rows.append(entry)
+        elif uname and (entry.get("responder_username") or "").lower() == uname:
             rows.append(entry)
     return rows
 
@@ -806,6 +821,8 @@ def pulse_receipts_for_user(user_id=None, username=None):
     uname = (username or "").lower().lstrip("@")
     rows = []
     for receipt in pulse_receipts:
+        if not receipt.get("acknowledged_at") and not iso_has_passed(receipt.get("notify_after")):
+            continue
         if user_id is not None and int(receipt.get("recipient_user_id") or 0) == int(user_id):
             rows.append(receipt)
         elif uname and (receipt.get("recipient_username") or "").lower() == uname:
@@ -1988,6 +2005,10 @@ def get_pulse_status(user_id: int | None = None, username: str | None = None):
         public_pulse_payload(entry)
         for entry in pulse_assignments_for_user(identity.get("user_id"), identity.get("username"))
     ]
+    responded = [
+        public_pulse_payload(entry)
+        for entry in pulse_responded_by_user(identity.get("user_id"), identity.get("username"))
+    ]
     sent = [
         public_pulse_payload(entry)
         for entry in pulse_user_sent_entries(identity.get("user_id"), identity.get("username"))
@@ -1998,6 +2019,7 @@ def get_pulse_status(user_id: int | None = None, username: str | None = None):
         "slots": slots,
         "assigned": assignments,
         "received": receipts,
+        "responded": responded,
         "sent": sent,
         "pending_queue": len([entry for entry in pulse_entries_for_day() if entry.get("status") == "queued"]),
     }
@@ -2015,6 +2037,8 @@ def submit_pulse(entry: PulseEntry):
 
     sender_note = (entry.answer or "").strip()
     question = (entry.question or "").strip()
+    if len(sender_note) < 3:
+        return {"status": "error", "message": "Please add your own anonymous answer before sending your Pulse."}
     if question not in PULSE_QUESTIONS[pulse_type]:
         return {"status": "error", "message": "Please choose one of the current Pulse questions."}
 
