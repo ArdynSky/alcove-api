@@ -774,6 +774,7 @@ def pulse_receipt_payload(receipt):
         "receipt_id": receipt.get("id"),
         "received_at": receipt.get("received_at"),
         "acknowledged_at": receipt.get("acknowledged_at"),
+        "notified_at": receipt.get("notified_at"),
     })
     return payload
 
@@ -802,6 +803,7 @@ def pulse_match_next_receiver(receiver):
             "recipient_display_name": receiver.get("display_name") or receiver.get("label"),
             "received_at": entry["delivered_at"],
             "acknowledged_at": None,
+            "notified_at": None,
         }
         pulse_receipts.append(receipt)
         return receipt
@@ -2027,6 +2029,37 @@ def bot_pending_pulses(x_bot_sync_secret: str | None = Header(default=None)):
     verify_bot_sync_secret(x_bot_sync_secret)
     queued = [entry for entry in pulse_entries_for_day() if entry.get("status") == "queued"]
     return {"status": "ok", "entries": queued}
+
+
+@app.get("/api/bot-sync/pulses/notifications")
+def bot_pending_pulse_notifications(x_bot_sync_secret: str | None = Header(default=None)):
+    verify_bot_sync_secret(x_bot_sync_secret)
+    rows = []
+    for receipt in pulse_receipts:
+        if receipt.get("notified_at") or receipt.get("acknowledged_at"):
+            continue
+        payload = pulse_receipt_payload(receipt)
+        if not payload:
+            continue
+        rows.append({
+            "receipt_id": receipt.get("id"),
+            "recipient_user_id": receipt.get("recipient_user_id"),
+            "recipient_username": receipt.get("recipient_username"),
+            "recipient_display_name": receipt.get("recipient_display_name"),
+            "received_at": receipt.get("received_at"),
+            "pulse": payload,
+        })
+    return {"status": "ok", "notifications": rows}
+
+
+@app.post("/api/bot-sync/pulses/notifications/{receipt_id}")
+def mark_pulse_notification_sent(receipt_id: int, x_bot_sync_secret: str | None = Header(default=None)):
+    verify_bot_sync_secret(x_bot_sync_secret)
+    receipt = next((item for item in pulse_receipts if item.get("id") == receipt_id), None)
+    if not receipt:
+        return {"status": "error", "message": "Pulse receipt not found."}
+    receipt["notified_at"] = now_iso()
+    return {"status": "ok", "receipt": pulse_receipt_payload(receipt)}
 
 
 @app.post("/api/asmr-entry")
