@@ -298,6 +298,12 @@ class PulseEntry(BaseModel):
     display_name: str | None = None
     pulse_type: str = "green"
     question: str
+    answer: str | None = None
+
+
+class PulseAssignmentResponse(BaseModel):
+    user_id: int | None = None
+    username: str | None = None
     answer: str
 
 
@@ -748,10 +754,27 @@ def public_pulse_payload(entry):
         "pulse_id": entry.get("id"),
         "pulse_type": entry.get("pulse_type"),
         "question": entry.get("question"),
-        "answer": entry.get("answer"),
+        "sender_note": entry.get("sender_note") or entry.get("answer"),
+        "answer": entry.get("response_answer"),
+        "status": entry.get("status"),
         "sent_at": entry.get("sent_at"),
+        "delivered_at": entry.get("delivered_at"),
+        "responded_at": entry.get("responded_at"),
         "day_key": entry.get("day_key"),
     }
+
+
+def pulse_assignments_for_user(user_id=None, username=None):
+    uname = (username or "").lower().lstrip("@")
+    rows = []
+    for entry in pulse_entries:
+        if entry.get("status") != "awaiting_response":
+            continue
+        if user_id is not None and int(entry.get("delivered_to_user_id") or 0) == int(user_id):
+            rows.append(entry)
+        elif uname and (entry.get("delivered_to_username") or "").lower() == uname:
+            rows.append(entry)
+    return rows
 
 
 def pulse_receipts_for_user(user_id=None, username=None):
@@ -779,34 +802,26 @@ def pulse_receipt_payload(receipt):
     return payload
 
 
-def pulse_match_next_receiver(receiver):
+def pulse_match_next_receiver(receiver, exclude_entry_id=None):
     day = pulse_day_key()
     receiver_id = receiver.get("user_id")
     receiver_username = (receiver.get("username") or "").lower()
     for entry in pulse_entries:
+        if exclude_entry_id is not None and int(entry.get("id") or 0) == int(exclude_entry_id):
+            continue
         if entry.get("day_key") != day or entry.get("status") != "queued":
             continue
         if receiver_id is not None and int(entry.get("sender_user_id") or 0) == int(receiver_id):
             continue
         if receiver_username and (entry.get("sender_username") or "").lower() == receiver_username:
             continue
-        entry["status"] = "delivered"
+        entry["status"] = "awaiting_response"
         entry["delivered_to_user_id"] = receiver.get("user_id")
         entry["delivered_to_username"] = receiver.get("username")
         entry["delivered_to_display_name"] = receiver.get("display_name") or receiver.get("label")
         entry["delivered_at"] = now_iso()
-        receipt = {
-            "id": len(pulse_receipts) + 1,
-            "pulse_id": entry.get("id"),
-            "recipient_user_id": receiver.get("user_id"),
-            "recipient_username": receiver.get("username"),
-            "recipient_display_name": receiver.get("display_name") or receiver.get("label"),
-            "received_at": entry["delivered_at"],
-            "acknowledged_at": None,
-            "notified_at": None,
-        }
-        pulse_receipts.append(receipt)
-        return receipt
+        entry["assignment_notified_at"] = None
+        return entry
     return None
 
 
@@ -1942,6 +1957,10 @@ def get_pulse_status(user_id: int | None = None, username: str | None = None):
         payload for payload in (pulse_receipt_payload(receipt) for receipt in pulse_receipts_for_user(identity.get("user_id"), identity.get("username")))
         if payload
     ]
+    assignments = [
+        public_pulse_payload(entry)
+        for entry in pulse_assignments_for_user(identity.get("user_id"), identity.get("username"))
+    ]
     sent = [
         public_pulse_payload(entry)
         for entry in pulse_user_sent_entries(identity.get("user_id"), identity.get("username"))
@@ -1950,6 +1969,7 @@ def get_pulse_status(user_id: int | None = None, username: str | None = None):
         "status": "ok",
         "user": identity,
         "slots": slots,
+        "assigned": assignments,
         "received": receipts,
         "sent": sent,
         "pending_queue": len([entry for entry in pulse_entries_for_day() if entry.get("status") == "queued"]),
@@ -1966,10 +1986,8 @@ def submit_pulse(entry: PulseEntry):
     if pulse_type not in ("green", "red"):
         return {"status": "error", "message": "Unknown Pulse type."}
 
-    answer = (entry.answer or "").strip()
+    sender_note = (entry.answer or "").strip()
     question = (entry.question or "").strip()
-    if len(answer) < 3:
-        return {"status": "error", "message": "Please add a little more before sending your Pulse."}
     if question not in PULSE_QUESTIONS[pulse_type]:
         return {"status": "error", "message": "Please choose one of the current Pulse questions."}
 
@@ -1984,7 +2002,8 @@ def submit_pulse(entry: PulseEntry):
         "day_key": pulse_day_key(),
         "pulse_type": pulse_type,
         "question": question,
-        "answer": answer,
+        "sender_note": sender_note,
+        "answer": sender_note,
         "sender_user_id": identity.get("user_id"),
         "sender_username": identity.get("username"),
         "sender_display_name": identity.get("display_name") or identity.get("label"),
@@ -1994,18 +2013,61 @@ def submit_pulse(entry: PulseEntry):
         "delivered_to_username": None,
         "delivered_to_display_name": None,
         "delivered_at": None,
+        "assignment_notified_at": None,
+        "response_answer": None,
+        "responded_at": None,
     }
     pulse_entries.append(data)
-    received = pulse_match_next_receiver(identity)
+    assigned = pulse_match_next_receiver(identity, exclude_entry_id=data["id"])
     updated_slots = pulse_slot_state(identity.get("user_id"), identity.get("username"))
     add_notification("pulse", "Anonymous Pulse submitted", False)
     return {
         "status": "ok",
         "pulse_id": data["id"],
         "slots": updated_slots,
-        "received": pulse_receipt_payload(received) if received else None,
-        "queued": received is None,
+        "assigned": public_pulse_payload(assigned) if assigned else None,
+        "queued": assigned is None,
     }
+
+
+@app.post("/api/pulse-assignments/{pulse_id}/respond")
+def respond_to_pulse_assignment(pulse_id: int, payload: PulseAssignmentResponse):
+    entry = next((item for item in pulse_entries if int(item.get("id") or 0) == int(pulse_id)), None)
+    if not entry:
+        return {"status": "error", "message": "Pulse assignment not found."}
+    if entry.get("status") != "awaiting_response":
+        return {"status": "error", "message": "That Pulse has already been answered."}
+
+    identity = pulse_user_identity(payload.user_id, payload.username)
+    if not identity:
+        return {"status": "error", "message": "Could not identify this Pulse user."}
+    if identity.get("user_id") is not None and int(entry.get("delivered_to_user_id") or 0) != int(identity.get("user_id")):
+        return {"status": "error", "message": "That Pulse is not assigned to you."}
+    if identity.get("user_id") is None and (identity.get("username") or "").lower() != (entry.get("delivered_to_username") or "").lower():
+        return {"status": "error", "message": "That Pulse is not assigned to you."}
+
+    answer = (payload.answer or "").strip()
+    if len(answer) < 3:
+        return {"status": "error", "message": "Please add a little more before sending your answer."}
+
+    entry["status"] = "completed"
+    entry["response_answer"] = answer
+    entry["responder_user_id"] = identity.get("user_id")
+    entry["responder_username"] = identity.get("username")
+    entry["responder_display_name"] = identity.get("display_name") or identity.get("label")
+    entry["responded_at"] = now_iso()
+    receipt = {
+        "id": len(pulse_receipts) + 1,
+        "pulse_id": entry.get("id"),
+        "recipient_user_id": entry.get("sender_user_id"),
+        "recipient_username": entry.get("sender_username"),
+        "recipient_display_name": entry.get("sender_display_name"),
+        "received_at": entry["responded_at"],
+        "acknowledged_at": None,
+        "notified_at": None,
+    }
+    pulse_receipts.append(receipt)
+    return {"status": "ok", "receipt": pulse_receipt_payload(receipt)}
 
 
 @app.post("/api/pulse-receipts/{receipt_id}/ack")
@@ -2035,6 +2097,22 @@ def bot_pending_pulses(x_bot_sync_secret: str | None = Header(default=None)):
 def bot_pending_pulse_notifications(x_bot_sync_secret: str | None = Header(default=None)):
     verify_bot_sync_secret(x_bot_sync_secret)
     rows = []
+    for entry in pulse_entries:
+        if entry.get("status") != "awaiting_response" or entry.get("assignment_notified_at"):
+            continue
+        payload = public_pulse_payload(entry)
+        if not payload:
+            continue
+        rows.append({
+            "notification_id": f"assignment-{entry.get('id')}",
+            "kind": "answer_request",
+            "pulse_id": entry.get("id"),
+            "recipient_user_id": entry.get("delivered_to_user_id"),
+            "recipient_username": entry.get("delivered_to_username"),
+            "recipient_display_name": entry.get("delivered_to_display_name"),
+            "received_at": entry.get("delivered_at"),
+            "pulse": payload,
+        })
     for receipt in pulse_receipts:
         if receipt.get("notified_at") or receipt.get("acknowledged_at"):
             continue
@@ -2042,6 +2120,8 @@ def bot_pending_pulse_notifications(x_bot_sync_secret: str | None = Header(defau
         if not payload:
             continue
         rows.append({
+            "notification_id": f"receipt-{receipt.get('id')}",
+            "kind": "reply_received",
             "receipt_id": receipt.get("id"),
             "recipient_user_id": receipt.get("recipient_user_id"),
             "recipient_username": receipt.get("recipient_username"),
@@ -2052,10 +2132,19 @@ def bot_pending_pulse_notifications(x_bot_sync_secret: str | None = Header(defau
     return {"status": "ok", "notifications": rows}
 
 
-@app.post("/api/bot-sync/pulses/notifications/{receipt_id}")
-def mark_pulse_notification_sent(receipt_id: int, x_bot_sync_secret: str | None = Header(default=None)):
+@app.post("/api/bot-sync/pulses/notifications/{notification_id}")
+def mark_pulse_notification_sent(notification_id: str, x_bot_sync_secret: str | None = Header(default=None)):
     verify_bot_sync_secret(x_bot_sync_secret)
-    receipt = next((item for item in pulse_receipts if item.get("id") == receipt_id), None)
+    if notification_id.startswith("assignment-"):
+        pulse_id = int(notification_id.split("-", 1)[1])
+        entry = next((item for item in pulse_entries if int(item.get("id") or 0) == pulse_id), None)
+        if not entry:
+            return {"status": "error", "message": "Pulse assignment not found."}
+        entry["assignment_notified_at"] = now_iso()
+        return {"status": "ok", "pulse": public_pulse_payload(entry)}
+
+    receipt_id = int(notification_id.replace("receipt-", "", 1))
+    receipt = next((item for item in pulse_receipts if int(item.get("id") or 0) == receipt_id), None)
     if not receipt:
         return {"status": "error", "message": "Pulse receipt not found."}
     receipt["notified_at"] = now_iso()
