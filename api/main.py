@@ -179,6 +179,7 @@ wheel_submission_limits = {}
 muted_users = set()
 current_winner = None
 PULSE_DEFAULT_HEAT_THRESHOLD = int(os.getenv("PULSE_HEAT_THRESHOLD", "50"))
+PULSE_TESTING_UNLIMITED = os.getenv("PULSE_TESTING_UNLIMITED", "1").strip().lower() in {"1", "true", "yes", "on"}
 UK_TZ = ZoneInfo("Europe/London")
 
 state = {
@@ -722,6 +723,10 @@ def pulse_base_green_slots(now: datetime.datetime | None = None):
     return 2 if current.hour >= 12 else 1
 
 
+def pulse_testing_unlimited() -> bool:
+    return PULSE_TESTING_UNLIMITED
+
+
 def pulse_heat_unlocked(day_key: str | None = None):
     return pulse_sent_today_count(day_key) >= pulse_heat_threshold()
 
@@ -748,19 +753,22 @@ def pulse_slot_state(user_id=None, username=None, now: datetime.datetime | None 
     red_unlocked = pulse_heat_unlocked(day)
     sent_today = pulse_sent_today_count(day)
     threshold = pulse_heat_threshold()
+    testing = pulse_testing_unlimited()
+    green_available = 99 if testing else max(green_total - green_used, 0)
     return {
         "day_key": day,
         "day_label": pulse_day_label(day),
         "green_total": green_total,
         "green_used": green_used,
-        "green_available": max(green_total - green_used, 0),
+        "green_available": green_available,
         "red_unlocked": red_unlocked,
         "red_used": red_used,
         "red_available": 1 if red_unlocked and red_used == 0 else 0,
         "sent_today": sent_today,
         "heat_threshold": threshold,
         "remaining_today": max(threshold - sent_today, 0),
-        "next_green_unlock_at": "12:00" if current.hour < 12 else None,
+        "next_green_unlock_at": None if testing else ("12:00" if current.hour < 12 else None),
+        "testing_unlimited": testing,
     }
 
 
