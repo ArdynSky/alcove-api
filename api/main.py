@@ -356,6 +356,13 @@ def pulse_day_label(day_key: str | None = None) -> str:
     return parsed.strftime("%d %B %Y")
 
 
+def seconds_until_next_uk_midnight() -> int:
+    current = uk_now()
+    tomorrow = (current + datetime.timedelta(days=1)).date()
+    reset_at = datetime.datetime.combine(tomorrow, datetime.time.min, tzinfo=UK_TZ)
+    return max(0, int((reset_at - current).total_seconds()))
+
+
 def verify_bot_sync_secret(x_bot_sync_secret: str | None):
     if not BOT_SYNC_SECRET:
         raise HTTPException(status_code=503, detail="Bot sync secret is not configured")
@@ -802,10 +809,10 @@ def pulse_match_next_receiver(receiver):
 
 
 def spotlight_today_exists(nominator_user_id=None, nominator_username=None):
-    today = datetime.datetime.utcnow().date().isoformat()
+    today = pulse_day_key()
     nominator_username = (nominator_username or "").lower()
     for entry in spotlight_entries:
-        if not str(entry.get("time", "")).startswith(today):
+        if entry.get("day_key") != today and not str(entry.get("time", "")).startswith(today):
             continue
         if nominator_user_id and entry.get("nominator_user_id") == nominator_user_id:
             return True
@@ -819,6 +826,15 @@ def get_spotlight_entry(entry_id: int):
         if int(entry.get("id") or 0) == int(entry_id):
             return entry
     return None
+
+
+def spotlight_status_payload(nominator_user_id=None, nominator_username=None):
+    submitted = spotlight_today_exists(nominator_user_id, nominator_username)
+    return {
+        "submitted_today": submitted,
+        "reset_seconds": seconds_until_next_uk_midnight(),
+        "reset_label": "midnight UK time",
+    }
 
 
 def build_alcove_analytics(period: str):
@@ -1828,6 +1844,7 @@ def submit_spotlight(entry: SpotlightEntry):
     data = entry.dict()
     data["id"] = len(spotlight_entries) + 1
     data["time"] = now_iso()
+    data["day_key"] = pulse_day_key()
     data["status"] = "pending_review"
     data["edited_reason"] = None
     data["review_message_sent"] = False
@@ -1849,7 +1866,19 @@ def submit_spotlight(entry: SpotlightEntry):
         )
     spotlight_entries.append(data)
     add_notification("spotlight", f"Spotlight submitted for {entry.nominee_display_name}", False)
-    return {"status": "ok", "spotlight_id": data["id"], "spotlights": len(spotlight_entries)}
+    return {
+        "status": "ok",
+        "spotlight_id": data["id"],
+        "spotlights": len(spotlight_entries),
+        "spotlight_status": spotlight_status_payload(data.get("nominator_user_id"), data.get("nominator_username")),
+    }
+
+
+@app.get("/api/spotlight-status")
+def get_spotlight_status(user_id: int | None = None, username: str | None = None):
+    if not user_id and not username:
+        return {"status": "error", "message": "Could not identify this Spotlight user."}
+    return {"status": "ok", **spotlight_status_payload(user_id, username)}
 
 
 @app.get("/api/spotlight-entries")
