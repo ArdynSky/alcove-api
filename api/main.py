@@ -285,9 +285,9 @@ PULSE_QUESTION_CATEGORIES = {
     "What do you value most in a meaningful connection?": "General",
     "What part of your story has shaped you the most?": "General",
     "What makes you feel deeply seen?": "General",
-    "What’s your hottest forbidden fantasy you’ve never told anyone?",: "General",
-    "What’s the sluttiest thing you’ve ever done in public or semi-public?",: "General",
-    "What exact thing during foreplay instantly makes your cock leak and your hole twitch?",: "General",
+    "What’s your hottest forbidden fantasy you’ve never told anyone?": "General",
+    "What’s the sluttiest thing you’ve ever done in public or semi-public?": "General",
+    "What exact thing during foreplay instantly makes your cock leak and your hole twitch?": "General",
     "Is there a time you hooked up with someone you really shouldn’t have — who it was and how filthy it got?": "General",
 }
 
@@ -389,6 +389,7 @@ class PulseQuestionSuggestion(BaseModel):
 
 class PulseSettingsUpdate(BaseModel):
     heat_threshold: int
+    reset_interval_hours: int | None = None
     admin_secret: str | None = None
 
 
@@ -452,6 +453,14 @@ def pulse_day_label(day_key: str | None = None) -> str:
     except ValueError:
         return raw
     return parsed.strftime("%d %B %Y")
+
+
+def normalized_pulse_reset_interval(value) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return 12
+    return parsed if parsed in {1, 3, 6, 12} else 12
 
 
 def pulse_question_category(question: str | None, pulse_type: str | None = None) -> str:
@@ -595,6 +604,32 @@ def seconds_until_next_uk_midnight() -> int:
     return max(0, int((reset_at - current).total_seconds()))
 
 
+def pulse_reset_interval_hours() -> int:
+    return load_pulse_settings()["reset_interval_hours"]
+
+
+def next_pulse_unlock_at(now: datetime.datetime | None = None, interval_hours: int | None = None) -> datetime.datetime:
+    current = now or uk_now()
+    interval = normalized_pulse_reset_interval(interval_hours or pulse_reset_interval_hours())
+    midnight = datetime.datetime.combine(current.date(), datetime.time.min, tzinfo=UK_TZ)
+    elapsed_seconds = max(0, int((current - midnight).total_seconds()))
+    interval_seconds = interval * 3600
+    next_boundary_seconds = ((elapsed_seconds // interval_seconds) + 1) * interval_seconds
+    if next_boundary_seconds >= 24 * 3600:
+        return midnight + datetime.timedelta(days=1)
+    return midnight + datetime.timedelta(seconds=next_boundary_seconds)
+
+
+def seconds_until_next_pulse_unlock(now: datetime.datetime | None = None, interval_hours: int | None = None) -> int:
+    current = now or uk_now()
+    return max(0, int((next_pulse_unlock_at(current, interval_hours) - current).total_seconds()))
+
+
+def pulse_unlock_label(now: datetime.datetime | None = None, interval_hours: int | None = None) -> str:
+    unlock_at = next_pulse_unlock_at(now, interval_hours)
+    return unlock_at.astimezone(UK_TZ).strftime("%H:%M")
+
+
 def verify_bot_sync_secret(x_bot_sync_secret: str | None):
     if not BOT_SYNC_SECRET:
         raise HTTPException(status_code=503, detail="Bot sync secret is not configured")
@@ -644,7 +679,10 @@ def normalized_pulse_threshold(value) -> int:
 
 
 def default_pulse_settings() -> dict:
-    return {"heat_threshold": normalized_pulse_threshold(PULSE_DEFAULT_HEAT_THRESHOLD)}
+    return {
+        "heat_threshold": normalized_pulse_threshold(PULSE_DEFAULT_HEAT_THRESHOLD),
+        "reset_interval_hours": 12,
+    }
 
 
 def load_pulse_settings() -> dict:
@@ -658,6 +696,7 @@ def load_pulse_settings() -> dict:
         return settings
     if isinstance(saved, dict):
         settings["heat_threshold"] = normalized_pulse_threshold(saved.get("heat_threshold"))
+        settings["reset_interval_hours"] = normalized_pulse_reset_interval(saved.get("reset_interval_hours"))
     return settings
 
 
@@ -665,7 +704,10 @@ def save_pulse_settings(settings: dict) -> None:
     directory = os.path.dirname(PULSE_SETTINGS_PATH)
     if directory:
         os.makedirs(directory, exist_ok=True)
-    normalized = {"heat_threshold": normalized_pulse_threshold(settings.get("heat_threshold"))}
+    normalized = {
+        "heat_threshold": normalized_pulse_threshold(settings.get("heat_threshold")),
+        "reset_interval_hours": normalized_pulse_reset_interval(settings.get("reset_interval_hours")),
+    }
     with open(PULSE_SETTINGS_PATH, "w", encoding="utf-8") as handle:
         json.dump(normalized, handle, indent=2, sort_keys=True)
 
@@ -678,14 +720,19 @@ def pulse_progress_payload(day_key: str | None = None) -> dict:
     threshold = pulse_heat_threshold()
     sent = pulse_sent_today_count(day_key)
     remaining = max(threshold - sent, 0)
+    interval_hours = pulse_reset_interval_hours()
     return {
         "heat_threshold": threshold,
+        "reset_interval_hours": interval_hours,
         "sent_today": sent,
         "remaining_today": remaining,
         "progress_percent": min(100, int((sent / max(threshold, 1)) * 100)),
         "red_unlocked": sent >= threshold,
         "day_key": day_key or pulse_day_key(),
         "day_label": pulse_day_label(day_key),
+        "next_unlock_at": next_pulse_unlock_at().isoformat(),
+        "next_unlock_label": pulse_unlock_label(),
+        "reset_seconds": seconds_until_next_pulse_unlock(),
     }
 
 
@@ -935,7 +982,11 @@ def pulse_sent_today_count(day_key: str | None = None):
 
 def pulse_base_green_slots(now: datetime.datetime | None = None):
     current = now or uk_now()
-    return 2 if current.hour >= 12 else 1
+    interval = pulse_reset_interval_hours()
+    midnight = datetime.datetime.combine(current.date(), datetime.time.min, tzinfo=UK_TZ)
+    elapsed_seconds = max(0, int((current - midnight).total_seconds()))
+    unlocked = 1 + (elapsed_seconds // (interval * 3600))
+    return max(1, min(2, unlocked))
 
 
 def pulse_testing_unlimited() -> bool:
@@ -1005,6 +1056,7 @@ def pulse_slot_state(user_id=None, username=None, now: datetime.datetime | None 
     sent_today = pulse_sent_today_count(day)
     threshold = pulse_heat_threshold()
     testing = pulse_testing_unlimited()
+    interval_hours = pulse_reset_interval_hours()
     green_available = 99 if testing else max(green_total - green_used, 0)
     return {
         "day_key": day,
@@ -1019,8 +1071,11 @@ def pulse_slot_state(user_id=None, username=None, now: datetime.datetime | None 
         "red_available": 1 if red_unlocked and red_activated and red_used == 0 else 0,
         "sent_today": sent_today,
         "heat_threshold": threshold,
+        "reset_interval_hours": interval_hours,
         "remaining_today": max(threshold - sent_today, 0),
-        "next_green_unlock_at": None if testing else ("12:00" if current.hour < 12 else None),
+        "next_green_unlock_at": pulse_unlock_label(current, interval_hours),
+        "next_unlock_at": next_pulse_unlock_at(current, interval_hours).isoformat(),
+        "reset_seconds": seconds_until_next_pulse_unlock(current, interval_hours),
         "testing_unlimited": testing,
     }
 
@@ -1631,7 +1686,10 @@ def get_pulse_settings():
 @app.post("/api/pulse-settings")
 def update_pulse_settings(payload: PulseSettingsUpdate, x_bot_sync_secret: str | None = Header(default=None)):
     verify_bot_sync_secret(x_bot_sync_secret or payload.admin_secret)
-    settings = {"heat_threshold": normalized_pulse_threshold(payload.heat_threshold)}
+    settings = {
+        "heat_threshold": normalized_pulse_threshold(payload.heat_threshold),
+        "reset_interval_hours": normalized_pulse_reset_interval(payload.reset_interval_hours),
+    }
     save_pulse_settings(settings)
     return {"status": "ok", "settings": settings, "progress": pulse_progress_payload()}
 
