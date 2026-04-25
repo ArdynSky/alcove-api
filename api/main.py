@@ -164,6 +164,9 @@ spotlight_entries = []
 pulse_entries = []
 pulse_receipts = []
 pulse_red_activations = []
+pulse_question_suggestions = []
+pulse_daily_summary_posts = []
+pulse_disabled_questions = []
 synced_alcove_users = []
 synced_alcove_analytics = {}
 last_bot_sync_at = None
@@ -212,19 +215,80 @@ DEFAULT_FEATURE_FLAGS = {
 
 PULSE_QUESTIONS = {
     "green": [
-        "What has helped you feel a little steadier recently?",
-        "What is one small thing you wish someone had told you earlier?",
-        "What helps you feel more connected when you feel distant?",
-        "What is one kind thing you are trying to practise with yourself?",
-        "What helps you get through a difficult hour?",
+        "What has been sitting on your heart lately?",
+        "When life feels heavy, what helps you feel held?",
+        "What is something you wish people understood about how you feel?",
+        "What brings you back to yourself when you start to drift?",
+        "What kind of reassurance do you need most these days?",
+        "What feeling have you been carrying quietly?",
+        "What helps you soften when you have been hard on yourself?",
+        "When do you feel most emotionally safe?",
+        "What does comfort look like for you right now?",
+        "What are you learning about your inner world lately?",
+        "What has your body been trying to tell you lately?",
+        "When do you feel most at ease in your body?",
+        "What helps your body feel comforted?",
+        "What kind of rest has been hardest to give yourself?",
+        "What physical need have you been neglecting a little?",
+        "What helps you feel more grounded in your body?",
+        "What does being gentle with your body look like for you?",
+        "What part of your physical wellbeing needs more care right now?",
+        "What simple act helps your body feel safer or calmer?",
+        "What does feeling well in your body mean to you these days?",
+        "What part of you do you wish people saw more clearly?",
+        "What kind of connection are you craving lately?",
+        "What does being understood feel like to you?",
+        "What do you long for more of in your life right now?",
+        "What kind of presence from another person feels most comforting?",
+        "What do you find yourself hoping for quietly?",
+        "What helps you feel close to someone?",
+        "What do you value most in a meaningful connection?",
+        "What part of your story has shaped you the most?",
+        "What makes you feel deeply seen?",
     ],
     "red": [
-        "What is one honest thing you want to say without being identified?",
-        "What do you wish people understood about temptation or craving?",
-        "What helps you pause before chasing a risky impulse?",
-        "What does support look like when things feel intense?",
-        "What would you say to someone trying not to spiral tonight?",
+        "What’s your hottest forbidden fantasy you’ve never told anyone?",
+        "What’s the sluttiest thing you’ve ever done in public or semi-public?",
+        "What exact thing during foreplay instantly makes your cock leak and your hole twitch?",
+        "Is there a time you hooked up with someone you really shouldn’t have — who it was and how filthy it got?",
     ],
+}
+
+PULSE_QUESTION_CATEGORIES = {
+    "What has been sitting on your heart lately?": "Mental health",
+    "When life feels heavy, what helps you feel held?": "Mental health",
+    "What is something you wish people understood about how you feel?": "Mental health",
+    "What brings you back to yourself when you start to drift?": "Mental health",
+    "What kind of reassurance do you need most these days?": "Mental health",
+    "What feeling have you been carrying quietly?": "Mental health",
+    "What helps you soften when you have been hard on yourself?": "Mental health",
+    "When do you feel most emotionally safe?": "Mental health",
+    "What does comfort look like for you right now?": "Mental health",
+    "What are you learning about your inner world lately?": "Mental health",
+    "What has your body been trying to tell you lately?": "Physical health",
+    "When do you feel most at ease in your body?": "Physical health",
+    "What helps your body feel comforted?": "Physical health",
+    "What kind of rest has been hardest to give yourself?": "Physical health",
+    "What physical need have you been neglecting a little?": "Physical health",
+    "What helps you feel more grounded in your body?": "Physical health",
+    "What does being gentle with your body look like for you?": "Physical health",
+    "What part of your physical wellbeing needs more care right now?": "Physical health",
+    "What simple act helps your body feel safer or calmer?": "Physical health",
+    "What does feeling well in your body mean to you these days?": "Physical health",
+    "What part of you do you wish people saw more clearly?": "General",
+    "What kind of connection are you craving lately?": "General",
+    "What does being understood feel like to you?": "General",
+    "What do you long for more of in your life right now?": "General",
+    "What kind of presence from another person feels most comforting?": "General",
+    "What do you find yourself hoping for quietly?": "General",
+    "What helps you feel close to someone?": "General",
+    "What do you value most in a meaningful connection?": "General",
+    "What part of your story has shaped you the most?": "General",
+    "What makes you feel deeply seen?": "General",
+    "What’s your hottest forbidden fantasy you’ve never told anyone?",: "General",
+    "What’s the sluttiest thing you’ve ever done in public or semi-public?",: "General",
+    "What exact thing during foreplay instantly makes your cock leak and your hole twitch?",: "General",
+    "Is there a time you hooked up with someone you really shouldn’t have — who it was and how filthy it got?": "General",
 }
 
 # ---------------------------------
@@ -314,6 +378,15 @@ class PulseReceiptAck(BaseModel):
     username: str | None = None
 
 
+class PulseQuestionSuggestion(BaseModel):
+    user_id: int | None = None
+    username: str | None = None
+    display_name: str | None = None
+    pool: str = "green"
+    category: str
+    question: str
+
+
 class PulseSettingsUpdate(BaseModel):
     heat_threshold: int
     admin_secret: str | None = None
@@ -379,6 +452,140 @@ def pulse_day_label(day_key: str | None = None) -> str:
     except ValueError:
         return raw
     return parsed.strftime("%d %B %Y")
+
+
+def pulse_question_category(question: str | None, pulse_type: str | None = None) -> str:
+    question = (question or "").strip()
+    if question in PULSE_QUESTION_CATEGORIES:
+        return PULSE_QUESTION_CATEGORIES[question]
+    if (pulse_type or "").strip().lower() == "red":
+        return "General"
+    return "Mental health"
+
+
+def pulse_default_question_entries():
+    rows = []
+    for pool, questions in PULSE_QUESTIONS.items():
+        for question in questions:
+            rows.append({
+                "source": "default",
+                "pool": pool,
+                "category": pulse_question_category(question, pool),
+                "question": question,
+                "active": {"pool": pool, "question": question} not in pulse_disabled_questions,
+            })
+    return rows
+
+
+def pulse_approved_question_entries():
+    rows = []
+    for entry in pulse_question_suggestions:
+        if entry.get("status") != "approved":
+            continue
+        rows.append({
+            "source": "suggested",
+            "suggestion_id": entry.get("id"),
+            "pool": entry.get("pool") or "green",
+            "category": entry.get("category") or "General",
+            "question": entry.get("edited_question") or entry.get("question") or "",
+            "active": True,
+        })
+    return rows
+
+
+def pulse_active_questions(pool: str):
+    active = []
+    for entry in pulse_default_question_entries() + pulse_approved_question_entries():
+        if entry.get("pool") != pool:
+            continue
+        if not entry.get("active", True):
+            continue
+        question = (entry.get("question") or "").strip()
+        if question:
+            active.append(question)
+    return active
+
+
+def pulse_question_answer_count(question: str, pool: str | None = None):
+    count = 0
+    for entry in pulse_entries:
+        if entry.get("status") != "completed":
+            continue
+        if (entry.get("question") or "").strip() != (question or "").strip():
+            continue
+        if pool and (entry.get("pulse_type") or "green") != pool:
+            continue
+        count += 1
+    return count
+
+
+def pulse_question_roster():
+    rows = []
+    current_id = 1
+    all_entries = pulse_default_question_entries() + pulse_approved_question_entries()
+    sort_key = {"Mental health": 0, "Physical health": 1, "General": 2}
+    all_entries.sort(key=lambda item: (item.get("pool") != "green", sort_key.get(item.get("category"), 99), item.get("question", "").lower()))
+    for entry in all_entries:
+        if not entry.get("active", True):
+            continue
+        rows.append({
+            "roster_id": current_id,
+            "source": entry.get("source"),
+            "suggestion_id": entry.get("suggestion_id"),
+            "pool": entry.get("pool"),
+            "category": entry.get("category"),
+            "question": entry.get("question"),
+            "answers_count": pulse_question_answer_count(entry.get("question"), entry.get("pool")),
+        })
+        current_id += 1
+    return rows
+
+
+def find_pulse_question_suggestion(suggestion_id: int):
+    for entry in pulse_question_suggestions:
+        if int(entry.get("id") or 0) == int(suggestion_id):
+            return entry
+    return None
+
+
+def prioritized_random_question(entries: list[dict], seed_value: str = "") -> dict | None:
+    if not entries:
+        return None
+    by_count = sorted(entries, key=lambda item: int(item.get("answers_count") or 0))
+    lowest_count = int(by_count[0].get("answers_count") or 0)
+    lowest_group = [item for item in by_count if int(item.get("answers_count") or 0) == lowest_count]
+    chooser = random.Random(seed_value or pulse_day_key())
+    return chooser.choice(lowest_group)
+
+
+def pulse_question_choices(pool: str, user_id=None, username=None):
+    roster = [row for row in pulse_question_roster() if row.get("pool") == pool]
+    if pool != "green":
+        return [row.get("question") for row in roster if row.get("question")]
+
+    chosen = []
+    categories = ("Mental health", "Physical health", "General")
+    identity_key = f"{pulse_day_key()}:{user_id or ''}:{(username or '').lower()}"
+    for category in categories:
+        candidate = prioritized_random_question([
+            row for row in roster
+            if row.get("category") == category and row.get("question") not in chosen
+        ], f"{identity_key}:{category}")
+        if candidate:
+            chosen.append(candidate.get("question"))
+
+    remaining = [
+        row for row in roster
+        if row.get("question") not in chosen
+    ]
+    while len(chosen) < 4 and remaining:
+        candidate = prioritized_random_question(remaining, f"{identity_key}:extra:{len(chosen)}")
+        if not candidate:
+            break
+        chosen.append(candidate.get("question"))
+        remaining = [row for row in remaining if row.get("question") != candidate.get("question")]
+
+    return [question for question in chosen if question]
 
 
 def seconds_until_next_uk_midnight() -> int:
@@ -824,6 +1031,7 @@ def public_pulse_payload(entry):
     return {
         "pulse_id": entry.get("id"),
         "pulse_type": entry.get("pulse_type"),
+        "category": entry.get("category") or pulse_question_category(entry.get("question"), entry.get("pulse_type")),
         "question": entry.get("question"),
         "sender_note": entry.get("sender_note") or entry.get("answer"),
         "answer": entry.get("response_answer"),
@@ -832,6 +1040,12 @@ def public_pulse_payload(entry):
         "delivered_at": entry.get("delivered_at"),
         "responded_at": entry.get("responded_at"),
         "day_key": entry.get("day_key"),
+        "sender_user_id": entry.get("sender_user_id"),
+        "sender_username": entry.get("sender_username"),
+        "sender_display_name": entry.get("sender_display_name"),
+        "responder_user_id": entry.get("responder_user_id"),
+        "responder_username": entry.get("responder_username"),
+        "responder_display_name": entry.get("responder_display_name"),
     }
 
 
@@ -913,6 +1127,64 @@ def pulse_match_next_receiver(receiver, exclude_entry_id=None):
         entry["assignment_notify_after"] = pulse_notification_due_at()
         return entry
     return None
+
+
+def pulse_daily_summary_state(day_key: str, category: str):
+    for entry in pulse_daily_summary_posts:
+        if entry.get("day_key") == day_key and entry.get("category") == category:
+            return entry
+    state = {
+        "day_key": day_key,
+        "category": category,
+        "admin_posted_at": None,
+        "published_at": None,
+    }
+    pulse_daily_summary_posts.append(state)
+    return state
+
+
+def pulse_completed_admin_entries():
+    rows = []
+    for entry in pulse_entries:
+        if entry.get("status") != "completed":
+            continue
+        if entry.get("admin_posted_at"):
+            continue
+        rows.append(public_pulse_payload(entry))
+    return rows
+
+
+def pulse_daily_summary_payload(day_key: str):
+    completed = [
+        entry for entry in pulse_entries
+        if entry.get("status") == "completed" and entry.get("day_key") == day_key
+    ]
+    grouped = {}
+    for entry in completed:
+        category = entry.get("category") or pulse_question_category(entry.get("question"), entry.get("pulse_type"))
+        grouped.setdefault(category, []).append(public_pulse_payload(entry))
+    summaries = []
+    for category, entries in grouped.items():
+        state = pulse_daily_summary_state(day_key, category)
+        summaries.append({
+            "day_key": day_key,
+            "day_label": pulse_day_label(day_key),
+            "category": category,
+            "entries": entries,
+            "admin_posted_at": state.get("admin_posted_at"),
+            "published_at": state.get("published_at"),
+        })
+    return summaries
+
+
+def pulse_category_from_slug(category_slug: str) -> str:
+    slug = (category_slug or "").strip().lower()
+    mapping = {
+        "mental-health": "Mental health",
+        "physical-health": "Physical health",
+        "general": "General",
+    }
+    return mapping.get(slug, "General")
 
 
 def spotlight_today_exists(nominator_user_id=None, nominator_username=None):
@@ -2028,11 +2300,56 @@ def bot_update_spotlight(entry_id: int, payload: SpotlightReviewUpdate, x_bot_sy
 
 
 @app.get("/api/pulse-questions")
-def get_pulse_questions():
+def get_pulse_questions(user_id: int | None = None, username: str | None = None):
     return {
         "status": "ok",
-        "questions": PULSE_QUESTIONS,
+        "questions": {
+            "green": pulse_question_choices("green", user_id, username),
+            "red": pulse_question_choices("red", user_id, username),
+        },
         "heat_threshold": pulse_heat_threshold(),
+    }
+
+
+@app.post("/api/pulse-question-suggestions")
+def submit_pulse_question_suggestion(payload: PulseQuestionSuggestion):
+    identity = pulse_user_identity(payload.user_id, payload.username)
+    if not identity:
+        return {"status": "error", "message": "Could not identify your Telegram account. Please open the Mini App from Telegram and try again."}
+
+    pool = (payload.pool or "green").strip().lower()
+    category = (payload.category or "").strip()
+    question = (payload.question or "").strip()
+    allowed_categories = {"Mental health", "Physical health", "General"}
+
+    if pool not in {"green", "red"}:
+        return {"status": "error", "message": "Please choose a valid Pulse pool."}
+    if category not in allowed_categories:
+        return {"status": "error", "message": "Please choose a valid category."}
+    if len(question) < 8:
+        return {"status": "error", "message": "Please add a little more detail before sending your question."}
+
+    entry = {
+        "id": len(pulse_question_suggestions) + 1,
+        "pool": pool,
+        "category": category,
+        "question": question,
+        "edited_question": None,
+        "submitted_at": now_iso(),
+        "day_key": pulse_day_key(),
+        "user_id": identity.get("user_id"),
+        "username": identity.get("username"),
+        "display_name": identity.get("display_name") or identity.get("label"),
+        "status": "pending_review",
+        "review_message_sent": False,
+        "reviewed_at": None,
+        "reviewed_by": None,
+    }
+    pulse_question_suggestions.append(entry)
+    return {
+        "status": "ok",
+        "message": "Question saved for a future Pulse round.",
+        "entry": entry,
     }
 
 
@@ -2069,6 +2386,11 @@ def get_pulse_status(user_id: int | None = None, username: str | None = None):
         "sent": sent,
         "pending_queue": len([entry for entry in pulse_entries_for_day() if entry.get("status") == "queued"]),
     }
+
+
+@app.get("/api/pulse-question-roster")
+def get_pulse_question_roster():
+    return {"status": "ok", "questions": pulse_question_roster()}
 
 
 @app.post("/api/pulse-red-activate")
@@ -2111,7 +2433,7 @@ def submit_pulse(entry: PulseEntry):
     question = (entry.question or "").strip()
     if len(sender_note) < 3:
         return {"status": "error", "message": "Please add your own anonymous answer before sending your Pulse."}
-    if question not in PULSE_QUESTIONS[pulse_type]:
+    if question not in pulse_active_questions(pulse_type):
         return {"status": "error", "message": "Please choose one of the current Pulse questions."}
 
     slots = pulse_slot_state(identity.get("user_id"), identity.get("username"))
@@ -2124,6 +2446,7 @@ def submit_pulse(entry: PulseEntry):
         "id": len(pulse_entries) + 1,
         "day_key": pulse_day_key(),
         "pulse_type": pulse_type,
+        "category": pulse_question_category(question, pulse_type),
         "question": question,
         "sender_note": sender_note,
         "answer": sender_note,
@@ -2140,6 +2463,7 @@ def submit_pulse(entry: PulseEntry):
         "assignment_notify_after": None,
         "response_answer": None,
         "responded_at": None,
+        "admin_posted_at": None,
     }
     pulse_entries.append(data)
     assigned = pulse_match_next_receiver(identity, exclude_entry_id=data["id"])
@@ -2216,6 +2540,133 @@ def bot_pending_pulses(x_bot_sync_secret: str | None = Header(default=None)):
     verify_bot_sync_secret(x_bot_sync_secret)
     queued = [entry for entry in pulse_entries_for_day() if entry.get("status") == "queued"]
     return {"status": "ok", "entries": queued}
+
+
+@app.get("/api/bot-sync/pulses/completed")
+def bot_completed_pulses(x_bot_sync_secret: str | None = Header(default=None)):
+    verify_bot_sync_secret(x_bot_sync_secret)
+    return {"status": "ok", "entries": pulse_completed_admin_entries()}
+
+
+@app.get("/api/bot-sync/pulse-questions/pending")
+def bot_pending_pulse_question_suggestions(x_bot_sync_secret: str | None = Header(default=None)):
+    verify_bot_sync_secret(x_bot_sync_secret)
+    entries = [
+        entry for entry in pulse_question_suggestions
+        if entry.get("status") == "pending_review" and not entry.get("review_message_sent")
+    ]
+    return {"status": "ok", "entries": entries}
+
+
+@app.get("/api/bot-sync/pulse-questions/{suggestion_id}")
+def bot_pulse_question_suggestion(suggestion_id: int, x_bot_sync_secret: str | None = Header(default=None)):
+    verify_bot_sync_secret(x_bot_sync_secret)
+    entry = find_pulse_question_suggestion(suggestion_id)
+    if not entry:
+        return {"status": "error", "message": "Pulse question suggestion not found."}
+    return {"status": "ok", "entry": entry}
+
+
+@app.post("/api/bot-sync/pulse-questions/{suggestion_id}")
+def bot_update_pulse_question_suggestion(suggestion_id: int, payload: dict | None = None, x_bot_sync_secret: str | None = Header(default=None)):
+    verify_bot_sync_secret(x_bot_sync_secret)
+    entry = find_pulse_question_suggestion(suggestion_id)
+    if not entry:
+        return {"status": "error", "message": "Pulse question suggestion not found."}
+    payload = payload or {}
+    if "edited_question" in payload:
+        entry["edited_question"] = (payload.get("edited_question") or "").strip() or None
+    if "category" in payload:
+        entry["category"] = payload.get("category") or entry.get("category")
+    if "status" in payload:
+        entry["status"] = payload.get("status")
+    if "review_message_sent" in payload:
+        entry["review_message_sent"] = bool(payload.get("review_message_sent"))
+    if "reviewed_by" in payload:
+        entry["reviewed_by"] = payload.get("reviewed_by")
+    if "reviewed_at" in payload:
+        entry["reviewed_at"] = payload.get("reviewed_at")
+    return {"status": "ok", "entry": entry}
+
+
+@app.get("/api/bot-sync/pulse-questions/roster")
+def bot_pulse_question_roster(x_bot_sync_secret: str | None = Header(default=None)):
+    verify_bot_sync_secret(x_bot_sync_secret)
+    return {"status": "ok", "questions": pulse_question_roster()}
+
+
+@app.post("/api/bot-sync/pulse-questions/roster/{roster_id}/delete")
+def bot_delete_pulse_question(roster_id: int, payload: dict | None = None, x_bot_sync_secret: str | None = Header(default=None)):
+    verify_bot_sync_secret(x_bot_sync_secret)
+    entry = next((item for item in pulse_question_roster() if int(item.get("roster_id") or 0) == int(roster_id)), None)
+    if not entry:
+        return {"status": "error", "message": "Question number not found."}
+
+    if entry.get("source") == "default":
+        marker = {"pool": entry.get("pool"), "question": entry.get("question")}
+        if marker not in pulse_disabled_questions:
+            pulse_disabled_questions.append(marker)
+    elif entry.get("suggestion_id"):
+        suggestion = find_pulse_question_suggestion(entry.get("suggestion_id"))
+        if suggestion:
+            suggestion["status"] = "deleted"
+            suggestion["reviewed_at"] = now_iso()
+            if payload and payload.get("reviewed_by") is not None:
+                suggestion["reviewed_by"] = payload.get("reviewed_by")
+
+    return {"status": "ok", "deleted": entry}
+
+
+@app.post("/api/bot-sync/pulses/completed/{pulse_id}")
+def mark_completed_pulse_posted(pulse_id: int, x_bot_sync_secret: str | None = Header(default=None)):
+    verify_bot_sync_secret(x_bot_sync_secret)
+    entry = next((item for item in pulse_entries if int(item.get("id") or 0) == int(pulse_id)), None)
+    if not entry:
+        return {"status": "error", "message": "Pulse not found."}
+    entry["admin_posted_at"] = now_iso()
+    return {"status": "ok", "pulse": public_pulse_payload(entry)}
+
+
+@app.get("/api/bot-sync/pulses/daily-summaries")
+def bot_pulse_daily_summaries(x_bot_sync_secret: str | None = Header(default=None)):
+    verify_bot_sync_secret(x_bot_sync_secret)
+    current_day = pulse_day_key()
+    day_keys = sorted({
+        entry.get("day_key")
+        for entry in pulse_entries
+        if entry.get("status") == "completed" and entry.get("day_key") and entry.get("day_key") < current_day
+    })
+    summaries = []
+    for day_key in day_keys:
+        for summary in pulse_daily_summary_payload(day_key):
+            if not summary.get("admin_posted_at"):
+                summaries.append(summary)
+    return {"status": "ok", "summaries": summaries}
+
+
+@app.get("/api/bot-sync/pulses/daily-summaries/{day_key}/{category_slug}")
+def bot_pulse_daily_summary(day_key: str, category_slug: str, x_bot_sync_secret: str | None = Header(default=None)):
+    verify_bot_sync_secret(x_bot_sync_secret)
+    category = pulse_category_from_slug(category_slug)
+    summary = next(
+        (item for item in pulse_daily_summary_payload(day_key) if item.get("category") == category),
+        None,
+    )
+    if not summary:
+        return {"status": "error", "message": "Pulse summary not found."}
+    return {"status": "ok", "summary": summary}
+
+
+@app.post("/api/bot-sync/pulses/daily-summaries/{day_key}/{category_slug}")
+def mark_pulse_daily_summary_posted(day_key: str, category_slug: str, payload: dict | None = None, x_bot_sync_secret: str | None = Header(default=None)):
+    verify_bot_sync_secret(x_bot_sync_secret)
+    category = pulse_category_from_slug(category_slug)
+    state = pulse_daily_summary_state(day_key, category)
+    if payload and payload.get("published"):
+        state["published_at"] = now_iso()
+    else:
+        state["admin_posted_at"] = now_iso()
+    return {"status": "ok", "summary": state}
 
 
 @app.get("/api/bot-sync/pulses/notifications")
