@@ -715,8 +715,15 @@ def pulse_entries_for_day(day_key: str | None = None):
     return [entry for entry in pulse_entries if entry.get("day_key") == day]
 
 
+def pulse_completed_today_count(day_key: str | None = None):
+    return len([
+        entry for entry in pulse_entries_for_day(day_key)
+        if entry.get("status") == "completed"
+    ])
+
+
 def pulse_sent_today_count(day_key: str | None = None):
-    return len(pulse_entries_for_day(day_key))
+    return pulse_completed_today_count(day_key)
 
 
 def pulse_base_green_slots(now: datetime.datetime | None = None):
