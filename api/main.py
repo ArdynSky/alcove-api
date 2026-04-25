@@ -997,6 +997,11 @@ def pulse_heat_unlocked(day_key: str | None = None):
     return pulse_sent_today_count(day_key) >= pulse_heat_threshold()
 
 
+def pulse_red_unlocked_cycles(day_key: str | None = None) -> int:
+    threshold = max(1, pulse_heat_threshold())
+    return pulse_sent_today_count(day_key) // threshold
+
+
 def pulse_user_sent_entries(user_id, username=None, day_key: str | None = None):
     day = day_key or pulse_day_key()
     uname = (username or "").lower().lstrip("@")
@@ -1009,15 +1014,23 @@ def pulse_user_sent_entries(user_id, username=None, day_key: str | None = None):
     return rows
 
 
-def pulse_red_activation_for_user(user_id=None, username=None, day_key: str | None = None):
+def pulse_red_activations_for_user(user_id=None, username=None, day_key: str | None = None):
     day = day_key or pulse_day_key()
     uname = (username or "").lower().lstrip("@")
+    matches = []
     for entry in pulse_red_activations:
         if entry.get("day_key") != day:
             continue
         if user_id is not None and int(entry.get("user_id") or 0) == int(user_id):
-            return entry
-        if uname and (entry.get("username") or "").lower() == uname:
+            matches.append(entry)
+        elif uname and (entry.get("username") or "").lower() == uname:
+            matches.append(entry)
+    return matches
+
+
+def pulse_red_activation_for_user(user_id=None, username=None, day_key: str | None = None, cycle_number: int | None = None):
+    for entry in pulse_red_activations_for_user(user_id, username, day_key):
+        if cycle_number is None or int(entry.get("cycle_number") or 0) == int(cycle_number):
             return entry
     return None
 
@@ -1028,12 +1041,14 @@ def pulse_red_is_activated(user_id=None, username=None, day_key: str | None = No
 
 def activate_red_pulse_for_user(identity: dict, day_key: str | None = None):
     day = day_key or pulse_day_key()
-    existing = pulse_red_activation_for_user(identity.get("user_id"), identity.get("username"), day)
+    cycle_number = pulse_red_unlocked_cycles(day)
+    existing = pulse_red_activation_for_user(identity.get("user_id"), identity.get("username"), day, cycle_number)
     if existing:
         return existing
     entry = {
         "id": len(pulse_red_activations) + 1,
         "day_key": day,
+        "cycle_number": cycle_number,
         "user_id": identity.get("user_id"),
         "username": identity.get("username"),
         "display_name": identity.get("display_name") or identity.get("label"),
@@ -1051,12 +1066,19 @@ def pulse_slot_state(user_id=None, username=None, now: datetime.datetime | None 
     red_used = len([entry for entry in sent if entry.get("pulse_type") == "red"])
     green_total = pulse_base_green_slots(current)
     red_unlocked = pulse_heat_unlocked(day)
-    red_activated = pulse_red_is_activated(user_id, username, day)
-    red_ready = red_unlocked and red_used == 0 and not red_activated
     sent_today = pulse_sent_today_count(day)
     threshold = pulse_heat_threshold()
     testing = pulse_testing_unlimited()
     interval_hours = pulse_reset_interval_hours()
+    unlocked_cycles = pulse_red_unlocked_cycles(day)
+    activated_cycles = len(pulse_red_activations_for_user(user_id, username, day))
+    red_ready = unlocked_cycles > activated_cycles
+    red_activated = activated_cycles > 0
+    red_available = max(activated_cycles - red_used, 0)
+    cycle_completed = max(sent_today - (activated_cycles * threshold), 0)
+    if red_ready:
+        cycle_completed = threshold
+    remaining_today = 0 if red_ready else max(threshold - min(cycle_completed, threshold), 0)
     green_available = 99 if testing else max(green_total - green_used, 0)
     return {
         "day_key": day,
@@ -1068,11 +1090,14 @@ def pulse_slot_state(user_id=None, username=None, now: datetime.datetime | None 
         "red_ready": red_ready,
         "red_activated": red_activated,
         "red_used": red_used,
-        "red_available": 1 if red_unlocked and red_activated and red_used == 0 else 0,
+        "red_available": red_available,
+        "red_unlocked_cycles": unlocked_cycles,
+        "red_activated_cycles": activated_cycles,
         "sent_today": sent_today,
         "heat_threshold": threshold,
         "reset_interval_hours": interval_hours,
-        "remaining_today": max(threshold - sent_today, 0),
+        "cycle_completed": min(cycle_completed, threshold),
+        "remaining_today": remaining_today,
         "next_green_unlock_at": pulse_unlock_label(current, interval_hours),
         "next_unlock_at": next_pulse_unlock_at(current, interval_hours).isoformat(),
         "reset_seconds": seconds_until_next_pulse_unlock(current, interval_hours),
@@ -2458,12 +2483,10 @@ def activate_pulse_red(payload: PulseReceiptAck):
         return {"status": "error", "message": "Could not identify this Pulse user."}
 
     slots = pulse_slot_state(identity.get("user_id"), identity.get("username"))
-    if not slots["red_unlocked"]:
-        return {"status": "error", "message": "Red Pulse has not been unlocked yet."}
-    if slots["red_used"] > 0:
+    if not slots["red_ready"]:
         return {
-            "status": "ok",
-            "message": "You have already used your Red Pulse today.",
+            "status": "error",
+            "message": "Red Pulse has not been unlocked yet.",
             "slots": slots,
         }
 
@@ -2616,6 +2639,12 @@ def bot_pending_pulse_question_suggestions(x_bot_sync_secret: str | None = Heade
     return {"status": "ok", "entries": entries}
 
 
+@app.get("/api/bot-sync/pulse-questions/roster")
+def bot_pulse_question_roster(x_bot_sync_secret: str | None = Header(default=None)):
+    verify_bot_sync_secret(x_bot_sync_secret)
+    return {"status": "ok", "questions": pulse_question_roster()}
+
+
 @app.get("/api/bot-sync/pulse-questions/{suggestion_id}")
 def bot_pulse_question_suggestion(suggestion_id: int, x_bot_sync_secret: str | None = Header(default=None)):
     verify_bot_sync_secret(x_bot_sync_secret)
@@ -2645,12 +2674,6 @@ def bot_update_pulse_question_suggestion(suggestion_id: int, payload: dict | Non
     if "reviewed_at" in payload:
         entry["reviewed_at"] = payload.get("reviewed_at")
     return {"status": "ok", "entry": entry}
-
-
-@app.get("/api/bot-sync/pulse-questions/roster")
-def bot_pulse_question_roster(x_bot_sync_secret: str | None = Header(default=None)):
-    verify_bot_sync_secret(x_bot_sync_secret)
-    return {"status": "ok", "questions": pulse_question_roster()}
 
 
 @app.post("/api/bot-sync/pulse-questions/roster/{roster_id}/delete")
