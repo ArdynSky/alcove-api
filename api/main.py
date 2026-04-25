@@ -163,6 +163,7 @@ story_entries = []
 spotlight_entries = []
 pulse_entries = []
 pulse_receipts = []
+pulse_red_activations = []
 synced_alcove_users = []
 synced_alcove_analytics = {}
 last_bot_sync_at = None
@@ -743,6 +744,40 @@ def pulse_user_sent_entries(user_id, username=None, day_key: str | None = None):
     return rows
 
 
+def pulse_red_activation_for_user(user_id=None, username=None, day_key: str | None = None):
+    day = day_key or pulse_day_key()
+    uname = (username or "").lower().lstrip("@")
+    for entry in pulse_red_activations:
+        if entry.get("day_key") != day:
+            continue
+        if user_id is not None and int(entry.get("user_id") or 0) == int(user_id):
+            return entry
+        if uname and (entry.get("username") or "").lower() == uname:
+            return entry
+    return None
+
+
+def pulse_red_is_activated(user_id=None, username=None, day_key: str | None = None) -> bool:
+    return pulse_red_activation_for_user(user_id, username, day_key) is not None
+
+
+def activate_red_pulse_for_user(identity: dict, day_key: str | None = None):
+    day = day_key or pulse_day_key()
+    existing = pulse_red_activation_for_user(identity.get("user_id"), identity.get("username"), day)
+    if existing:
+        return existing
+    entry = {
+        "id": len(pulse_red_activations) + 1,
+        "day_key": day,
+        "user_id": identity.get("user_id"),
+        "username": identity.get("username"),
+        "display_name": identity.get("display_name") or identity.get("label"),
+        "activated_at": now_iso(),
+    }
+    pulse_red_activations.append(entry)
+    return entry
+
+
 def pulse_slot_state(user_id=None, username=None, now: datetime.datetime | None = None):
     current = now or uk_now()
     day = pulse_day_key(current)
@@ -751,6 +786,8 @@ def pulse_slot_state(user_id=None, username=None, now: datetime.datetime | None 
     red_used = len([entry for entry in sent if entry.get("pulse_type") == "red"])
     green_total = pulse_base_green_slots(current)
     red_unlocked = pulse_heat_unlocked(day)
+    red_activated = pulse_red_is_activated(user_id, username, day)
+    red_ready = red_unlocked and red_used == 0 and not red_activated
     sent_today = pulse_sent_today_count(day)
     threshold = pulse_heat_threshold()
     testing = pulse_testing_unlimited()
@@ -762,8 +799,10 @@ def pulse_slot_state(user_id=None, username=None, now: datetime.datetime | None 
         "green_used": green_used,
         "green_available": green_available,
         "red_unlocked": red_unlocked,
+        "red_ready": red_ready,
+        "red_activated": red_activated,
         "red_used": red_used,
-        "red_available": 1 if red_unlocked and red_used == 0 else 0,
+        "red_available": 1 if red_unlocked and red_activated and red_used == 0 else 0,
         "sent_today": sent_today,
         "heat_threshold": threshold,
         "remaining_today": max(threshold - sent_today, 0),
@@ -2022,6 +2061,32 @@ def get_pulse_status(user_id: int | None = None, username: str | None = None):
         "responded": responded,
         "sent": sent,
         "pending_queue": len([entry for entry in pulse_entries_for_day() if entry.get("status") == "queued"]),
+    }
+
+
+@app.post("/api/pulse-red-activate")
+def activate_pulse_red(payload: PulseReceiptAck):
+    identity = pulse_user_identity(payload.user_id, payload.username)
+    if not identity:
+        return {"status": "error", "message": "Could not identify this Pulse user."}
+
+    slots = pulse_slot_state(identity.get("user_id"), identity.get("username"))
+    if not slots["red_unlocked"]:
+        return {"status": "error", "message": "Red Pulse has not been unlocked yet."}
+    if slots["red_used"] > 0:
+        return {
+            "status": "ok",
+            "message": "You have already used your Red Pulse today.",
+            "slots": slots,
+        }
+
+    activation = activate_red_pulse_for_user(identity, slots["day_key"])
+    updated_slots = pulse_slot_state(identity.get("user_id"), identity.get("username"))
+    return {
+        "status": "ok",
+        "message": "Your Red Pulse is now active.",
+        "activation": activation,
+        "slots": updated_slots,
     }
 
 
