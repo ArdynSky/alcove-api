@@ -183,7 +183,7 @@ wheel_submission_limits = {}
 muted_users = set()
 current_winner = None
 PULSE_DEFAULT_HEAT_THRESHOLD = int(os.getenv("PULSE_HEAT_THRESHOLD", "50"))
-PULSE_TESTING_UNLIMITED = os.getenv("PULSE_TESTING_UNLIMITED", "1").strip().lower() in {"1", "true", "yes", "on"}
+PULSE_TESTING_UNLIMITED = os.getenv("PULSE_TESTING_UNLIMITED", "0").strip().lower() in {"1", "true", "yes", "on"}
 UK_TZ = ZoneInfo("Europe/London")
 
 state = {
