@@ -56,6 +56,10 @@ PULSE_SETTINGS_PATH = os.getenv(
     "PULSE_SETTINGS_PATH",
     os.path.join(os.getcwd(), "pulse_settings.json"),
 )
+RUNTIME_STATE_PATH = os.getenv(
+    "ALCOVE_RUNTIME_STATE_PATH",
+    os.path.join(os.getcwd(), "alcove_runtime_state.json"),
+)
 
 for path in [DOWNLOADS_DIR, READY_DIR, ARCHIVE_DIR, PLAYOUT_DIR]:
     os.makedirs(path, exist_ok=True)
@@ -196,6 +200,54 @@ state = {
         "shoutouts": False,
     },
 }
+
+
+def runtime_state_payload() -> dict:
+    return {
+        "spotlight_entries": spotlight_entries,
+        "pulse_entries": pulse_entries,
+        "pulse_receipts": pulse_receipts,
+        "pulse_red_activations": pulse_red_activations,
+        "pulse_question_suggestions": pulse_question_suggestions,
+        "pulse_daily_summary_posts": pulse_daily_summary_posts,
+        "pulse_disabled_questions": pulse_disabled_questions,
+    }
+
+
+def load_runtime_state() -> None:
+    global spotlight_entries, pulse_entries, pulse_receipts, pulse_red_activations
+    global pulse_question_suggestions, pulse_daily_summary_posts, pulse_disabled_questions
+
+    if not os.path.exists(RUNTIME_STATE_PATH):
+        return
+    try:
+        with open(RUNTIME_STATE_PATH, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return
+    if not isinstance(payload, dict):
+        return
+
+    spotlight_entries = payload.get("spotlight_entries") if isinstance(payload.get("spotlight_entries"), list) else []
+    pulse_entries = payload.get("pulse_entries") if isinstance(payload.get("pulse_entries"), list) else []
+    pulse_receipts = payload.get("pulse_receipts") if isinstance(payload.get("pulse_receipts"), list) else []
+    pulse_red_activations = payload.get("pulse_red_activations") if isinstance(payload.get("pulse_red_activations"), list) else []
+    pulse_question_suggestions = payload.get("pulse_question_suggestions") if isinstance(payload.get("pulse_question_suggestions"), list) else []
+    pulse_daily_summary_posts = payload.get("pulse_daily_summary_posts") if isinstance(payload.get("pulse_daily_summary_posts"), list) else []
+    pulse_disabled_questions = payload.get("pulse_disabled_questions") if isinstance(payload.get("pulse_disabled_questions"), list) else []
+
+
+def save_runtime_state() -> None:
+    directory = os.path.dirname(RUNTIME_STATE_PATH)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    temp_path = f"{RUNTIME_STATE_PATH}.tmp"
+    with open(temp_path, "w", encoding="utf-8") as handle:
+        json.dump(runtime_state_payload(), handle, indent=2, sort_keys=True)
+    os.replace(temp_path, RUNTIME_STATE_PATH)
+
+
+load_runtime_state()
 
 DEFAULT_FEATURE_FLAGS = {
     "pages": {
@@ -1043,6 +1095,7 @@ def activate_red_pulse_for_user(identity: dict, day_key: str | None = None):
         "activated_at": now_iso(),
     }
     pulse_red_activations.append(entry)
+    save_runtime_state()
     return entry
 
 
@@ -1193,6 +1246,7 @@ def pulse_match_next_receiver(receiver, exclude_entry_id=None):
         entry["delivered_at"] = now_iso()
         entry["assignment_notified_at"] = None
         entry["assignment_notify_after"] = pulse_notification_due_at()
+        save_runtime_state()
         return entry
     return None
 
@@ -1208,6 +1262,7 @@ def pulse_daily_summary_state(day_key: str, category: str):
         "published_at": None,
     }
     pulse_daily_summary_posts.append(state)
+    save_runtime_state()
     return state
 
 
@@ -2326,6 +2381,7 @@ def submit_spotlight(entry: SpotlightEntry):
             or (f"@{entry.nominator_username.lstrip('@')}" if entry.nominator_username else None)
         )
     spotlight_entries.append(data)
+    save_runtime_state()
     print(
         f"[{now_iso()}] spotlight submit success spotlight_id={data['id']} "
         f"nominator_user_id={data.get('nominator_user_id')} nominee_user_id={data.get('nominee_user_id')}",
@@ -2382,6 +2438,7 @@ def bot_update_spotlight(entry_id: int, payload: SpotlightReviewUpdate, x_bot_sy
         entry["reviewed_by"] = payload.reviewed_by
     if payload.reviewed_at is not None:
         entry["reviewed_at"] = payload.reviewed_at
+    save_runtime_state()
 
     return {"status": "ok", "entry": entry}
 
@@ -2442,6 +2499,7 @@ def submit_pulse_question_suggestion(payload: PulseQuestionSuggestion):
         "reviewed_by": None,
     }
     pulse_question_suggestions.append(entry)
+    save_runtime_state()
     print(
         f"[{now_iso()}] pulse question submit success suggestion_id={entry['id']} "
         f"pool={pool} category={category!r} user_id={identity.get('user_id')} username={identity.get('username')!r}",
@@ -2576,6 +2634,7 @@ def submit_pulse(entry: PulseEntry):
         "admin_posted_at": None,
     }
     pulse_entries.append(data)
+    save_runtime_state()
     assigned = pulse_match_next_receiver(identity, exclude_entry_id=data["id"])
     print(
         f"[{now_iso()}] pulse submit success pulse_id={data['id']} pulse_type={pulse_type} "
@@ -2643,6 +2702,7 @@ def respond_to_pulse_assignment(pulse_id: int, payload: PulseAssignmentResponse)
         "notify_after": pulse_notification_due_at(),
     }
     pulse_receipts.append(receipt)
+    save_runtime_state()
     print(
         f"[{now_iso()}] pulse answer success pulse_id={pulse_id} responder_user_id={identity.get('user_id')} "
         f"responder_username={identity.get('username')!r} receipt_id={receipt['id']}",
@@ -2664,6 +2724,7 @@ def acknowledge_pulse_receipt(receipt_id: int, payload: PulseReceiptAck):
         return {"status": "error", "message": "That Pulse is not assigned to you."}
 
     receipt["acknowledged_at"] = now_iso()
+    save_runtime_state()
     return {"status": "ok", "receipt": pulse_receipt_payload(receipt)}
 
 
@@ -2731,6 +2792,7 @@ def bot_respond_to_pulse(
         "notify_after": pulse_notification_due_at(),
     }
     pulse_receipts.append(receipt)
+    save_runtime_state()
     print(
         f"[{now_iso()}] bot pulse answer success pulse_id={pulse_id} responder_user_id={responder_user_id} "
         f"responder_username={responder_username!r} receipt_id={receipt['id']}",
@@ -2789,6 +2851,7 @@ def bot_update_pulse_question_suggestion(suggestion_id: int, payload: dict | Non
         entry["reviewed_by"] = payload.get("reviewed_by")
     if "reviewed_at" in payload:
         entry["reviewed_at"] = payload.get("reviewed_at")
+    save_runtime_state()
     return {"status": "ok", "entry": entry}
 
 
@@ -2810,6 +2873,7 @@ def bot_delete_pulse_question(roster_id: int, payload: dict | None = None, x_bot
             suggestion["reviewed_at"] = now_iso()
             if payload and payload.get("reviewed_by") is not None:
                 suggestion["reviewed_by"] = payload.get("reviewed_by")
+    save_runtime_state()
 
     return {"status": "ok", "deleted": entry}
 
@@ -2821,6 +2885,7 @@ def mark_completed_pulse_posted(pulse_id: int, x_bot_sync_secret: str | None = H
     if not entry:
         return {"status": "error", "message": "Pulse not found."}
     entry["admin_posted_at"] = now_iso()
+    save_runtime_state()
     return {"status": "ok", "pulse": public_pulse_payload(entry)}
 
 
@@ -2863,6 +2928,7 @@ def mark_pulse_daily_summary_posted(day_key: str, category_slug: str, payload: d
         state["published_at"] = now_iso()
     else:
         state["admin_posted_at"] = now_iso()
+    save_runtime_state()
     return {"status": "ok", "summary": state}
 
 
@@ -2920,6 +2986,7 @@ def mark_pulse_notification_sent(notification_id: str, x_bot_sync_secret: str | 
         if not entry:
             return {"status": "error", "message": "Pulse assignment not found."}
         entry["assignment_notified_at"] = now_iso()
+        save_runtime_state()
         return {"status": "ok", "pulse": public_pulse_payload(entry)}
 
     receipt_id = int(notification_id.replace("receipt-", "", 1))
@@ -2927,6 +2994,7 @@ def mark_pulse_notification_sent(notification_id: str, x_bot_sync_secret: str | 
     if not receipt:
         return {"status": "error", "message": "Pulse receipt not found."}
     receipt["notified_at"] = now_iso()
+    save_runtime_state()
     return {"status": "ok", "receipt": pulse_receipt_payload(receipt)}
 
 
