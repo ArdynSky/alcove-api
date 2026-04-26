@@ -986,7 +986,7 @@ def pulse_base_green_slots(now: datetime.datetime | None = None):
     midnight = datetime.datetime.combine(current.date(), datetime.time.min, tzinfo=UK_TZ)
     elapsed_seconds = max(0, int((current - midnight).total_seconds()))
     unlocked = 1 + (elapsed_seconds // (interval * 3600))
-    return max(1, min(2, unlocked))
+    return max(1, min(4, unlocked))
 
 
 def pulse_testing_unlimited() -> bool:
@@ -2284,11 +2284,19 @@ def allow_more(payload: dict):
 
 @app.post("/api/spotlight-entry")
 def submit_spotlight(entry: SpotlightEntry):
+    print(
+        f"[{now_iso()}] spotlight submit attempt "
+        f"nominee_user_id={entry.nominee_user_id} nominee_username={entry.nominee_username!r} "
+        f"nominator_user_id={entry.nominator_user_id} nominator_username={entry.nominator_username!r}",
+        flush=True,
+    )
     nominee = find_verified_alcove_user(entry.nominee_user_id, entry.nominee_username)
     if not nominee:
+        print(f"[{now_iso()}] spotlight submit rejected: nominee not verified", flush=True)
         return {"status": "error", "message": "That user is not a verified Alcove resident."}
 
     if not entry.nominator_user_id and not entry.nominator_username:
+        print(f"[{now_iso()}] spotlight submit rejected: missing Telegram identity", flush=True)
         return {
             "status": "error",
             "message": "Could not identify who submitted this Spotlight. Please open the Mini App from Telegram and try again.",
@@ -2296,11 +2304,14 @@ def submit_spotlight(entry: SpotlightEntry):
 
     nominator = find_verified_alcove_user(entry.nominator_user_id, entry.nominator_username)
     if entry.nominator_user_id and nominee.get("user_id") == entry.nominator_user_id:
+        print(f"[{now_iso()}] spotlight submit rejected: self nomination by user_id={entry.nominator_user_id}", flush=True)
         return {"status": "error", "message": "You cannot nominate yourself."}
     if entry.nominator_username and (nominee.get("username") or "").lower() == entry.nominator_username.lower():
+        print(f"[{now_iso()}] spotlight submit rejected: self nomination by username={entry.nominator_username!r}", flush=True)
         return {"status": "error", "message": "You cannot nominate yourself."}
 
     if spotlight_today_exists(entry.nominator_user_id, entry.nominator_username):
+        print(f"[{now_iso()}] spotlight submit rejected: already submitted today", flush=True)
         return {"status": "error", "message": "You have already submitted a Spotlight today."}
 
     data = entry.dict()
@@ -2327,6 +2338,11 @@ def submit_spotlight(entry: SpotlightEntry):
             or (f"@{entry.nominator_username.lstrip('@')}" if entry.nominator_username else None)
         )
     spotlight_entries.append(data)
+    print(
+        f"[{now_iso()}] spotlight submit success spotlight_id={data['id']} "
+        f"nominator_user_id={data.get('nominator_user_id')} nominee_user_id={data.get('nominee_user_id')}",
+        flush=True,
+    )
     add_notification("spotlight", f"Spotlight submitted for {entry.nominee_display_name}", False)
     return {
         "status": "ok",
@@ -2396,8 +2412,14 @@ def get_pulse_questions(user_id: int | None = None, username: str | None = None)
 
 @app.post("/api/pulse-question-suggestions")
 def submit_pulse_question_suggestion(payload: PulseQuestionSuggestion):
+    print(
+        f"[{now_iso()}] pulse question submit attempt pool={payload.pool or 'green'} "
+        f"category={payload.category!r} user_id={payload.user_id} username={payload.username!r}",
+        flush=True,
+    )
     identity = pulse_user_identity(payload.user_id, payload.username)
     if not identity:
+        print(f"[{now_iso()}] pulse question submit rejected: missing Telegram identity", flush=True)
         return {"status": "error", "message": "Could not identify your Telegram account. Please open the Mini App from Telegram and try again."}
 
     pool = (payload.pool or "green").strip().lower()
@@ -2406,10 +2428,13 @@ def submit_pulse_question_suggestion(payload: PulseQuestionSuggestion):
     allowed_categories = {"Mental health", "Physical health", "General"}
 
     if pool not in {"green", "red"}:
+        print(f"[{now_iso()}] pulse question submit rejected: invalid pool={pool!r}", flush=True)
         return {"status": "error", "message": "Please choose a valid Pulse pool."}
     if category not in allowed_categories:
+        print(f"[{now_iso()}] pulse question submit rejected: invalid category={category!r}", flush=True)
         return {"status": "error", "message": "Please choose a valid category."}
     if len(question) < 8:
+        print(f"[{now_iso()}] pulse question submit rejected: question too short", flush=True)
         return {"status": "error", "message": "Please add a little more detail before sending your question."}
 
     entry = {
@@ -2429,6 +2454,11 @@ def submit_pulse_question_suggestion(payload: PulseQuestionSuggestion):
         "reviewed_by": None,
     }
     pulse_question_suggestions.append(entry)
+    print(
+        f"[{now_iso()}] pulse question submit success suggestion_id={entry['id']} "
+        f"pool={pool} category={category!r} user_id={identity.get('user_id')} username={identity.get('username')!r}",
+        flush=True,
+    )
     return {
         "status": "ok",
         "message": "Question saved for a future Pulse round.",
@@ -2502,25 +2532,36 @@ def activate_pulse_red(payload: PulseReceiptAck):
 
 @app.post("/api/pulse-entry")
 def submit_pulse(entry: PulseEntry):
+    print(
+        f"[{now_iso()}] pulse submit attempt pulse_type={entry.pulse_type or 'green'} "
+        f"user_id={entry.user_id} username={entry.username!r} question={((entry.question or '').strip())[:80]!r}",
+        flush=True,
+    )
     identity = pulse_user_identity(entry.user_id, entry.username)
     if not identity:
+        print(f"[{now_iso()}] pulse submit rejected: missing Telegram identity", flush=True)
         return {"status": "error", "message": "Could not identify your Telegram account. Please open the Mini App from Telegram and try again."}
 
     pulse_type = (entry.pulse_type or "green").strip().lower()
     if pulse_type not in ("green", "red"):
+        print(f"[{now_iso()}] pulse submit rejected: unknown pulse type {pulse_type!r}", flush=True)
         return {"status": "error", "message": "Unknown Pulse type."}
 
     sender_note = (entry.answer or "").strip()
     question = (entry.question or "").strip()
     if len(sender_note) < 3:
+        print(f"[{now_iso()}] pulse submit rejected: answer too short", flush=True)
         return {"status": "error", "message": "Please add your own anonymous answer before sending your Pulse."}
     if question not in pulse_active_questions(pulse_type):
+        print(f"[{now_iso()}] pulse submit rejected: question not active", flush=True)
         return {"status": "error", "message": "Please choose one of the current Pulse questions."}
 
     slots = pulse_slot_state(identity.get("user_id"), identity.get("username"))
     if pulse_type == "green" and slots["green_available"] <= 0:
+        print(f"[{now_iso()}] pulse submit rejected: no green slot available", flush=True)
         return {"status": "error", "message": "You do not have a green Pulse available right now."}
     if pulse_type == "red" and slots["red_available"] <= 0:
+        print(f"[{now_iso()}] pulse submit rejected: no red slot available", flush=True)
         return {"status": "error", "message": "A red Pulse is not available right now."}
 
     data = {
@@ -2548,6 +2589,12 @@ def submit_pulse(entry: PulseEntry):
     }
     pulse_entries.append(data)
     assigned = pulse_match_next_receiver(identity, exclude_entry_id=data["id"])
+    print(
+        f"[{now_iso()}] pulse submit success pulse_id={data['id']} pulse_type={pulse_type} "
+        f"sender_user_id={identity.get('user_id')} sender_username={identity.get('username')!r} "
+        f"assigned_to_user_id={assigned.get('delivered_to_user_id') if assigned else None} queued={assigned is None}",
+        flush=True,
+    )
     updated_slots = pulse_slot_state(identity.get("user_id"), identity.get("username"))
     add_notification("pulse", "Anonymous Pulse submitted", False)
     return {
@@ -2561,22 +2608,33 @@ def submit_pulse(entry: PulseEntry):
 
 @app.post("/api/pulse-assignments/{pulse_id}/respond")
 def respond_to_pulse_assignment(pulse_id: int, payload: PulseAssignmentResponse):
+    print(
+        f"[{now_iso()}] pulse answer attempt pulse_id={pulse_id} user_id={payload.user_id} "
+        f"username={payload.username!r}",
+        flush=True,
+    )
     entry = next((item for item in pulse_entries if int(item.get("id") or 0) == int(pulse_id)), None)
     if not entry:
+        print(f"[{now_iso()}] pulse answer rejected: pulse not found", flush=True)
         return {"status": "error", "message": "Pulse assignment not found."}
     if entry.get("status") != "awaiting_response":
+        print(f"[{now_iso()}] pulse answer rejected: pulse already answered or not awaiting", flush=True)
         return {"status": "error", "message": "That Pulse has already been answered."}
 
     identity = pulse_user_identity(payload.user_id, payload.username)
     if not identity:
+        print(f"[{now_iso()}] pulse answer rejected: missing Telegram identity", flush=True)
         return {"status": "error", "message": "Could not identify this Pulse user."}
     if identity.get("user_id") is not None and int(entry.get("delivered_to_user_id") or 0) != int(identity.get("user_id")):
+        print(f"[{now_iso()}] pulse answer rejected: wrong recipient by user_id", flush=True)
         return {"status": "error", "message": "That Pulse is not assigned to you."}
     if identity.get("user_id") is None and (identity.get("username") or "").lower() != (entry.get("delivered_to_username") or "").lower():
+        print(f"[{now_iso()}] pulse answer rejected: wrong recipient by username", flush=True)
         return {"status": "error", "message": "That Pulse is not assigned to you."}
 
     answer = (payload.answer or "").strip()
     if len(answer) < 3:
+        print(f"[{now_iso()}] pulse answer rejected: answer too short", flush=True)
         return {"status": "error", "message": "Please add a little more before sending your answer."}
 
     entry["status"] = "completed"
@@ -2597,6 +2655,11 @@ def respond_to_pulse_assignment(pulse_id: int, payload: PulseAssignmentResponse)
         "notify_after": pulse_notification_due_at(),
     }
     pulse_receipts.append(receipt)
+    print(
+        f"[{now_iso()}] pulse answer success pulse_id={pulse_id} responder_user_id={identity.get('user_id')} "
+        f"responder_username={identity.get('username')!r} receipt_id={receipt['id']}",
+        flush=True,
+    )
     return {"status": "ok", "receipt": pulse_receipt_payload(receipt)}
 
 
