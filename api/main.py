@@ -2674,6 +2674,71 @@ def bot_pending_pulses(x_bot_sync_secret: str | None = Header(default=None)):
     return {"status": "ok", "entries": queued}
 
 
+@app.get("/api/bot-sync/pulses/outstanding")
+def bot_outstanding_pulses(x_bot_sync_secret: str | None = Header(default=None)):
+    verify_bot_sync_secret(x_bot_sync_secret)
+    entries = []
+    for entry in pulse_entries_for_day():
+        if entry.get("status") != "awaiting_response":
+            continue
+        payload = public_pulse_payload(entry) or {}
+        payload["delivered_to_user_id"] = entry.get("delivered_to_user_id")
+        payload["delivered_to_username"] = entry.get("delivered_to_username")
+        payload["delivered_to_display_name"] = entry.get("delivered_to_display_name")
+        payload["assignment_notified_at"] = entry.get("assignment_notified_at")
+        payload["assignment_notify_after"] = entry.get("assignment_notify_after")
+        entries.append(payload)
+    return {"status": "ok", "entries": entries}
+
+
+@app.post("/api/bot-sync/pulses/respond/{pulse_id}")
+def bot_respond_to_pulse(
+    pulse_id: int,
+    payload: dict | None = None,
+    x_bot_sync_secret: str | None = Header(default=None),
+):
+    verify_bot_sync_secret(x_bot_sync_secret)
+    payload = payload or {}
+    entry = next((item for item in pulse_entries if int(item.get("id") or 0) == int(pulse_id)), None)
+    if not entry:
+        return {"status": "error", "message": "Pulse assignment not found."}
+    if entry.get("status") != "awaiting_response":
+        return {"status": "error", "message": "That Pulse has already been answered."}
+
+    answer = (payload.get("answer") or "").strip()
+    if len(answer) < 3:
+        return {"status": "error", "message": "Please add a little more before sending your answer."}
+
+    responder_user_id = payload.get("responder_user_id")
+    responder_username = clean_username(payload.get("responder_username"))
+    responder_display_name = payload.get("responder_display_name") or responder_username or str(responder_user_id or "Admin")
+
+    entry["status"] = "completed"
+    entry["response_answer"] = answer
+    entry["responder_user_id"] = responder_user_id
+    entry["responder_username"] = responder_username
+    entry["responder_display_name"] = responder_display_name
+    entry["responded_at"] = now_iso()
+    receipt = {
+        "id": len(pulse_receipts) + 1,
+        "pulse_id": entry.get("id"),
+        "recipient_user_id": entry.get("sender_user_id"),
+        "recipient_username": entry.get("sender_username"),
+        "recipient_display_name": entry.get("sender_display_name"),
+        "received_at": entry["responded_at"],
+        "acknowledged_at": None,
+        "notified_at": None,
+        "notify_after": pulse_notification_due_at(),
+    }
+    pulse_receipts.append(receipt)
+    print(
+        f"[{now_iso()}] bot pulse answer success pulse_id={pulse_id} responder_user_id={responder_user_id} "
+        f"responder_username={responder_username!r} receipt_id={receipt['id']}",
+        flush=True,
+    )
+    return {"status": "ok", "receipt": pulse_receipt_payload(receipt), "pulse": public_pulse_payload(entry)}
+
+
 @app.get("/api/bot-sync/pulses/completed")
 def bot_completed_pulses(x_bot_sync_secret: str | None = Header(default=None)):
     verify_bot_sync_secret(x_bot_sync_secret)
