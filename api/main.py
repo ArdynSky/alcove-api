@@ -2330,16 +2330,25 @@ def submit_spotlight(entry: SpotlightEntry):
     print(
         f"[{now_iso()}] spotlight submit attempt "
         f"nominee_user_id={entry.nominee_user_id} nominee_username={entry.nominee_username!r} "
-        f"nominator_user_id={entry.nominator_user_id} nominator_username={entry.nominator_username!r}",
+        f"nominator_user_id={entry.nominator_user_id} nominator_username={entry.nominator_username!r} "
+        f"style={entry.style!r} reason_len={len((entry.reason or '').strip())}",
         flush=True,
     )
     nominee = find_verified_alcove_user(entry.nominee_user_id, entry.nominee_username)
     if not nominee:
-        print(f"[{now_iso()}] spotlight submit rejected: nominee not verified", flush=True)
+        print(
+            f"[{now_iso()}] spotlight submit rejected: nominee not verified "
+            f"nominee_user_id={entry.nominee_user_id} nominee_username={entry.nominee_username!r}",
+            flush=True,
+        )
         return {"status": "error", "message": "That user is not a verified Alcove resident."}
 
     if not entry.nominator_user_id and not entry.nominator_username:
-        print(f"[{now_iso()}] spotlight submit rejected: missing Telegram identity", flush=True)
+        print(
+            f"[{now_iso()}] spotlight submit rejected: missing Telegram identity "
+            f"nominee_user_id={entry.nominee_user_id} nominee_username={entry.nominee_username!r}",
+            flush=True,
+        )
         return {
             "status": "error",
             "message": "Could not identify who submitted this Spotlight. Please open the Mini App from Telegram and try again.",
@@ -2347,14 +2356,24 @@ def submit_spotlight(entry: SpotlightEntry):
 
     nominator = find_verified_alcove_user(entry.nominator_user_id, entry.nominator_username)
     if entry.nominator_user_id and nominee.get("user_id") == entry.nominator_user_id:
-        print(f"[{now_iso()}] spotlight submit rejected: self nomination by user_id={entry.nominator_user_id}", flush=True)
+        print(
+            f"[{now_iso()}] spotlight submit rejected: self nomination by user_id={entry.nominator_user_id}",
+            flush=True,
+        )
         return {"status": "error", "message": "You cannot nominate yourself."}
     if entry.nominator_username and (nominee.get("username") or "").lower() == entry.nominator_username.lower():
-        print(f"[{now_iso()}] spotlight submit rejected: self nomination by username={entry.nominator_username!r}", flush=True)
+        print(
+            f"[{now_iso()}] spotlight submit rejected: self nomination by username={entry.nominator_username!r}",
+            flush=True,
+        )
         return {"status": "error", "message": "You cannot nominate yourself."}
 
     if spotlight_today_exists(entry.nominator_user_id, entry.nominator_username):
-        print(f"[{now_iso()}] spotlight submit rejected: already submitted today", flush=True)
+        print(
+            f"[{now_iso()}] spotlight submit rejected: already submitted today "
+            f"nominator_user_id={entry.nominator_user_id} nominator_username={entry.nominator_username!r}",
+            flush=True,
+        )
         return {"status": "error", "message": "You have already submitted a Spotlight today."}
 
     data = entry.dict()
@@ -2384,7 +2403,8 @@ def submit_spotlight(entry: SpotlightEntry):
     save_runtime_state()
     print(
         f"[{now_iso()}] spotlight submit success spotlight_id={data['id']} "
-        f"nominator_user_id={data.get('nominator_user_id')} nominee_user_id={data.get('nominee_user_id')}",
+        f"nominator_user_id={data.get('nominator_user_id')} nominee_user_id={data.get('nominee_user_id')} "
+        f"style={data.get('style')!r}",
         flush=True,
     )
     add_notification("spotlight", f"Spotlight submitted for {entry.nominee_display_name}", False)
@@ -2770,9 +2790,13 @@ def bot_respond_to_pulse(
     if len(answer) < 3:
         return {"status": "error", "message": "Please add a little more before sending your answer."}
 
-    responder_user_id = payload.get("responder_user_id")
-    responder_username = clean_username(payload.get("responder_username"))
-    responder_display_name = payload.get("responder_display_name") or responder_username or str(responder_user_id or "Admin")
+    responder_user_id = entry.get("delivered_to_user_id")
+    responder_username = clean_username(entry.get("delivered_to_username"))
+    responder_display_name = (
+        entry.get("delivered_to_display_name")
+        or responder_username
+        or str(responder_user_id or "Anonymous")
+    )
 
     entry["status"] = "completed"
     entry["response_answer"] = answer
