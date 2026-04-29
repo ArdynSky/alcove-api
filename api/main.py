@@ -2831,6 +2831,21 @@ def bot_completed_pulses(x_bot_sync_secret: str | None = Header(default=None)):
     return {"status": "ok", "entries": pulse_completed_admin_entries()}
 
 
+@app.get("/api/bot-sync/pulses/export")
+def bot_export_pulses(x_bot_sync_secret: str | None = Header(default=None)):
+    verify_bot_sync_secret(x_bot_sync_secret)
+    entries = [public_pulse_payload(entry) for entry in pulse_entries]
+    entries = [entry for entry in entries if entry]
+    entries.sort(
+        key=lambda item: (
+            (item.get("question") or "").lower(),
+            item.get("sent_at") or "",
+            int(item.get("pulse_id") or 0),
+        )
+    )
+    return {"status": "ok", "entries": entries}
+
+
 @app.get("/api/bot-sync/pulse-questions/pending")
 def bot_pending_pulse_question_suggestions(x_bot_sync_secret: str | None = Header(default=None)):
     verify_bot_sync_secret(x_bot_sync_secret)
