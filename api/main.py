@@ -60,6 +60,10 @@ RUNTIME_STATE_PATH = os.getenv(
     "ALCOVE_RUNTIME_STATE_PATH",
     os.path.join(os.getcwd(), "alcove_runtime_state.json"),
 )
+STATE_DB_PATH = os.getenv(
+    "ALCOVE_STATE_DB_PATH",
+    os.path.join(os.getcwd(), "alcove_state.db"),
+)
 
 for path in [DOWNLOADS_DIR, READY_DIR, ARCHIVE_DIR, PLAYOUT_DIR]:
     os.makedirs(path, exist_ok=True)
@@ -214,9 +218,79 @@ def runtime_state_payload() -> dict:
     }
 
 
-def load_runtime_state() -> None:
+def ensure_state_store() -> None:
+    directory = os.path.dirname(STATE_DB_PATH)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    with sqlite3.connect(STATE_DB_PATH) as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS runtime_state_store (
+                state_key TEXT PRIMARY KEY,
+                payload_json TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.commit()
+
+
+def apply_runtime_payload(payload: dict) -> None:
     global spotlight_entries, pulse_entries, pulse_receipts, pulse_red_activations
     global pulse_question_suggestions, pulse_daily_summary_posts, pulse_disabled_questions
+
+    spotlight_entries = payload.get("spotlight_entries") if isinstance(payload.get("spotlight_entries"), list) else []
+    pulse_entries = payload.get("pulse_entries") if isinstance(payload.get("pulse_entries"), list) else []
+    pulse_receipts = payload.get("pulse_receipts") if isinstance(payload.get("pulse_receipts"), list) else []
+    pulse_red_activations = payload.get("pulse_red_activations") if isinstance(payload.get("pulse_red_activations"), list) else []
+    pulse_question_suggestions = payload.get("pulse_question_suggestions") if isinstance(payload.get("pulse_question_suggestions"), list) else []
+    pulse_daily_summary_posts = payload.get("pulse_daily_summary_posts") if isinstance(payload.get("pulse_daily_summary_posts"), list) else []
+    pulse_disabled_questions = payload.get("pulse_disabled_questions") if isinstance(payload.get("pulse_disabled_questions"), list) else []
+
+
+def load_runtime_state_from_db() -> dict | None:
+    ensure_state_store()
+    try:
+        with sqlite3.connect(STATE_DB_PATH) as conn:
+            row = conn.execute(
+                "SELECT payload_json FROM runtime_state_store WHERE state_key = ?",
+                ("alcove_runtime",),
+            ).fetchone()
+    except sqlite3.Error:
+        return None
+    if not row or not row[0]:
+        return None
+    try:
+        payload = json.loads(row[0])
+    except (TypeError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    return payload
+
+
+def save_runtime_state_to_db(payload: dict) -> None:
+    ensure_state_store()
+    serialized = json.dumps(payload, indent=2, sort_keys=True)
+    with sqlite3.connect(STATE_DB_PATH) as conn:
+        conn.execute(
+            """
+            INSERT INTO runtime_state_store (state_key, payload_json, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(state_key) DO UPDATE SET
+                payload_json = excluded.payload_json,
+                updated_at = excluded.updated_at
+            """,
+            ("alcove_runtime", serialized, datetime.datetime.utcnow().isoformat()),
+        )
+        conn.commit()
+
+
+def load_runtime_state() -> None:
+    payload = load_runtime_state_from_db()
+    if isinstance(payload, dict):
+        apply_runtime_payload(payload)
+        return
 
     if not os.path.exists(RUNTIME_STATE_PATH):
         return
@@ -228,22 +302,23 @@ def load_runtime_state() -> None:
     if not isinstance(payload, dict):
         return
 
-    spotlight_entries = payload.get("spotlight_entries") if isinstance(payload.get("spotlight_entries"), list) else []
-    pulse_entries = payload.get("pulse_entries") if isinstance(payload.get("pulse_entries"), list) else []
-    pulse_receipts = payload.get("pulse_receipts") if isinstance(payload.get("pulse_receipts"), list) else []
-    pulse_red_activations = payload.get("pulse_red_activations") if isinstance(payload.get("pulse_red_activations"), list) else []
-    pulse_question_suggestions = payload.get("pulse_question_suggestions") if isinstance(payload.get("pulse_question_suggestions"), list) else []
-    pulse_daily_summary_posts = payload.get("pulse_daily_summary_posts") if isinstance(payload.get("pulse_daily_summary_posts"), list) else []
-    pulse_disabled_questions = payload.get("pulse_disabled_questions") if isinstance(payload.get("pulse_disabled_questions"), list) else []
+    apply_runtime_payload(payload)
+    try:
+        save_runtime_state_to_db(payload)
+    except sqlite3.Error:
+        pass
 
 
 def save_runtime_state() -> None:
+    payload = runtime_state_payload()
+    save_runtime_state_to_db(payload)
+
     directory = os.path.dirname(RUNTIME_STATE_PATH)
     if directory:
         os.makedirs(directory, exist_ok=True)
     temp_path = f"{RUNTIME_STATE_PATH}.tmp"
     with open(temp_path, "w", encoding="utf-8") as handle:
-        json.dump(runtime_state_payload(), handle, indent=2, sort_keys=True)
+        json.dump(payload, handle, indent=2, sort_keys=True)
     os.replace(temp_path, RUNTIME_STATE_PATH)
 
 
