@@ -181,6 +181,8 @@ last_bot_sync_at = None
 
 current_now_playing = None
 video_reviews = []
+current_wheel_reaction = None
+latest_review_overlay = None
 
 pending_comments = []
 approved_comments = []
@@ -197,6 +199,9 @@ UK_TZ = ZoneInfo("Europe/London")
 state = {
     "current_round": 1,
     "round_status": "closed",  # closed | open | locked | spinning | playing
+    "room_open": True,
+    "closing_soon": False,
+    "review_prompt_open": False,
     "modules": {
         "wheel": True,
         "asmr": False,
@@ -431,6 +436,13 @@ class StreamComment(BaseModel):
     username: str | None = None
     display_name: str
     text: str
+
+
+class WheelReaction(BaseModel):
+    user_id: int | None = None
+    username: str | None = None
+    display_name: str
+    reaction_key: str
 
 
 class ModuleStateUpdate(BaseModel):
@@ -1481,6 +1493,10 @@ def get_round_entries(round_number: int):
     return [entry for entry in wheel_entries if entry.get("round_id") == round_number]
 
 
+def entry_is_approved(entry: dict) -> bool:
+    return entry.get("approval_status") == "approved"
+
+
 def get_room_users():
     users = {}
     for entry in wheel_entries + archived_wheel_entries:
@@ -1522,6 +1538,36 @@ def get_room_users():
 
     return sorted(users.values(), key=lambda u: (u["display_name"] or "").lower())
 
+
+def current_active_wheel_reaction():
+    global current_wheel_reaction
+    if not current_wheel_reaction:
+        return None
+    expires_at = current_wheel_reaction.get("expires_at")
+    if expires_at:
+        try:
+            if datetime.datetime.fromisoformat(expires_at) <= datetime.datetime.utcnow():
+                current_wheel_reaction = None
+                return None
+        except Exception:
+            pass
+    return current_wheel_reaction
+
+
+def current_active_review_overlay():
+    global latest_review_overlay
+    if not latest_review_overlay:
+        return None
+    expires_at = latest_review_overlay.get("expires_at")
+    if expires_at:
+        try:
+            if datetime.datetime.fromisoformat(expires_at) <= datetime.datetime.utcnow():
+                latest_review_overlay = None
+                return None
+        except Exception:
+            pass
+    return latest_review_overlay
+
 def get_next_spin_pool(round_number: int):
     return get_ready_unplayed_entries(round_number)
 
@@ -1535,6 +1581,7 @@ def get_ready_unplayed_entries(round_number: int):
         entry
         for entry in wheel_entries
         if entry.get("round_id") == round_number
+        and entry_is_approved(entry)
         and not entry.get("played", False)
         and entry_is_download_ready(entry)
     ]
@@ -1708,6 +1755,11 @@ def get_app_state():
         "room_users": get_room_users(),
         "current_winner": current_winner,
         "current_now_playing": current_now_playing,
+        "room_open": state.get("room_open", True),
+        "closing_soon": state.get("closing_soon", False),
+        "review_prompt_open": state.get("review_prompt_open", False),
+        "active_wheel_reaction": current_active_wheel_reaction(),
+        "active_review_overlay": current_active_review_overlay(),
     }
 
 
@@ -1719,6 +1771,9 @@ def get_app_state():
 def open_round():
     current_round = state["current_round"]
     state["round_status"] = "open"
+    state["room_open"] = True
+    state["closing_soon"] = False
+    state["review_prompt_open"] = False
     current_round_entries = get_round_entries(current_round)
     wheel_submission_limits.clear()
     add_notification("system", f"Round {current_round} submissions open", True)
@@ -1773,6 +1828,7 @@ def end_round():
     global current_winner, current_now_playing
     current_round = state["current_round"]
     state["round_status"] = "closed"
+    state["review_prompt_open"] = False
     current_winner = None
     current_now_playing = None
     video_reviews.clear()
@@ -1905,6 +1961,7 @@ def submit_wheel(entry: WheelEntry):
         1
         for e in get_round_entries(state["current_round"])
         if e["data"]["display_name"].lower() == user_key
+        and e.get("approval_status") != "rejected"
     )
 
     if current >= allowed:
@@ -1930,6 +1987,9 @@ def submit_wheel(entry: WheelEntry):
         "local_path": None,
         "download_started_at": None,
         "download_completed_at": None,
+        "approval_status": "pending",
+        "approval_time": None,
+        "rejection_time": None,
     }
 
     wheel_entries.append(new_entry)
@@ -1953,6 +2013,7 @@ def list_wheel_entries_host():
     return [
         {
             "entry_id": entry["id"],
+            "id": entry["id"],
             "round_id": entry["round_id"],
             "display_name": entry["data"].get("display_name"),
             "username": entry["data"].get("username"),
@@ -1968,6 +2029,10 @@ def list_wheel_entries_host():
             "played": entry.get("played", False),
             "played_at": entry.get("played_at"),
             "time": entry.get("time"),
+            "approval_status": entry.get("approval_status", "pending"),
+            "approval_time": entry.get("approval_time"),
+            "rejection_time": entry.get("rejection_time"),
+            "data": entry.get("data"),
         }
         for entry in wheel_entries
     ]
@@ -2016,7 +2081,8 @@ def list_pending_downloads():
     pending = [
         entry
         for entry in wheel_entries
-        if entry.get("download_status") in {"pending", "failed"}
+        if entry.get("approval_status") == "approved"
+        and entry.get("download_status") in {"pending", "failed"}
         and not entry.get("played", False)
     ]
     pending.sort(key=lambda e: (e["round_id"], e["id"]))
@@ -2029,9 +2095,46 @@ def list_pending_downloads():
             "source_domain": entry.get("source_domain"),
             "download_status": entry.get("download_status"),
             "download_error": entry.get("download_error"),
+            "approval_status": entry.get("approval_status", "pending"),
         }
         for entry in pending
     ]
+
+
+@app.post("/api/entry/approve/{entry_id}")
+def approve_entry(entry_id: int):
+    entry = find_entry(entry_id)
+    if not entry:
+        return {"status": "error", "message": "entry not found"}
+
+    entry["approval_status"] = "approved"
+    entry["approval_time"] = now_iso()
+    entry["rejection_time"] = None
+    add_notification("system", f"Approved: {entry['data'].get('display_name', 'Unknown')}", False)
+    ws_broadcast_bundle()
+    return {"status": "ok", "entry_id": entry_id, "approval_status": "approved"}
+
+
+@app.post("/api/entry/reject/{entry_id}")
+def reject_entry(entry_id: int):
+    entry = find_entry(entry_id)
+    if not entry:
+        return {"status": "error", "message": "entry not found"}
+
+    entry["approval_status"] = "rejected"
+    entry["approval_time"] = None
+    entry["rejection_time"] = now_iso()
+    entry["download_status"] = "rejected"
+    entry["download_error"] = None
+    entry["download_started_at"] = None
+    entry["download_completed_at"] = None
+    entry["direct_media_url"] = None
+    entry["local_filename"] = None
+    entry["local_path"] = None
+    entry["download_method"] = None
+    add_notification("system", f"Rejected: {entry['data'].get('display_name', 'Unknown')}", False)
+    ws_broadcast_bundle()
+    return {"status": "ok", "entry_id": entry_id, "approval_status": "rejected"}
 
 
 @app.post("/api/downloads/start/{entry_id}")
@@ -2039,6 +2142,9 @@ def mark_download_start(entry_id: int):
     entry = find_entry(entry_id)
     if not entry:
         return {"status": "error", "message": "entry not found"}
+
+    if not entry_is_approved(entry):
+        return {"status": "error", "message": "entry is not approved"}
 
     entry["download_status"] = "extracting"
     entry["download_started_at"] = now_iso()
@@ -2052,6 +2158,9 @@ def mark_downloading(entry_id: int, payload: dict | None = None):
     if not entry:
         return {"status": "error", "message": "entry not found"}
 
+    if not entry_is_approved(entry):
+        return {"status": "error", "message": "entry is not approved"}
+
     entry["download_status"] = "downloading"
     if payload and payload.get("direct_media_url"):
         entry["direct_media_url"] = payload["direct_media_url"]
@@ -2063,6 +2172,9 @@ def mark_download_complete(entry_id: int, payload: DownloadCompletePayload):
     entry = find_entry(entry_id)
     if not entry:
         return {"status": "error", "message": "entry not found"}
+
+    if not entry_is_approved(entry):
+        return {"status": "error", "message": "entry is not approved"}
 
     entry["download_status"] = "ready"
     entry["download_error"] = None
@@ -2082,6 +2194,9 @@ def mark_download_failed(entry_id: int, payload: DownloadFailedPayload):
     if not entry:
         return {"status": "error", "message": "entry not found"}
 
+    if not entry_is_approved(entry):
+        return {"status": "error", "message": "entry is not approved"}
+
     entry["download_status"] = "failed"
     entry["download_error"] = payload.error
     entry["download_method"] = "auto"
@@ -2093,6 +2208,9 @@ def mark_manual_ready(entry_id: int, payload: ManualReadyPayload):
     entry = find_entry(entry_id)
     if not entry:
         return {"status": "error", "message": "entry not found"}
+
+    if not entry_is_approved(entry):
+        return {"status": "error", "message": "entry is not approved"}
 
     entry["download_status"] = "manual_ready"
     entry["download_error"] = None
@@ -2110,6 +2228,9 @@ def retry_download(entry_id: int):
     entry = find_entry(entry_id)
     if not entry:
         return {"status": "error", "message": "entry not found"}
+
+    if not entry_is_approved(entry):
+        return {"status": "error", "message": "entry is not approved"}
 
     entry["download_status"] = "pending"
     entry["download_error"] = None
@@ -2186,6 +2307,7 @@ def set_now_playing(entry_id: int):
     global current_now_playing
     video_reviews.clear()
     state["round_status"] = "playing"
+    state["review_prompt_open"] = False
     entry = find_entry(entry_id)
     if not entry:
         return {"status": "error"}
@@ -2225,7 +2347,7 @@ def mark_played(entry_id: int):
 
 @app.post("/api/review")
 def submit_review(review: VideoReview):
-    global current_now_playing
+    global current_now_playing, latest_review_overlay
     if current_now_playing is None or "data" not in current_now_playing:
         return {"status": "error", "message": "Reviews are closed until a video is live."}
 
@@ -2249,7 +2371,34 @@ def submit_review(review: VideoReview):
         }
     )
 
+    latest_review_overlay = {
+        "display_name": reviewer_name,
+        "rating": review.rating,
+        "review": review.review,
+        "video_entry_id": current_now_playing.get("id"),
+        "expires_at": (datetime.datetime.utcnow() + datetime.timedelta(seconds=5)).isoformat(),
+        "time": now_iso(),
+    }
+    ws_broadcast_bundle()
+
     return {"status": "ok", "reviews": len(video_reviews)}
+
+
+@app.post("/api/review/open")
+def open_review_prompt():
+    state["review_prompt_open"] = True
+    state["round_status"] = "reviewing"
+    ws_broadcast_bundle()
+    return {"status": "ok"}
+
+
+@app.post("/api/review/close")
+def close_review_prompt():
+    state["review_prompt_open"] = False
+    if current_now_playing:
+        state["round_status"] = "playing"
+    ws_broadcast_bundle()
+    return {"status": "ok"}
 
 
 @app.get("/api/reviews")
@@ -2336,6 +2485,26 @@ def reject_comment(comment_id: int):
     return {"status": "error"}
 
 
+@app.post("/api/wheel-reaction")
+def submit_wheel_reaction(payload: WheelReaction):
+    global current_wheel_reaction
+    allowed = {"fire", "shock", "hot", "love", "wild"}
+    reaction_key = (payload.reaction_key or "").strip().lower()
+    if reaction_key not in allowed:
+        return {"status": "error", "message": "Unknown reaction."}
+
+    current_wheel_reaction = {
+        "reaction_key": reaction_key,
+        "display_name": payload.display_name,
+        "username": payload.username,
+        "user_id": payload.user_id,
+        "expires_at": (datetime.datetime.utcnow() + datetime.timedelta(seconds=5)).isoformat(),
+        "time": now_iso(),
+    }
+    ws_broadcast_bundle()
+    return {"status": "ok", "reaction": current_wheel_reaction}
+
+
 # ---------------------------------
 # Notification feed
 # ---------------------------------
@@ -2391,6 +2560,36 @@ def archive_wheel_entry(entry_id: int):
 # ---------------------------------
 # Legacy / extra sections
 # ---------------------------------
+
+@app.post("/api/room/close")
+def close_room():
+    state["closing_soon"] = True
+    state["room_open"] = False
+    ws_broadcast_bundle()
+    return {"status": "ok"}
+
+
+@app.post("/api/user/extra-spin")
+def user_extra_spin(payload: dict):
+    name = (payload.get("display_name") or "").strip().lower()
+    if not name:
+        return {"status": "error", "message": "display_name required"}
+    wheel_submission_limits[name] = wheel_submission_limits.get(name, 1) + 1
+    ws_broadcast_bundle()
+    return {"status": "ok", "submission_limit": wheel_submission_limits[name]}
+
+
+@app.post("/api/user/mute")
+def user_mute(payload: dict):
+    name = (payload.get("display_name") or "").strip().lower()
+    if not name:
+        return {"status": "error", "message": "display_name required"}
+    if payload.get("muted"):
+        muted_users.add(name)
+    else:
+        muted_users.discard(name)
+    ws_broadcast_bundle()
+    return {"status": "ok", "muted": name in muted_users}
 
 @app.post("/api/wheel-entry/allow-more")
 def allow_more(payload: dict):
