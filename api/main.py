@@ -1,7 +1,8 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from urllib.parse import urlparse
+import re
+from urllib.parse import urlparse, unquote
 from pathlib import Path
 from zoneinfo import ZoneInfo
 import datetime
@@ -467,6 +468,11 @@ class DownloadFailedPayload(BaseModel):
 class ManualReadyPayload(BaseModel):
     local_filename: str
     local_path: str
+    video_title: str | None = None
+
+
+class ManualReadyByFilenamePayload(BaseModel):
+    filename: str
     video_title: str | None = None
 
 
@@ -1162,6 +1168,23 @@ def pulse_red_activation_for_user(user_id=None, username=None, day_key: str | No
     return None
 
 
+def derive_video_title_from_url(url: str) -> str | None:
+    try:
+        parsed = urlparse(url)
+        slug = (parsed.path or "").rstrip("/").split("/")[-1]
+        if not slug:
+            return None
+        slug = unquote(slug)
+        slug = re.sub(r"\.[a-z0-9]{2,5}$", "", slug, flags=re.IGNORECASE)
+        slug = re.sub(r"[-_]+", " ", slug)
+        slug = re.sub(r"\s+", " ", slug).strip()
+        if not slug:
+            return None
+        return slug[:120]
+    except Exception:
+        return None
+
+
 def pulse_red_is_activated(user_id=None, username=None, day_key: str | None = None) -> bool:
     return pulse_red_activation_for_user(user_id, username, day_key) is not None
 
@@ -1497,6 +1520,17 @@ def entry_is_approved(entry: dict) -> bool:
     return entry.get("approval_status") == "approved"
 
 
+def wheel_entry_matches_submitter(entry: dict, telegram_id=None, username=None, display_name=None) -> bool:
+    data = entry.get("data") or {}
+    if telegram_id is not None and data.get("telegram_id") == telegram_id:
+        return True
+    if username and (data.get("username") or "").strip().lower() == str(username).strip().lstrip("@").lower():
+        return True
+    if display_name and (data.get("display_name") or "").strip().lower() == str(display_name).strip().lower():
+        return True
+    return False
+
+
 def get_room_users():
     users = {}
     for entry in wheel_entries + archived_wheel_entries:
@@ -1612,6 +1646,75 @@ def sanitize_name(text: str) -> str:
     while "__" in cleaned:
         cleaned = cleaned.replace("__", "_")
     return cleaned or "Unknown"
+
+
+VIDEO_EXTENSIONS = {
+    ".mp4", ".m4v", ".mov", ".webm", ".mkv", ".avi", ".wmv"
+}
+
+
+def is_video_filename(path: str) -> bool:
+    return os.path.splitext(path)[1].lower() in VIDEO_EXTENSIONS
+
+
+def ensure_unique_path(path: str) -> str:
+    if not os.path.exists(path):
+        return path
+    root, ext = os.path.splitext(path)
+    index = 2
+    while True:
+        candidate = f"{root}_{index}{ext}"
+        if not os.path.exists(candidate):
+            return candidate
+        index += 1
+
+
+def build_ready_filename(entry: dict, source_path: str) -> str:
+    safe_name = sanitize_name(entry["data"].get("display_name", "Unknown"))
+    ext = os.path.splitext(source_path)[1].lower() or ".mp4"
+    if ext not in VIDEO_EXTENSIONS:
+        ext = ".mp4"
+    return f'{entry["id"]:04d}_{safe_name}{ext}'
+
+
+def assign_local_file_to_entry(entry: dict, source_path: str, video_title: str | None = None) -> dict:
+    if not os.path.exists(source_path):
+        return {"status": "error", "message": "local file not found"}
+
+    os.makedirs(READY_DIR, exist_ok=True)
+    target_name = build_ready_filename(entry, source_path)
+    target_path = ensure_unique_path(os.path.join(READY_DIR, target_name))
+
+    if os.path.abspath(source_path) != os.path.abspath(target_path):
+        shutil.move(source_path, target_path)
+    else:
+        target_path = source_path
+
+    entry["download_status"] = "manual_ready"
+    entry["download_error"] = None
+    entry["local_filename"] = os.path.basename(target_path)
+    entry["local_path"] = target_path
+    entry["download_method"] = "manual"
+    entry["download_completed_at"] = now_iso()
+    if video_title:
+        entry["data"]["video_title"] = video_title
+
+    ws_broadcast_bundle()
+    return {"status": "ok", "entry": entry}
+
+
+def latest_video_in_downloads() -> str | None:
+    if not os.path.exists(DOWNLOADS_DIR):
+        return None
+    candidates = []
+    for name in os.listdir(DOWNLOADS_DIR):
+        path = os.path.join(DOWNLOADS_DIR, name)
+        if os.path.isfile(path) and is_video_filename(path):
+            candidates.append(path)
+    if not candidates:
+        return None
+    candidates.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+    return candidates[0]
 
 def ws_broadcast(event: str, data):
     try:
@@ -1942,13 +2045,6 @@ def submit_wheel(entry: WheelEntry):
             "message": "Wheel of Desire is inactive right now."
         }
 
-    domain_cfg = get_domain_config(entry.link)
-    if not domain_cfg:
-        return {
-            "status": "error",
-            "message": "This site is not supported for video downloads."
-        }
-
     entry_data = entry.dict()
 
     if entry_data["display_name"].strip().lower() == "anonymous":
@@ -1960,7 +2056,12 @@ def submit_wheel(entry: WheelEntry):
     current = sum(
         1
         for e in get_round_entries(state["current_round"])
-        if e["data"]["display_name"].lower() == user_key
+        if wheel_entry_matches_submitter(
+            e,
+            telegram_id=entry_data.get("telegram_id"),
+            username=entry_data.get("username"),
+            display_name=entry_data.get("display_name"),
+        )
         and e.get("approval_status") != "rejected"
     )
 
@@ -1969,6 +2070,9 @@ def submit_wheel(entry: WheelEntry):
 
     submitted_url = entry_data["link"]
     domain = normalize_domain(submitted_url)
+
+    if not entry_data.get("video_title"):
+        entry_data["video_title"] = derive_video_title_from_url(submitted_url)
 
     new_entry = {
         "id": len(wheel_entries) + len(archived_wheel_entries) + 1,
@@ -2221,6 +2325,53 @@ def mark_manual_ready(entry_id: int, payload: ManualReadyPayload):
     if payload.video_title:
         entry["data"]["video_title"] = payload.video_title
     return {"status": "ok"}
+
+
+@app.post("/api/downloads/manual-ready-by-filename/{entry_id}")
+def mark_manual_ready_by_filename(entry_id: int, payload: ManualReadyByFilenamePayload):
+    entry = find_entry(entry_id)
+    if not entry:
+        return {"status": "error", "message": "entry not found"}
+
+    if not entry_is_approved(entry):
+        return {"status": "error", "message": "entry is not approved"}
+
+    raw_name = (payload.filename or "").strip().strip('"')
+    if not raw_name:
+        return {"status": "error", "message": "filename required"}
+
+    source_path = None
+    search_dirs = [READY_DIR, DOWNLOADS_DIR]
+    for directory in search_dirs:
+        candidate = os.path.join(directory, raw_name)
+        if os.path.exists(candidate) and os.path.isfile(candidate):
+            source_path = candidate
+            break
+
+    if source_path is None:
+        return {"status": "error", "message": "file not found in Ready or Downloads"}
+
+    return assign_local_file_to_entry(entry, source_path, payload.video_title)
+
+
+@app.post("/api/downloads/manual-ready-latest/{entry_id}")
+def mark_manual_ready_latest(entry_id: int, payload: dict | None = None):
+    entry = find_entry(entry_id)
+    if not entry:
+        return {"status": "error", "message": "entry not found"}
+
+    if not entry_is_approved(entry):
+        return {"status": "error", "message": "entry is not approved"}
+
+    latest_path = latest_video_in_downloads()
+    if latest_path is None:
+        return {"status": "error", "message": "no video files found in Downloads"}
+
+    video_title = None
+    if isinstance(payload, dict):
+        video_title = payload.get("video_title")
+
+    return assign_local_file_to_entry(entry, latest_path, video_title)
 
 
 @app.post("/api/downloads/retry/{entry_id}")
