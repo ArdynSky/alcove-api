@@ -183,6 +183,7 @@ last_bot_sync_at = None
 current_now_playing = None
 video_reviews = []
 current_wheel_reaction = None
+wheel_reaction_events = []
 latest_review_overlay = None
 
 pending_comments = []
@@ -203,6 +204,7 @@ state = {
     "room_open": True,
     "closing_soon": False,
     "review_prompt_open": False,
+    "review_reveal_active": False,
     "modules": {
         "wheel": True,
         "asmr": False,
@@ -1588,6 +1590,22 @@ def current_active_wheel_reaction():
     return current_wheel_reaction
 
 
+def current_active_wheel_reactions():
+    global wheel_reaction_events
+    active = []
+    for event in wheel_reaction_events:
+        expires_at = event.get("expires_at")
+        if expires_at:
+            try:
+                if datetime.datetime.fromisoformat(expires_at) <= datetime.datetime.utcnow():
+                    continue
+            except Exception:
+                pass
+        active.append(event)
+    wheel_reaction_events = active[-20:]
+    return wheel_reaction_events
+
+
 def current_active_review_overlay():
     global latest_review_overlay
     if not latest_review_overlay:
@@ -1861,7 +1879,10 @@ def get_app_state():
         "room_open": state.get("room_open", True),
         "closing_soon": state.get("closing_soon", False),
         "review_prompt_open": state.get("review_prompt_open", False),
+        "review_reveal_active": state.get("review_reveal_active", False),
+        "video_reviews": video_reviews,
         "active_wheel_reaction": current_active_wheel_reaction(),
+        "active_wheel_reactions": current_active_wheel_reactions(),
         "active_review_overlay": current_active_review_overlay(),
     }
 
@@ -1877,6 +1898,7 @@ def open_round():
     state["room_open"] = True
     state["closing_soon"] = False
     state["review_prompt_open"] = False
+    state["review_reveal_active"] = False
     current_round_entries = get_round_entries(current_round)
     wheel_submission_limits.clear()
     add_notification("system", f"Round {current_round} submissions open", True)
@@ -1932,6 +1954,7 @@ def end_round():
     current_round = state["current_round"]
     state["round_status"] = "closed"
     state["review_prompt_open"] = False
+    state["review_reveal_active"] = False
     current_winner = None
     current_now_playing = None
     video_reviews.clear()
@@ -2459,6 +2482,7 @@ def set_now_playing(entry_id: int):
     video_reviews.clear()
     state["round_status"] = "playing"
     state["review_prompt_open"] = False
+    state["review_reveal_active"] = False
     entry = find_entry(entry_id)
     if not entry:
         return {"status": "error"}
@@ -2522,14 +2546,7 @@ def submit_review(review: VideoReview):
         }
     )
 
-    latest_review_overlay = {
-        "display_name": reviewer_name,
-        "rating": review.rating,
-        "review": review.review,
-        "video_entry_id": current_now_playing.get("id"),
-        "expires_at": (datetime.datetime.utcnow() + datetime.timedelta(seconds=5)).isoformat(),
-        "time": now_iso(),
-    }
+    latest_review_overlay = None
     ws_broadcast_bundle()
 
     return {"status": "ok", "reviews": len(video_reviews)}
@@ -2548,6 +2565,20 @@ def close_review_prompt():
     state["review_prompt_open"] = False
     if current_now_playing:
         state["round_status"] = "playing"
+    ws_broadcast_bundle()
+    return {"status": "ok"}
+
+
+@app.post("/api/reviews/reveal/start")
+def start_review_reveal():
+    state["review_reveal_active"] = True
+    ws_broadcast_bundle()
+    return {"status": "ok", "reviews": len(video_reviews)}
+
+
+@app.post("/api/reviews/reveal/stop")
+def stop_review_reveal():
+    state["review_reveal_active"] = False
     ws_broadcast_bundle()
     return {"status": "ok"}
 
@@ -2638,7 +2669,7 @@ def reject_comment(comment_id: int):
 
 @app.post("/api/wheel-reaction")
 def submit_wheel_reaction(payload: WheelReaction):
-    global current_wheel_reaction
+    global current_wheel_reaction, wheel_reaction_events
     allowed = {"fire", "shock", "hot", "love", "wild"}
     reaction_key = (payload.reaction_key or "").strip().lower()
     if reaction_key not in allowed:
@@ -2649,9 +2680,11 @@ def submit_wheel_reaction(payload: WheelReaction):
         "display_name": payload.display_name,
         "username": payload.username,
         "user_id": payload.user_id,
-        "expires_at": (datetime.datetime.utcnow() + datetime.timedelta(seconds=5)).isoformat(),
+        "expires_at": (datetime.datetime.utcnow() + datetime.timedelta(seconds=3)).isoformat(),
         "time": now_iso(),
     }
+    wheel_reaction_events.append(dict(current_wheel_reaction))
+    wheel_reaction_events = current_active_wheel_reactions()
     ws_broadcast_bundle()
     return {"status": "ok", "reaction": current_wheel_reaction}
 
