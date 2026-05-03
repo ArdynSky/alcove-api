@@ -205,6 +205,7 @@ state = {
     "closing_soon": False,
     "review_prompt_open": False,
     "review_reveal_active": False,
+    "review_score_reveal_active": False,
     "modules": {
         "wheel": True,
         "asmr": False,
@@ -1178,11 +1179,14 @@ def derive_video_title_from_url(url: str) -> str | None:
             return None
         slug = unquote(slug)
         slug = re.sub(r"\.[a-z0-9]{2,5}$", "", slug, flags=re.IGNORECASE)
+        slug = re.sub(r"^[0-9]+[._-]*", "", slug)
+        slug = re.sub(r"^(watch|video|videos|clip|clips)[-_ ]+", "", slug, flags=re.IGNORECASE)
         slug = re.sub(r"[-_]+", " ", slug)
+        slug = re.sub(r"\b(cockdude|seancody|gayporn|porn)\b", "", slug, flags=re.IGNORECASE)
         slug = re.sub(r"\s+", " ", slug).strip()
         if not slug:
             return None
-        return slug[:120]
+        return slug[:120].title()
     except Exception:
         return None
 
@@ -1620,6 +1624,13 @@ def current_active_review_overlay():
             pass
     return latest_review_overlay
 
+
+def review_average_rating() -> float:
+    ratings = [float(review.get("rating") or 0) for review in video_reviews if review.get("rating")]
+    if not ratings:
+        return 0.0
+    return round(sum(ratings) / len(ratings), 2)
+
 def get_next_spin_pool(round_number: int):
     return get_ready_unplayed_entries(round_number)
 
@@ -1688,7 +1699,8 @@ def ensure_unique_path(path: str) -> str:
 
 
 def build_ready_filename(entry: dict, source_path: str) -> str:
-    safe_name = sanitize_name(entry["data"].get("display_name", "Unknown"))
+    title = (entry.get("data") or {}).get("video_title") or entry.get("video_title") or entry["data"].get("display_name", "Unknown")
+    safe_name = sanitize_name(title)[:80]
     ext = os.path.splitext(source_path)[1].lower() or ".mp4"
     if ext not in VIDEO_EXTENSIONS:
         ext = ".mp4"
@@ -1880,7 +1892,9 @@ def get_app_state():
         "closing_soon": state.get("closing_soon", False),
         "review_prompt_open": state.get("review_prompt_open", False),
         "review_reveal_active": state.get("review_reveal_active", False),
+        "review_score_reveal_active": state.get("review_score_reveal_active", False),
         "video_reviews": video_reviews,
+        "video_review_average": review_average_rating(),
         "active_wheel_reaction": current_active_wheel_reaction(),
         "active_wheel_reactions": current_active_wheel_reactions(),
         "active_review_overlay": current_active_review_overlay(),
@@ -1899,6 +1913,7 @@ def open_round():
     state["closing_soon"] = False
     state["review_prompt_open"] = False
     state["review_reveal_active"] = False
+    state["review_score_reveal_active"] = False
     current_round_entries = get_round_entries(current_round)
     wheel_submission_limits.clear()
     add_notification("system", f"Round {current_round} submissions open", True)
@@ -1955,6 +1970,7 @@ def end_round():
     state["round_status"] = "closed"
     state["review_prompt_open"] = False
     state["review_reveal_active"] = False
+    state["review_score_reveal_active"] = False
     current_winner = None
     current_now_playing = None
     video_reviews.clear()
@@ -2483,6 +2499,7 @@ def set_now_playing(entry_id: int):
     state["round_status"] = "playing"
     state["review_prompt_open"] = False
     state["review_reveal_active"] = False
+    state["review_score_reveal_active"] = False
     entry = find_entry(entry_id)
     if not entry:
         return {"status": "error"}
@@ -2556,6 +2573,7 @@ def submit_review(review: VideoReview):
 def open_review_prompt():
     state["review_prompt_open"] = True
     state["round_status"] = "reviewing"
+    state["review_score_reveal_active"] = False
     ws_broadcast_bundle()
     return {"status": "ok"}
 
@@ -2572,6 +2590,7 @@ def close_review_prompt():
 @app.post("/api/reviews/reveal/start")
 def start_review_reveal():
     state["review_reveal_active"] = True
+    state["review_score_reveal_active"] = False
     ws_broadcast_bundle()
     return {"status": "ok", "reviews": len(video_reviews)}
 
@@ -2579,6 +2598,23 @@ def start_review_reveal():
 @app.post("/api/reviews/reveal/stop")
 def stop_review_reveal():
     state["review_reveal_active"] = False
+    state["review_score_reveal_active"] = False
+    ws_broadcast_bundle()
+    return {"status": "ok"}
+
+
+@app.post("/api/reviews/reveal/score")
+def reveal_review_score():
+    state["review_reveal_active"] = True
+    state["review_score_reveal_active"] = True
+    ws_broadcast_bundle()
+    return {"status": "ok", "average": review_average_rating(), "reviews": len(video_reviews)}
+
+
+@app.post("/api/reviews/reveal/hide")
+def hide_review_results():
+    state["review_reveal_active"] = False
+    state["review_score_reveal_active"] = False
     ws_broadcast_bundle()
     return {"status": "ok"}
 
@@ -2713,6 +2749,7 @@ def archive_wheel_entry(entry_id: int):
     global current_now_playing, current_winner
     for i, entry in enumerate(wheel_entries):
         if entry["id"] == entry_id:
+            archive_path = None
             # move file into archive if it exists
             if entry.get("local_path") and os.path.exists(entry["local_path"]):
                 archive_name = entry.get("local_filename") or os.path.basename(entry["local_path"])
@@ -2725,6 +2762,32 @@ def archive_wheel_entry(entry_id: int):
             archived = dict(entry)
             archived["archived_at"] = now_iso()
             archived_wheel_entries.append(archived)
+
+            if archive_path:
+                metadata_path = os.path.splitext(archive_path)[0] + ".json"
+                related_reviews = [
+                    review for review in video_reviews
+                    if int(review.get("video_entry_id") or 0) == int(entry_id)
+                ]
+                ratings = [float(review.get("rating") or 0) for review in related_reviews if review.get("rating")]
+                metadata = {
+                    "entry_id": entry.get("id"),
+                    "title": (entry.get("data") or {}).get("video_title"),
+                    "submitted_by": (entry.get("data") or {}).get("display_name"),
+                    "username": (entry.get("data") or {}).get("username"),
+                    "submitted_at": entry.get("time"),
+                    "played_at": entry.get("played_at"),
+                    "archived_at": archived.get("archived_at"),
+                    "local_filename": entry.get("local_filename"),
+                    "average_rating": round(sum(ratings) / len(ratings), 2) if ratings else 0.0,
+                    "review_count": len(related_reviews),
+                    "reviews": related_reviews,
+                }
+                try:
+                    with open(metadata_path, "w", encoding="utf-8") as metadata_file:
+                        json.dump(metadata, metadata_file, indent=2, ensure_ascii=False)
+                except Exception:
+                    pass
 
             if current_now_playing and current_now_playing["id"] == entry_id:
                 current_now_playing = None

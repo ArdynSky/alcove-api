@@ -57,6 +57,14 @@ def sanitize_name(text: str) -> str:
     return cleaned or "Unknown"
 
 
+def clean_video_title(text: str | None) -> str:
+    raw = str(text or "").strip()
+    if not raw:
+        return "Unknown"
+    raw = raw[:80]
+    return sanitize_name(raw)
+
+
 def is_video_file(path: Path) -> bool:
     return path.suffix.lower() in VIDEO_EXTENSIONS
 
@@ -74,17 +82,17 @@ def ensure_unique_path(path: Path) -> Path:
         counter += 1
 
 
-def build_ready_filename(entry_id: int, display_name: str, source_path: Path) -> str:
-    safe_name = sanitize_name(display_name)
+def build_ready_filename(entry_id: int, display_name: str, source_path: Path, video_title: str | None = None) -> str:
+    safe_name = clean_video_title(video_title) if video_title else sanitize_name(display_name)
     ext = source_path.suffix.lower() or ".mp4"
     if ext not in VIDEO_EXTENSIONS:
         ext = ".mp4"
     return f"{entry_id:04d}_{safe_name}{ext}"
 
 
-def move_to_ready(source_path: Path, entry_id: int, display_name: str) -> Path:
+def move_to_ready(source_path: Path, entry_id: int, display_name: str, video_title: str | None = None) -> Path:
     READY_DIR.mkdir(parents=True, exist_ok=True)
-    target_name = build_ready_filename(entry_id, display_name, source_path)
+    target_name = build_ready_filename(entry_id, display_name, source_path, video_title)
     target_path = ensure_unique_path(READY_DIR / target_name)
     if source_path.resolve() != target_path.resolve():
         shutil.move(str(source_path), str(target_path))
@@ -185,7 +193,7 @@ class HelperHandler(BaseHTTPRequestHandler):
             if source is None:
                 return json_response(self, 200, {"status": "error", "message": "No video files found in Downloads."})
             try:
-                target = move_to_ready(source, entry_id, display_name)
+                target = move_to_ready(source, entry_id, display_name, video_title)
                 remote = report_download_ready(api_base, entry_id, target, video_title)
             except Exception as exc:
                 return json_response(self, 200, {"status": "error", "message": str(exc)})
@@ -205,7 +213,7 @@ class HelperHandler(BaseHTTPRequestHandler):
             if source is None:
                 return json_response(self, 200, {"status": "error", "message": "That file was not found in Ready or Downloads."})
             try:
-                target = move_to_ready(source, entry_id, display_name)
+                target = move_to_ready(source, entry_id, display_name, video_title)
                 remote = report_download_ready(api_base, entry_id, target, video_title)
             except Exception as exc:
                 return json_response(self, 200, {"status": "error", "message": str(exc)})
