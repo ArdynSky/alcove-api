@@ -7,6 +7,7 @@ import subprocess
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.request import Request, urlopen
+from yt_dlp import YoutubeDL
 
 
 HOST = "127.0.0.1"
@@ -27,6 +28,7 @@ TARGET_VIDEO_BITRATE = "2800k"
 TARGET_MAXRATE = "3200k"
 TARGET_BUFSIZE = "6400k"
 TARGET_AUDIO_BITRATE = "128k"
+YTDLP_FORMAT = "best[height<=480][ext=mp4]/best[height<=480]/best[ext=mp4]/best[height<=480]/best"
 ALLOWED_ORIGINS = {
     "http://127.0.0.1:5500",
     "http://localhost:5500",
@@ -154,13 +156,19 @@ def compress_to_ready(source_path: Path, target_path: Path) -> Path:
     return target_path
 
 
-def move_to_ready(source_path: Path, entry_id: int, display_name: str, video_title: str | None = None) -> Path:
+def move_to_ready(
+    source_path: Path,
+    entry_id: int,
+    display_name: str,
+    video_title: str | None = None,
+    use_ffmpeg: bool = False,
+) -> Path:
     READY_DIR.mkdir(parents=True, exist_ok=True)
     if source_path.parent.resolve() == READY_DIR.resolve():
         return source_path
     target_name = build_ready_filename(entry_id, display_name, source_path, video_title)
     target_path = ensure_unique_path(READY_DIR / target_name)
-    if ffmpeg_available():
+    if use_ffmpeg and ffmpeg_available():
         return compress_to_ready(source_path, target_path)
     if source_path.resolve() != target_path.resolve():
         shutil.move(str(source_path), str(target_path))
@@ -199,6 +207,34 @@ def report_download_ready(api_base: str, entry_id: int, target_path: Path, video
             "download_method": "manual",
         },
     )
+
+
+def download_low_res_video(url: str, entry_id: int) -> tuple[Path, str | None]:
+    DOWNLOADS_DIR.mkdir(parents=True, exist_ok=True)
+    template = str(DOWNLOADS_DIR / f"alcove_{entry_id}_%(title).80s.%(ext)s")
+    options = {
+        "format": YTDLP_FORMAT,
+        "outtmpl": template,
+        "noplaylist": True,
+        "quiet": True,
+        "no_warnings": True,
+        "windowsfilenames": True,
+        "restrictfilenames": True,
+        "nopart": True,
+        "overwrites": True,
+    }
+    with YoutubeDL(options) as ydl:
+        info = ydl.extract_info(url, download=True)
+    title = str(info.get("title") or "").strip() or None
+    prefix = f"alcove_{entry_id}_"
+    candidates = [
+        path for path in DOWNLOADS_DIR.iterdir()
+        if path.is_file() and is_video_file(path) and path.name.startswith(prefix)
+    ]
+    if not candidates:
+        raise RuntimeError("yt-dlp did not produce a usable local video file.")
+    candidates.sort(key=lambda path: path.stat().st_mtime, reverse=True)
+    return candidates[0], title
 
 
 def json_response(handler: BaseHTTPRequestHandler, status: int, payload: dict):
@@ -240,6 +276,7 @@ class HelperHandler(BaseHTTPRequestHandler):
                     "downloads_dir": str(DOWNLOADS_DIR),
                     "ready_dir": str(READY_DIR),
                     "playout_file": str(CURRENT_PICK_PATH),
+                    "download_mode": "yt-dlp direct low-res",
                     "ffmpeg_path": str(FFMPEG_EXE),
                     "ffmpeg_available": ffmpeg_available(),
                     "compression_profile": {
@@ -268,7 +305,7 @@ class HelperHandler(BaseHTTPRequestHandler):
             if source is None:
                 return json_response(self, 200, {"status": "error", "message": "No video files found in Downloads."})
             try:
-                target = move_to_ready(source, entry_id, display_name, video_title)
+                target = move_to_ready(source, entry_id, display_name, video_title, use_ffmpeg=False)
                 remote = report_download_ready(api_base, entry_id, target, video_title)
             except Exception as exc:
                 return json_response(self, 200, {"status": "error", "message": str(exc)})
@@ -288,7 +325,7 @@ class HelperHandler(BaseHTTPRequestHandler):
             if source is None:
                 return json_response(self, 200, {"status": "error", "message": "That file was not found in Ready or Downloads."})
             try:
-                target = move_to_ready(source, entry_id, display_name, video_title)
+                target = move_to_ready(source, entry_id, display_name, video_title, use_ffmpeg=False)
                 remote = report_download_ready(api_base, entry_id, target, video_title)
             except Exception as exc:
                 return json_response(self, 200, {"status": "error", "message": str(exc)})
@@ -296,6 +333,29 @@ class HelperHandler(BaseHTTPRequestHandler):
                 "status": remote.get("status", "ok"),
                 "local_path": str(target),
                 "local_filename": target.name,
+                "remote": remote,
+            })
+
+        if self.path == "/api/downloads/fetch-low-res":
+            entry_id = int(payload.get("entry_id") or 0)
+            display_name = str(payload.get("display_name") or "").strip() or "Unknown"
+            api_base = payload.get("api_base") or API_DEFAULT
+            submitted_url = str(payload.get("submitted_url") or "").strip()
+            video_title = payload.get("video_title")
+            if not submitted_url:
+                return json_response(self, 200, {"status": "error", "message": "No source URL was supplied."})
+            try:
+                source, extracted_title = download_low_res_video(submitted_url, entry_id)
+                final_title = extracted_title or video_title
+                target = move_to_ready(source, entry_id, display_name, final_title, use_ffmpeg=False)
+                remote = report_download_ready(api_base, entry_id, target, final_title)
+            except Exception as exc:
+                return json_response(self, 200, {"status": "error", "message": str(exc)})
+            return json_response(self, 200, {
+                "status": remote.get("status", "ok"),
+                "local_path": str(target),
+                "local_filename": target.name,
+                "video_title": final_title,
                 "remote": remote,
             })
 
