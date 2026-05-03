@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import subprocess
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.request import Request, urlopen
@@ -17,6 +18,15 @@ READY_DIR = ALCOVE_ROOT / "Ready"
 PLAYOUT_DIR = ALCOVE_ROOT / "Playout"
 CURRENT_PICK_PATH = PLAYOUT_DIR / "current_pick.mp4"
 VIDEO_EXTENSIONS = {".mp4", ".mkv", ".webm", ".mov", ".avi", ".m4v", ".wmv"}
+DEFAULT_FFMPEG_EXE = Path(
+    r"F:\Downloads - Copy\ffmpeg-8.0.1-full_build (2)\ffmpeg-8.0.1-full_build\bin\ffmpeg.exe"
+)
+FFMPEG_EXE = Path(os.getenv("ALCOVE_FFMPEG_EXE") or DEFAULT_FFMPEG_EXE)
+TARGET_VIDEO_HEIGHT = 720
+TARGET_VIDEO_BITRATE = "2800k"
+TARGET_MAXRATE = "3200k"
+TARGET_BUFSIZE = "6400k"
+TARGET_AUDIO_BITRATE = "128k"
 ALLOWED_ORIGINS = {
     "http://127.0.0.1:5500",
     "http://localhost:5500",
@@ -84,16 +94,74 @@ def ensure_unique_path(path: Path) -> Path:
 
 def build_ready_filename(entry_id: int, display_name: str, source_path: Path, video_title: str | None = None) -> str:
     safe_name = clean_video_title(video_title) if video_title else sanitize_name(display_name)
-    ext = source_path.suffix.lower() or ".mp4"
+    ext = ".mp4" if ffmpeg_available() else (source_path.suffix.lower() or ".mp4")
     if ext not in VIDEO_EXTENSIONS:
         ext = ".mp4"
     return f"{entry_id:04d}_{safe_name}{ext}"
 
 
+def ffmpeg_available() -> bool:
+    return FFMPEG_EXE.exists() and FFMPEG_EXE.is_file()
+
+
+def compress_to_ready(source_path: Path, target_path: Path) -> Path:
+    command = [
+        str(FFMPEG_EXE),
+        "-y",
+        "-i",
+        str(source_path),
+        "-map",
+        "0:v:0",
+        "-map",
+        "0:a?",
+        "-vf",
+        f"scale=-2:{TARGET_VIDEO_HEIGHT}:force_original_aspect_ratio=decrease",
+        "-r",
+        "30",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "veryfast",
+        "-profile:v",
+        "high",
+        "-level",
+        "4.1",
+        "-pix_fmt",
+        "yuv420p",
+        "-b:v",
+        TARGET_VIDEO_BITRATE,
+        "-maxrate",
+        TARGET_MAXRATE,
+        "-bufsize",
+        TARGET_BUFSIZE,
+        "-c:a",
+        "aac",
+        "-b:a",
+        TARGET_AUDIO_BITRATE,
+        "-movflags",
+        "+faststart",
+        str(target_path),
+    ]
+    result = subprocess.run(command, capture_output=True, text=True)
+    if result.returncode != 0:
+        stderr = (result.stderr or "").strip().splitlines()
+        detail = stderr[-1] if stderr else "Unknown ffmpeg error"
+        raise RuntimeError(f"ffmpeg compression failed: {detail}")
+    try:
+        source_path.unlink(missing_ok=True)
+    except Exception:
+        pass
+    return target_path
+
+
 def move_to_ready(source_path: Path, entry_id: int, display_name: str, video_title: str | None = None) -> Path:
     READY_DIR.mkdir(parents=True, exist_ok=True)
+    if source_path.parent.resolve() == READY_DIR.resolve():
+        return source_path
     target_name = build_ready_filename(entry_id, display_name, source_path, video_title)
     target_path = ensure_unique_path(READY_DIR / target_name)
+    if ffmpeg_available():
+        return compress_to_ready(source_path, target_path)
     if source_path.resolve() != target_path.resolve():
         shutil.move(str(source_path), str(target_path))
     return target_path
@@ -172,6 +240,13 @@ class HelperHandler(BaseHTTPRequestHandler):
                     "downloads_dir": str(DOWNLOADS_DIR),
                     "ready_dir": str(READY_DIR),
                     "playout_file": str(CURRENT_PICK_PATH),
+                    "ffmpeg_path": str(FFMPEG_EXE),
+                    "ffmpeg_available": ffmpeg_available(),
+                    "compression_profile": {
+                        "height": TARGET_VIDEO_HEIGHT,
+                        "video_bitrate": TARGET_VIDEO_BITRATE,
+                        "audio_bitrate": TARGET_AUDIO_BITRATE,
+                    },
                 },
             )
         return json_response(self, 404, {"status": "error", "message": "Not found"})
