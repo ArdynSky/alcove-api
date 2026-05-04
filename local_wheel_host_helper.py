@@ -237,6 +237,35 @@ def download_low_res_video(url: str, entry_id: int) -> tuple[Path, str | None]:
     return candidates[0], title
 
 
+def fetch_video_title(url: str | None) -> str | None:
+    source = str(url or "").strip()
+    if not source:
+        return None
+    options = {
+        "quiet": True,
+        "no_warnings": True,
+        "noplaylist": True,
+        "skip_download": True,
+        "windowsfilenames": True,
+        "restrictfilenames": True,
+    }
+    with YoutubeDL(options) as ydl:
+        info = ydl.extract_info(source, download=False)
+    title = str(info.get("title") or "").strip()
+    return title or None
+
+
+def resolve_video_title(url: str | None, fallback_title: str | None = None) -> str | None:
+    try:
+        extracted = fetch_video_title(url)
+        if extracted:
+            return extracted
+    except Exception:
+        pass
+    fallback = str(fallback_title or "").strip()
+    return fallback or None
+
+
 def json_response(handler: BaseHTTPRequestHandler, status: int, payload: dict):
     body = json.dumps(payload).encode("utf-8")
     origin = handler.headers.get("Origin", "")
@@ -301,18 +330,21 @@ class HelperHandler(BaseHTTPRequestHandler):
             display_name = str(payload.get("display_name") or "").strip() or "Unknown"
             api_base = payload.get("api_base") or API_DEFAULT
             video_title = payload.get("video_title")
+            submitted_url = payload.get("submitted_url")
             source = latest_video_in_downloads()
             if source is None:
                 return json_response(self, 200, {"status": "error", "message": "No video files found in Downloads."})
             try:
-                target = move_to_ready(source, entry_id, display_name, video_title, use_ffmpeg=False)
-                remote = report_download_ready(api_base, entry_id, target, video_title)
+                final_title = resolve_video_title(submitted_url, video_title)
+                target = move_to_ready(source, entry_id, display_name, final_title, use_ffmpeg=False)
+                remote = report_download_ready(api_base, entry_id, target, final_title)
             except Exception as exc:
                 return json_response(self, 200, {"status": "error", "message": str(exc)})
             return json_response(self, 200, {
                 "status": remote.get("status", "ok"),
                 "local_path": str(target),
                 "local_filename": target.name,
+                "video_title": final_title,
                 "remote": remote,
             })
 
@@ -321,18 +353,21 @@ class HelperHandler(BaseHTTPRequestHandler):
             display_name = str(payload.get("display_name") or "").strip() or "Unknown"
             api_base = payload.get("api_base") or API_DEFAULT
             video_title = payload.get("video_title")
+            submitted_url = payload.get("submitted_url")
             source = find_by_filename(payload.get("filename"))
             if source is None:
                 return json_response(self, 200, {"status": "error", "message": "That file was not found in Ready or Downloads."})
             try:
-                target = move_to_ready(source, entry_id, display_name, video_title, use_ffmpeg=False)
-                remote = report_download_ready(api_base, entry_id, target, video_title)
+                final_title = resolve_video_title(submitted_url, video_title)
+                target = move_to_ready(source, entry_id, display_name, final_title, use_ffmpeg=False)
+                remote = report_download_ready(api_base, entry_id, target, final_title)
             except Exception as exc:
                 return json_response(self, 200, {"status": "error", "message": str(exc)})
             return json_response(self, 200, {
                 "status": remote.get("status", "ok"),
                 "local_path": str(target),
                 "local_filename": target.name,
+                "video_title": final_title,
                 "remote": remote,
             })
 

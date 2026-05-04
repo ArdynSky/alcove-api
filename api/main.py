@@ -185,6 +185,9 @@ video_reviews = []
 current_wheel_reaction = None
 wheel_reaction_events = []
 latest_review_overlay = None
+wheel_reaction_history = []
+wheel_review_history = []
+wheel_user_engagement = {}
 
 pending_comments = []
 approved_comments = []
@@ -224,6 +227,9 @@ def runtime_state_payload() -> dict:
         "pulse_question_suggestions": pulse_question_suggestions,
         "pulse_daily_summary_posts": pulse_daily_summary_posts,
         "pulse_disabled_questions": pulse_disabled_questions,
+        "wheel_reaction_history": wheel_reaction_history,
+        "wheel_review_history": wheel_review_history,
+        "wheel_user_engagement": wheel_user_engagement,
     }
 
 
@@ -247,6 +253,7 @@ def ensure_state_store() -> None:
 def apply_runtime_payload(payload: dict) -> None:
     global spotlight_entries, pulse_entries, pulse_receipts, pulse_red_activations
     global pulse_question_suggestions, pulse_daily_summary_posts, pulse_disabled_questions
+    global wheel_reaction_history, wheel_review_history, wheel_user_engagement
 
     spotlight_entries = payload.get("spotlight_entries") if isinstance(payload.get("spotlight_entries"), list) else []
     pulse_entries = payload.get("pulse_entries") if isinstance(payload.get("pulse_entries"), list) else []
@@ -255,6 +262,9 @@ def apply_runtime_payload(payload: dict) -> None:
     pulse_question_suggestions = payload.get("pulse_question_suggestions") if isinstance(payload.get("pulse_question_suggestions"), list) else []
     pulse_daily_summary_posts = payload.get("pulse_daily_summary_posts") if isinstance(payload.get("pulse_daily_summary_posts"), list) else []
     pulse_disabled_questions = payload.get("pulse_disabled_questions") if isinstance(payload.get("pulse_disabled_questions"), list) else []
+    wheel_reaction_history = payload.get("wheel_reaction_history") if isinstance(payload.get("wheel_reaction_history"), list) else []
+    wheel_review_history = payload.get("wheel_review_history") if isinstance(payload.get("wheel_review_history"), list) else []
+    wheel_user_engagement = payload.get("wheel_user_engagement") if isinstance(payload.get("wheel_user_engagement"), dict) else {}
 
 
 def load_runtime_state_from_db() -> dict | None:
@@ -433,6 +443,8 @@ class VideoReview(BaseModel):
     review: str
     display_name: str
     anonymous: bool
+    user_id: int | None = None
+    username: str | None = None
 
 
 class StreamComment(BaseModel):
@@ -1540,17 +1552,24 @@ def wheel_entry_matches_submitter(entry: dict, telegram_id=None, username=None, 
 def get_room_users():
     users = {}
     for entry in wheel_entries + archived_wheel_entries:
-        name = (entry.get("data", {}) or {}).get("display_name")
+        data = entry.get("data", {}) or {}
+        name = data.get("display_name")
         if not name:
             continue
         key = name.strip().lower()
         users.setdefault(key, {
             "display_name": name,
+            "username": data.get("username"),
+            "user_id": data.get("telegram_id"),
             "muted": key in muted_users,
             "submission_limit": wheel_submission_limits.get(key, 1),
             "current_round_entries": 0,
             "last_seen": entry.get("time"),
         })
+        if data.get("username"):
+            users[key]["username"] = data.get("username")
+        if data.get("telegram_id") is not None:
+            users[key]["user_id"] = data.get("telegram_id")
         if entry.get("round_id") == state["current_round"]:
             users[key]["current_round_entries"] += 1
         if entry.get("time") and (not users[key]["last_seen"] or entry.get("time") > users[key]["last_seen"]):
@@ -1563,20 +1582,131 @@ def get_room_users():
         key = name.lower()
         users.setdefault(key, {
             "display_name": name,
+            "username": comment.get("username"),
+            "user_id": comment.get("user_id"),
             "muted": key in muted_users,
             "submission_limit": wheel_submission_limits.get(key, 1),
             "current_round_entries": 0,
             "last_seen": comment.get("time"),
         })
         users[key]["muted"] = key in muted_users
+        if comment.get("username"):
+            users[key]["username"] = comment.get("username")
+        if comment.get("user_id") is not None:
+            users[key]["user_id"] = comment.get("user_id")
         if comment.get("time") and (not users[key]["last_seen"] or comment.get("time") > users[key]["last_seen"]):
             users[key]["last_seen"] = comment.get("time")
 
     for key, user in users.items():
         user["muted"] = key in muted_users
         user["submission_limit"] = wheel_submission_limits.get(key, 1)
+        stats = ensure_wheel_user_engagement(
+            user_id=user.get("user_id"),
+            username=user.get("username"),
+            display_name=user.get("display_name"),
+        ) or {}
+        user["total_reactions"] = int(stats.get("total_reactions") or 0)
+        user["total_reviews"] = int(stats.get("total_reviews") or 0)
+
+    reaction_counts = current_video_reaction_counts()
+    reviewed_users = current_video_reviewers()
+    for key, user in users.items():
+        reaction_key = wheel_user_key(
+            user_id=user.get("user_id"),
+            username=user.get("username"),
+            display_name=user.get("display_name"),
+        )
+        user["current_video_reactions"] = int(reaction_counts.get(reaction_key, 0)) if reaction_key else 0
+        user["current_video_reviewed"] = bool(reaction_key and reaction_key in reviewed_users)
 
     return sorted(users.values(), key=lambda u: (u["display_name"] or "").lower())
+
+
+def wheel_user_key(user_id=None, username=None, display_name=None) -> str | None:
+    if user_id is not None:
+        return f"user:{int(user_id)}"
+    if username:
+        return f"username:{str(username).strip().lower()}"
+    if display_name:
+        return f"name:{str(display_name).strip().lower()}"
+    return None
+
+
+def ensure_wheel_user_engagement(user_id=None, username=None, display_name=None) -> dict | None:
+    global wheel_user_engagement
+    key = wheel_user_key(user_id=user_id, username=username, display_name=display_name)
+    if not key:
+        return None
+    existing = wheel_user_engagement.get(key)
+    if not isinstance(existing, dict):
+        existing = {
+            "user_id": user_id,
+            "username": username,
+            "display_name": display_name or "Unknown",
+            "total_reactions": 0,
+            "total_reviews": 0,
+            "last_active_at": None,
+        }
+        wheel_user_engagement[key] = existing
+    if user_id is not None:
+        existing["user_id"] = user_id
+    if username:
+        existing["username"] = username
+    if display_name:
+        existing["display_name"] = display_name
+    return existing
+
+
+def current_video_entry_id() -> int | None:
+    try:
+        if current_now_playing and current_now_playing.get("id") is not None:
+            return int(current_now_playing.get("id"))
+    except Exception:
+        return None
+    return None
+
+
+def current_video_reaction_counts() -> dict:
+    current_entry_id = current_video_entry_id()
+    if current_entry_id is None:
+        return {}
+    counts = {}
+    for event in wheel_reaction_history:
+        try:
+            if int(event.get("video_entry_id") or 0) != current_entry_id:
+                continue
+        except Exception:
+            continue
+        key = wheel_user_key(
+            user_id=event.get("user_id"),
+            username=event.get("username"),
+            display_name=event.get("display_name"),
+        )
+        if not key:
+            continue
+        counts[key] = counts.get(key, 0) + 1
+    return counts
+
+
+def current_video_reviewers() -> set[str]:
+    current_entry_id = current_video_entry_id()
+    if current_entry_id is None:
+        return set()
+    reviewers = set()
+    for review in wheel_review_history:
+        try:
+            if int(review.get("video_entry_id") or 0) != current_entry_id:
+                continue
+        except Exception:
+            continue
+        key = wheel_user_key(
+            user_id=review.get("user_id"),
+            username=review.get("username"),
+            display_name=review.get("real_display_name") or review.get("display_name"),
+        )
+        if key:
+            reviewers.add(key)
+    return reviewers
 
 
 def current_active_wheel_reaction():
@@ -2547,21 +2677,33 @@ def submit_review(review: VideoReview):
     video_title = current_data.get("video_title", "") or "No video title set yet"
     chosen_by = current_data.get("display_name", "") or "Unknown"
 
-    reviewer_name = review.display_name
-    if review.anonymous:
-        reviewer_name = "Anonymous"
-
-    video_reviews.append(
-        {
-            "video_entry_id": current_now_playing.get("id"),
-            "video_title": video_title,
-            "chosen_by": chosen_by,
-            "rating": review.rating,
-            "review": review.review,
-            "display_name": reviewer_name,
-            "time": now_iso(),
-        }
+    real_display_name = (review.display_name or "").strip() or "Unknown"
+    reviewer_name = "Anonymous" if review.anonymous else real_display_name
+    review_record = {
+        "video_entry_id": current_now_playing.get("id"),
+        "video_title": video_title,
+        "chosen_by": chosen_by,
+        "rating": review.rating,
+        "review": review.review,
+        "display_name": reviewer_name,
+        "real_display_name": real_display_name,
+        "user_id": review.user_id,
+        "username": review.username,
+        "anonymous": review.anonymous,
+        "time": now_iso(),
+    }
+    video_reviews.append(review_record)
+    wheel_review_history.append(dict(review_record))
+    wheel_review_history[:] = wheel_review_history[-2000:]
+    stats = ensure_wheel_user_engagement(
+        user_id=review.user_id,
+        username=review.username,
+        display_name=real_display_name,
     )
+    if stats is not None:
+        stats["total_reviews"] = int(stats.get("total_reviews") or 0) + 1
+        stats["last_active_at"] = review_record["time"]
+    save_runtime_state()
 
     latest_review_overlay = None
     ws_broadcast_bundle()
@@ -2721,6 +2863,25 @@ def submit_wheel_reaction(payload: WheelReaction):
     }
     wheel_reaction_events.append(dict(current_wheel_reaction))
     wheel_reaction_events = current_active_wheel_reactions()
+    current_entry_id = current_video_entry_id()
+    stats = ensure_wheel_user_engagement(
+        user_id=payload.user_id,
+        username=payload.username,
+        display_name=payload.display_name,
+    )
+    if stats is not None:
+        stats["total_reactions"] = int(stats.get("total_reactions") or 0) + 1
+        stats["last_active_at"] = current_wheel_reaction["time"]
+    wheel_reaction_history.append({
+        "video_entry_id": current_entry_id,
+        "reaction_key": reaction_key,
+        "display_name": payload.display_name,
+        "username": payload.username,
+        "user_id": payload.user_id,
+        "time": current_wheel_reaction["time"],
+    })
+    wheel_reaction_history[:] = wheel_reaction_history[-2000:]
+    save_runtime_state()
     ws_broadcast_bundle()
     return {"status": "ok", "reaction": current_wheel_reaction}
 
