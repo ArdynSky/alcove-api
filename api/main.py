@@ -2724,7 +2724,7 @@ def open_review_prompt():
 def close_review_prompt():
     state["review_prompt_open"] = False
     if current_now_playing:
-        state["round_status"] = "playing"
+        state["round_status"] = "reviewing"
     ws_broadcast_bundle()
     return {"status": "ok"}
 
@@ -2757,6 +2757,8 @@ def reveal_review_score():
 def hide_review_results():
     state["review_reveal_active"] = False
     state["review_score_reveal_active"] = False
+    if current_now_playing:
+        state["round_status"] = "reviewing"
     ws_broadcast_bundle()
     return {"status": "ok"}
 
@@ -2973,6 +2975,14 @@ def archive_wheel_entry(entry_id: int):
 def close_room():
     state["closing_soon"] = True
     state["room_open"] = False
+    ws_broadcast_bundle()
+    return {"status": "ok"}
+
+
+@app.post("/api/room/open")
+def open_room():
+    state["closing_soon"] = False
+    state["room_open"] = True
     ws_broadcast_bundle()
     return {"status": "ok"}
 
