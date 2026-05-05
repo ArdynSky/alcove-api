@@ -66,6 +66,20 @@ ALLOWED_ORIGINS = {
 CURRENT_STREAM_STATE: dict | None = None
 
 
+class QuietYDLLogger:
+    def debug(self, msg):
+        return
+
+    def info(self, msg):
+        return
+
+    def warning(self, msg):
+        return
+
+    def error(self, msg):
+        return
+
+
 def normalize_api_base(value: str | None) -> str:
     raw = (value or API_DEFAULT).strip()
     if not raw:
@@ -277,6 +291,9 @@ def download_low_res_video(url: str, entry_id: int) -> tuple[Path, str | None]:
         "restrictfilenames": True,
         "nopart": True,
         "overwrites": True,
+        "logger": QuietYDLLogger(),
+        "verbose": False,
+        "progress_with_newline": False,
     }
     with YoutubeDL(options) as ydl:
         info = ydl.extract_info(url, download=True)
@@ -303,6 +320,8 @@ def fetch_video_title(url: str | None) -> str | None:
         "skip_download": True,
         "windowsfilenames": True,
         "restrictfilenames": True,
+        "logger": QuietYDLLogger(),
+        "verbose": False,
     }
     with YoutubeDL(options) as ydl:
         info = ydl.extract_info(source, download=False)
@@ -318,6 +337,8 @@ def build_extract_options(extra: dict | None = None) -> dict:
         "skip_download": True,
         "windowsfilenames": True,
         "restrictfilenames": True,
+        "logger": QuietYDLLogger(),
+        "verbose": False,
     }
     if extra:
         options.update(extra)
@@ -1087,7 +1108,10 @@ class HelperHandler(BaseHTTPRequestHandler):
                 self.send_header("Access-Control-Allow-Methods", "GET,POST,OPTIONS")
                 self.send_header("Access-Control-Allow-Headers", "Content-Type, Range")
                 self.end_headers()
-                self.wfile.write(body)
+                try:
+                    self.wfile.write(body)
+                except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                    pass
                 return
 
             self.send_response(status_code)
@@ -1101,11 +1125,14 @@ class HelperHandler(BaseHTTPRequestHandler):
             self.send_header("Access-Control-Allow-Methods", "GET,POST,OPTIONS")
             self.send_header("Access-Control-Allow-Headers", "Content-Type, Range")
             self.end_headers()
-            while True:
-                chunk = upstream.read(1024 * 64)
-                if not chunk:
-                    break
-                self.wfile.write(chunk)
+            try:
+                while True:
+                    chunk = upstream.read(1024 * 64)
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                pass
             return
         return json_response(self, 404, {"status": "error", "message": "Not found"})
 
