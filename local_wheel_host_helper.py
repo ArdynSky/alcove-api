@@ -63,6 +63,7 @@ ALLOWED_ORIGINS = {
     "https://ardyn-alcove.com",
     "https://www.ardyn-alcove.com",
 }
+CURRENT_STREAM_STATE: dict | None = None
 
 
 def normalize_api_base(value: str | None) -> str:
@@ -384,6 +385,40 @@ def build_proxy_url(target_url: str, referer: str | None = None) -> str:
     if referer:
         params["referer"] = referer
     return f"http://{HOST}:{PORT}/api/stream/proxy?{urlencode(params)}"
+
+
+def build_stream_state(payload: dict) -> dict:
+    media_url = str(payload.get("media_url") or "").strip()
+    if not media_url:
+        raise ValueError("No stream media URL was supplied.")
+    submitted_url = str(payload.get("submitted_url") or payload.get("webpage_url") or "").strip()
+    referer = (
+        str(payload.get("referer") or "").strip()
+        or page_origin(submitted_url)
+        or submitted_url
+        or None
+    )
+    media_kind = str(payload.get("media_kind") or "").strip().lower()
+    if not media_kind:
+        media_kind = "hls" if ".m3u8" in media_url.lower() else "file"
+    playback_url = str(payload.get("playback_url") or "").strip() or build_proxy_url(media_url, referer)
+    prepared_at = int(time.time() * 1000)
+    stream_key = hashlib.sha1(f"{payload.get('entry_id')}-{media_url}-{prepared_at}".encode("utf-8")).hexdigest()[:12]
+    return {
+        "entry_id": int(payload.get("entry_id") or 0) or None,
+        "entrant_name": str(payload.get("entrant_name") or "").strip() or None,
+        "title": str(payload.get("title") or payload.get("video_title") or "").strip() or None,
+        "media_url": media_url,
+        "playback_url": playback_url,
+        "media_kind": media_kind,
+        "height": payload.get("height"),
+        "resolve_strategy": str(payload.get("resolve_strategy") or payload.get("download_method") or "stream-ready").strip(),
+        "submitted_url": submitted_url or None,
+        "webpage_url": submitted_url or None,
+        "referer": referer,
+        "stream_key": stream_key,
+        "prepared_at": prepared_at,
+    }
 
 
 def fetch_page_html(url: str, referer: str | None = None) -> str:
@@ -972,6 +1007,7 @@ class HelperHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_GET(self):
+        global CURRENT_STREAM_STATE
         if self.path == "/api/health":
             return json_response(
                 self,
@@ -991,6 +1027,16 @@ class HelperHandler(BaseHTTPRequestHandler):
                     },
                     "stream_resolve_available": True,
                     "stream_resolve_cookie_attempts": list(COOKIE_BROWSER_ATTEMPTS),
+                },
+            )
+        if self.path == "/api/stream/current":
+            return json_response(
+                self,
+                200,
+                {
+                    "status": "ok",
+                    "active": bool(CURRENT_STREAM_STATE),
+                    "stream": CURRENT_STREAM_STATE,
                 },
             )
         if self.path.startswith("/api/stream/proxy"):
@@ -1044,12 +1090,23 @@ class HelperHandler(BaseHTTPRequestHandler):
         return json_response(self, 404, {"status": "error", "message": "Not found"})
 
     def do_POST(self):
+        global CURRENT_STREAM_STATE
         try:
             content_length = int(self.headers.get("Content-Length", "0") or "0")
             raw = self.rfile.read(content_length) if content_length else b"{}"
             payload = json.loads(raw.decode("utf-8") or "{}")
         except Exception:
             return json_response(self, 400, {"status": "error", "message": "Invalid JSON payload"})
+
+        if self.path == "/api/stream/current":
+            if payload.get("clear"):
+                CURRENT_STREAM_STATE = None
+                return json_response(self, 200, {"status": "ok", "active": False, "stream": None})
+            try:
+                CURRENT_STREAM_STATE = build_stream_state(payload)
+            except Exception as exc:
+                return json_response(self, 200, {"status": "error", "message": str(exc)})
+            return json_response(self, 200, {"status": "ok", "active": True, "stream": CURRENT_STREAM_STATE})
 
         if self.path == "/api/downloads/manual-ready-latest":
             entry_id = int(payload.get("entry_id") or 0)
