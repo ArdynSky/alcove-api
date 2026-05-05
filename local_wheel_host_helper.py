@@ -244,6 +244,26 @@ def report_download_ready(api_base: str, entry_id: int, target_path: Path, video
     )
 
 
+def report_stream_ready(
+    api_base: str,
+    entry_id: int,
+    direct_media_url: str,
+    video_title: str | None,
+    download_method: str,
+) -> dict:
+    return api_post(
+        api_base,
+        f"/downloads/complete/{entry_id}",
+        {
+            "local_filename": "",
+            "local_path": "",
+            "direct_media_url": direct_media_url,
+            "video_title": video_title,
+            "download_method": download_method,
+        },
+    )
+
+
 def download_low_res_video(url: str, entry_id: int) -> tuple[Path, str | None]:
     DOWNLOADS_DIR.mkdir(parents=True, exist_ok=True)
     template = str(DOWNLOADS_DIR / f"alcove_{entry_id}_%(title).80s.%(ext)s")
@@ -1163,24 +1183,66 @@ class HelperHandler(BaseHTTPRequestHandler):
             if not submitted_url:
                 return json_response(self, 200, {"status": "error", "message": "No source URL was supplied."})
             try:
-                download_method = "yt-dlp"
                 try:
-                    source, extracted_title = download_low_res_video(submitted_url, entry_id)
-                    final_title = extracted_title or video_title
-                except Exception:
-                    captured = browser_capture_media(submitted_url)
-                    referer = page_origin(submitted_url) or submitted_url
-                    source = download_captured_media(
-                        captured["media_url"],
-                        referer,
+                    resolved = resolve_direct_media(submitted_url)
+                    final_title = resolved.get("title") or video_title
+                    remote = report_stream_ready(
+                        api_base,
                         entry_id,
-                        captured.get("title") or video_title,
-                        captured.get("ext"),
+                        resolved["media_url"],
+                        final_title,
+                        resolved.get("resolve_strategy") or "stream-resolve",
                     )
-                    final_title = captured.get("title") or video_title
-                    download_method = "browser-capture-fallback"
-                target = move_to_ready(source, entry_id, display_name, final_title, use_ffmpeg=False)
-                remote = report_download_ready(api_base, entry_id, target, final_title)
+                    return json_response(self, 200, {
+                        "status": remote.get("status", "ok"),
+                        "video_title": final_title,
+                        "download_method": resolved.get("resolve_strategy") or "stream-resolve",
+                        "direct_media_url": resolved["media_url"],
+                        "playback_url": resolved.get("playback_url"),
+                        "media_kind": resolved.get("media_kind"),
+                        "stream_support": "supported",
+                        "remote": remote,
+                    })
+                except Exception:
+                    try:
+                        captured = browser_capture_media(submitted_url)
+                        final_title = captured.get("title") or video_title
+                        remote = report_stream_ready(
+                            api_base,
+                            entry_id,
+                            captured["media_url"],
+                            final_title,
+                            captured.get("resolve_strategy") or "browser-capture",
+                        )
+                        return json_response(self, 200, {
+                            "status": remote.get("status", "ok"),
+                            "video_title": final_title,
+                            "download_method": captured.get("resolve_strategy") or "browser-capture",
+                            "direct_media_url": captured["media_url"],
+                            "playback_url": captured.get("playback_url"),
+                            "media_kind": captured.get("media_kind"),
+                            "stream_support": "supported",
+                            "remote": remote,
+                        })
+                    except Exception:
+                        download_method = "yt-dlp"
+                        try:
+                            source, extracted_title = download_low_res_video(submitted_url, entry_id)
+                            final_title = extracted_title or video_title
+                        except Exception:
+                            captured = browser_capture_media(submitted_url)
+                            referer = page_origin(submitted_url) or submitted_url
+                            source = download_captured_media(
+                                captured["media_url"],
+                                referer,
+                                entry_id,
+                                captured.get("title") or video_title,
+                                captured.get("ext"),
+                            )
+                            final_title = captured.get("title") or video_title
+                            download_method = "browser-capture-fallback"
+                        target = move_to_ready(source, entry_id, display_name, final_title, use_ffmpeg=False)
+                        remote = report_download_ready(api_base, entry_id, target, final_title)
             except Exception as exc:
                 return json_response(self, 200, {"status": "error", "message": str(exc)})
             return json_response(self, 200, {
