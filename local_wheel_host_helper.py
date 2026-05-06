@@ -56,7 +56,8 @@ CHROME_EXE_CANDIDATES = [
     Path(r"C:\Program Files\Microsoft\Edge\Application\msedge.exe"),
     Path(r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"),
 ]
-CDP_PORT = 9223
+CDP_PORT = int(os.getenv("ALCOVE_CDP_PORT", "9223"))
+CDP_PORT_FALLBACKS = [9223, 9224, 9225, 9226]
 ALLOWED_ORIGINS = {
     "http://127.0.0.1:5500",
     "http://localhost:5500",
@@ -386,13 +387,34 @@ def resolve_video_title(url: str | None, fallback_title: str | None = None) -> s
 
 
 def classify_resolution_error(message: str) -> str:
+    """Classify resolution errors for better debugging"""
     text = str(message or "").lower()
-    if "unsupported url" in text:
-        return "unsupported"
-    if "no video formats found" in text or "no playable direct media stream" in text:
-        return "no-formats"
-    if "cookie" in text:
+    if "chrome devtools" in text or "websocket" in text:
+        return "browser-capture-unavailable"
+    if "headless" in text or "executable" in text:
+        return "browser-not-found"
+    if "firefox" in text or "cookie" in text:
         return "cookies-unavailable"
+    if "403" in text or "unauthorized" in text or "forbidden" in text:
+        return "auth-required"
+    if "401" in text:
+        return "auth-required"
+    if "unsupported url" in text:
+        return "unsupported-site"
+    if "no video formats found" in text or "no playable" in text:
+        return "no-formats"
+    if "404" in text or "not found" in text:
+        return "content-missing"
+    if "geo" in text or "region" in text:
+        return "geo-blocked"
+    if "timeout" in text or "took too long" in text:
+        return "timeout"
+    if "connection" in text or "refused" in text or "unreachable" in text:
+        return "network-error"
+    if "ssl" in text or "certificate" in text:
+        return "ssl-error"
+    if "429" in text or "too many" in text or "rate" in text:
+        return "rate-limited"
     return "unknown"
 
 
@@ -851,34 +873,57 @@ def websocket_recv_text(sock: socket.socket, timeout: float = 1.0) -> str | None
         return None
 
 
-def chrome_devtools_json(path: str, method: str = "GET") -> dict | list:
-    request = Request(f"http://127.0.0.1:{CDP_PORT}{path}", method=method)
+def find_available_cdp_port() -> int:
+    """Find first available Chrome DevTools port from fallback list"""
+    for port in CDP_PORT_FALLBACKS:
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            result = sock.connect_ex(('127.0.0.1', port))
+            sock.close()
+            if result != 0:  # Port is available
+                return port
+        except:
+            pass
+    return CDP_PORT  # Fallback to configured port
+
+
+def chrome_devtools_json(path: str, method: str = "GET", port: int | None = None) -> dict | list:
+    if port is None:
+        port = CDP_PORT
+    request = Request(f"http://127.0.0.1:{port}{path}", method=method)
     with urlopen(request, timeout=15) as response:
         return json.loads(response.read().decode("utf-8"))
 
 
-def wait_for_devtools() -> None:
+def wait_for_devtools(port: int | None = None) -> None:
+    if port is None:
+        port = CDP_PORT
     start = time.time()
     last_error = None
     while time.time() - start < 15:
         try:
-            chrome_devtools_json("/json/version")
+            chrome_devtools_json("/json/version", port=port)
             return
         except Exception as exc:
             last_error = exc
             time.sleep(0.35)
-    raise RuntimeError(f"Chrome DevTools endpoint did not start: {last_error}")
+    raise RuntimeError(f"Chrome DevTools endpoint did not start on port {port}: {last_error}")
 
 
-def start_capture_browser() -> subprocess.Popen:
+def start_capture_browser() -> tuple[subprocess.Popen, int]:
+    """Start browser and return (process, actual_port) tuple"""
     browser = chrome_executable()
     if not browser:
         raise RuntimeError("No Chrome or Edge executable was found on this machine.")
     profile_dir = Path(tempfile.gettempdir()) / "alcove-stream-capture-profile"
     profile_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Find available port
+    actual_port = find_available_cdp_port()
+    
     command = [
         str(browser),
-        f"--remote-debugging-port={CDP_PORT}",
+        f"--remote-debugging-port={actual_port}",
         f"--user-data-dir={profile_dir}",
         "--headless=new",
         "--autoplay-policy=no-user-gesture-required",
@@ -889,14 +934,16 @@ def start_capture_browser() -> subprocess.Popen:
         "about:blank",
     ]
     process = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    wait_for_devtools()
-    return process
+    wait_for_devtools(actual_port)
+    return process, actual_port
 
 
 def browser_capture_media(source: str) -> dict:
-    process = start_capture_browser()
+    process = None
+    actual_port = CDP_PORT
     try:
-        new_target = chrome_devtools_json(f"/json/new?{quote(source, safe=':/?&=%#')}", method="PUT")
+        process, actual_port = start_capture_browser()
+        new_target = chrome_devtools_json(f"/json/new?{quote(source, safe=':/?&=%#')}", method="PUT", port=actual_port)
         ws_url = new_target.get("webSocketDebuggerUrl")
         if not ws_url:
             raise RuntimeError("Chrome did not provide a DevTools websocket URL.")
@@ -1000,10 +1047,15 @@ def browser_capture_media(source: str) -> dict:
             "attempts": [{"name": "browser-capture", "status": "ok"}],
         }
     finally:
-        try:
-            process.terminate()
-        except Exception:
-            pass
+        if process:
+            try:
+                process.terminate()
+                process.wait(timeout=5)
+            except:
+                try:
+                    process.kill()
+                except:
+                    pass
 
 
 def extract_info(source: str, extra_options: dict | None = None) -> dict:
