@@ -13,6 +13,7 @@ import base64
 import hashlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from datetime import datetime
 from urllib.error import HTTPError
 from urllib.parse import parse_qs, quote, urljoin, urlencode, urlparse, urlunparse
 from urllib.request import Request, urlopen
@@ -153,6 +154,34 @@ def build_ready_filename(entry_id: int, display_name: str, source_path: Path, vi
 
 def ffmpeg_available() -> bool:
     return FFMPEG_EXE.exists() and FFMPEG_EXE.is_file()
+
+
+def parse_timecode(value: str | None) -> float | None:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    if re.fullmatch(r"\d+(\.\d+)?", raw):
+        return float(raw)
+    parts = raw.split(":")
+    if not 1 <= len(parts) <= 3:
+        raise ValueError("Use seconds or hh:mm:ss for clip times.")
+    try:
+        numbers = [float(part) for part in parts]
+    except ValueError as exc:
+        raise ValueError("Use seconds or hh:mm:ss for clip times.") from exc
+    seconds = 0.0
+    for number in numbers:
+        seconds = seconds * 60 + number
+    return seconds
+
+
+def format_timecode(value: float) -> str:
+    whole = max(0, int(round(value)))
+    hours, rem = divmod(whole, 3600)
+    minutes, seconds = divmod(rem, 60)
+    if hours:
+        return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+    return f"{minutes:02d}:{seconds:02d}"
 
 
 def compress_to_ready(source_path: Path, target_path: Path) -> Path:
@@ -694,6 +723,66 @@ def download_captured_media(media_url: str, referer: str | None, entry_id: int, 
                 break
             handle.write(chunk)
     return target_path
+
+
+def download_clip_test(media_url: str, referer: str | None, title: str | None, start_seconds: float, end_seconds: float) -> Path:
+    if not ffmpeg_available():
+        raise RuntimeError("ffmpeg is required for clip download tests on this machine.")
+    if end_seconds <= start_seconds:
+        raise RuntimeError("Clip end time must be later than the start time.")
+
+    DOWNLOADS_DIR.mkdir(parents=True, exist_ok=True)
+    safe_title = clean_video_title(title) if title else "stream_clip"
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    target_path = ensure_unique_path(DOWNLOADS_DIR / f"clip_test_{stamp}_{safe_title}.mp4")
+    duration = max(0.1, end_seconds - start_seconds)
+    start_arg = f"{start_seconds:.3f}"
+    duration_arg = f"{duration:.3f}"
+
+    base_command = [
+        str(FFMPEG_EXE),
+        "-y",
+        "-ss",
+        start_arg,
+        "-t",
+        duration_arg,
+        "-headers",
+        f"User-Agent: {COMMON_USER_AGENT}\r\n" + (f"Referer: {referer}\r\n" if referer else ""),
+        "-i",
+        media_url,
+        "-map",
+        "0:v:0",
+        "-map",
+        "0:a?",
+        "-movflags",
+        "+faststart",
+    ]
+
+    copy_command = [*base_command, "-c", "copy", str(target_path)]
+    copy_result = subprocess.run(copy_command, capture_output=True, text=True, timeout=900)
+    if copy_result.returncode == 0 and target_path.exists():
+        return target_path
+
+    transcode_command = [
+        *base_command,
+        "-c:v",
+        "libx264",
+        "-preset",
+        "veryfast",
+        "-crf",
+        "23",
+        "-c:a",
+        "aac",
+        "-b:a",
+        "128k",
+        str(target_path),
+    ]
+    transcode_result = subprocess.run(transcode_command, capture_output=True, text=True, timeout=900)
+    if transcode_result.returncode == 0 and target_path.exists():
+        return target_path
+
+    error_text = (transcode_result.stderr or copy_result.stderr or "ffmpeg could not create the clip.").strip()
+    raise RuntimeError(error_text[-400:] if len(error_text) > 400 else error_text)
 
 
 def websocket_handshake(sock: socket.socket, host: str, path: str) -> None:
@@ -1340,6 +1429,42 @@ class HelperHandler(BaseHTTPRequestHandler):
                     },
                 )
             return json_response(self, 200, {"status": "ok", **captured})
+
+        if self.path == "/api/stream/download-clip-test":
+            submitted_url = str(payload.get("submitted_url") or "").strip()
+            clip_start = parse_timecode(payload.get("clip_start"))
+            clip_end = parse_timecode(payload.get("clip_end"))
+            if not submitted_url:
+                return json_response(self, 200, {"status": "error", "message": "No source URL was supplied."})
+            if clip_start is None or clip_end is None:
+                return json_response(self, 200, {"status": "error", "message": "Add both clip start and clip end times."})
+            if clip_end <= clip_start:
+                return json_response(self, 200, {"status": "error", "message": "Clip end time must be later than the start time."})
+            try:
+                try:
+                    resolved = resolve_direct_media(submitted_url)
+                except Exception:
+                    resolved = browser_capture_media(submitted_url)
+                title = str(resolved.get("title") or payload.get("video_title") or "").strip() or None
+                referer = page_origin(submitted_url) or submitted_url
+                target = download_clip_test(
+                    resolved["media_url"],
+                    referer,
+                    title,
+                    clip_start,
+                    clip_end,
+                )
+            except Exception as exc:
+                return json_response(self, 200, {"status": "error", "message": str(exc)})
+            return json_response(self, 200, {
+                "status": "ok",
+                "local_path": str(target),
+                "local_filename": target.name,
+                "video_title": title,
+                "clip_start": format_timecode(clip_start),
+                "clip_end": format_timecode(clip_end),
+                "duration_seconds": round(max(0.0, clip_end - clip_start), 2),
+            })
 
         if self.path == "/api/playout/load":
             source_value = str(payload.get("local_path") or "").strip()
