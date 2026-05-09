@@ -18,6 +18,7 @@ from urllib.error import HTTPError
 from urllib.parse import parse_qs, quote, urljoin, urlencode, urlparse, urlunparse
 from urllib.request import Request, urlopen
 from yt_dlp import YoutubeDL
+from yt_dlp.networking.impersonate import ImpersonateTarget
 
 
 HOST = "127.0.0.1"
@@ -49,7 +50,17 @@ MOBILE_USER_AGENT = (
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/124.0.0.0 Mobile Safari/537.36"
 )
-COOKIE_BROWSER_ATTEMPTS = ("edge", "chrome", "firefox")
+COOKIE_BROWSER_ATTEMPTS = ("brave", "edge", "chrome", "firefox")
+YTDLP_IMPERSONATE_TARGETS = (
+    "chrome-136:macos-15",
+    "chrome-131:macos-14",
+    "edge-101:windows-10",
+)
+BRAVE_EXE_CANDIDATES = [
+    Path(r"C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe"),
+    Path(r"C:\Program Files (x86)\BraveSoftware\Brave-Browser\Application\brave.exe"),
+    Path(os.getenv("LOCALAPPDATA", "")) / "BraveSoftware" / "Brave-Browser" / "Application" / "brave.exe",
+]
 CHROME_EXE_CANDIDATES = [
     Path(r"C:\Program Files\Google\Chrome\Application\chrome.exe"),
     Path(r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe"),
@@ -58,7 +69,11 @@ CHROME_EXE_CANDIDATES = [
 ]
 CDP_PORT = int(os.getenv("ALCOVE_CDP_PORT", "9223"))
 CDP_PORT_FALLBACKS = [9223, 9224, 9225, 9226]
+AUTH_BROWSER_PORT = int(os.getenv("ALCOVE_AUTH_BROWSER_PORT", "9231"))
+AUTH_BROWSER_PROFILE_DIR = Path(os.getenv("ALCOVE_AUTH_BROWSER_PROFILE") or (ALCOVE_ROOT / "AuthBrowserProfile"))
+AUTH_BROWSER_START_URL = os.getenv("ALCOVE_AUTH_BROWSER_START_URL", "https://www.pornhub.com/")
 ALLOWED_ORIGINS = {
+    "null",
     "http://127.0.0.1:5500",
     "http://localhost:5500",
     "https://thealcove.netlify.app",
@@ -66,6 +81,8 @@ ALLOWED_ORIGINS = {
     "https://www.ardyn-alcove.com",
 }
 CURRENT_STREAM_STATE: dict | None = None
+CURRENT_VIDEO_INTRO_STATE: dict | None = None
+AUTH_BROWSER_PROCESS: subprocess.Popen | None = None
 
 
 class QuietYDLLogger:
@@ -92,11 +109,16 @@ def normalize_api_base(value: str | None) -> str:
     return base
 
 
-def chrome_executable() -> Path | None:
-    for candidate in CHROME_EXE_CANDIDATES:
+def browser_executable(prefer_brave: bool = False) -> Path | None:
+    candidates = [*BRAVE_EXE_CANDIDATES, *CHROME_EXE_CANDIDATES] if prefer_brave else [*CHROME_EXE_CANDIDATES, *BRAVE_EXE_CANDIDATES]
+    for candidate in candidates:
         if candidate.exists():
             return candidate
     return None
+
+
+def chrome_executable() -> Path | None:
+    return browser_executable(False)
 
 
 def api_post(api_base: str, path: str, payload: dict) -> dict:
@@ -308,6 +330,67 @@ def report_stream_ready(
     )
 
 
+def report_processed_options(
+    api_base: str,
+    entry_id: int,
+    stream_candidate: dict | None = None,
+    download_candidate: dict | None = None,
+    video_title: str | None = None,
+    process_method: str | None = None,
+) -> dict:
+    return api_post(
+        api_base,
+        f"/downloads/processed/{entry_id}",
+        {
+            "stream_candidate": stream_candidate,
+            "download_candidate": download_candidate,
+            "video_title": video_title,
+            "process_method": process_method,
+        },
+    )
+
+
+def report_processing_started(api_base: str, entry_id: int) -> None:
+    try:
+        api_post(api_base, f"/downloads/start/{entry_id}", {})
+    except Exception:
+        pass
+
+
+def report_processing_failed(api_base: str, entry_id: int, message: str) -> None:
+    try:
+        api_post(api_base, f"/downloads/failed/{entry_id}", {"error": message})
+    except Exception:
+        pass
+
+
+def clip_window_from_payload(payload: dict) -> tuple[float | None, float | None]:
+    start_value = payload.get("clip_start_seconds")
+    end_value = payload.get("clip_end_seconds")
+    try:
+        start = float(start_value) if start_value is not None and str(start_value) != "" else None
+    except Exception:
+        start = None
+    try:
+        end = float(end_value) if end_value is not None and str(end_value) != "" else None
+    except Exception:
+        end = None
+    if start is not None and end is None:
+        end = start + 300
+    if start is None or end is None or end <= start:
+        return None, None
+    return start, end
+
+
+def clip_fields(start_seconds: float | None, end_seconds: float | None) -> dict:
+    if start_seconds is None or end_seconds is None:
+        return {}
+    return {
+        "clip_start_seconds": start_seconds,
+        "clip_end_seconds": end_seconds,
+    }
+
+
 def download_low_res_video(url: str, entry_id: int) -> tuple[Path, str | None]:
     DOWNLOADS_DIR.mkdir(parents=True, exist_ok=True)
     template = str(DOWNLOADS_DIR / f"alcove_{entry_id}_%(title).80s.%(ext)s")
@@ -324,6 +407,7 @@ def download_low_res_video(url: str, entry_id: int) -> tuple[Path, str | None]:
         "logger": QuietYDLLogger(),
         "verbose": False,
         "progress_with_newline": False,
+        **impersonate_options(os.getenv("ALCOVE_YTDLP_IMPERSONATE") or YTDLP_IMPERSONATE_TARGETS[0]),
     }
     with YoutubeDL(options) as ydl:
         info = ydl.extract_info(url, download=True)
@@ -375,6 +459,19 @@ def build_extract_options(extra: dict | None = None) -> dict:
     return options
 
 
+def impersonate_options(target: str, referer: str | None = None) -> dict:
+    headers = {}
+    if referer:
+        headers["Referer"] = referer
+    options = {
+        "impersonate": ImpersonateTarget.from_str(target),
+        "extractor_args": {"generic": {"impersonate": [""]}},
+    }
+    if headers:
+        options["http_headers"] = headers
+    return options
+
+
 def resolve_video_title(url: str | None, fallback_title: str | None = None) -> str | None:
     try:
         extracted = fetch_video_title(url)
@@ -416,6 +513,25 @@ def classify_resolution_error(message: str) -> str:
     if "429" in text or "too many" in text or "rate" in text:
         return "rate-limited"
     return "unknown"
+
+
+def summarize_resolution_failure(diagnostics: list[dict], last_error: str) -> str:
+    primary_kinds = [
+        str(item.get("kind") or "")
+        for item in diagnostics
+        if not str(item.get("name") or "").startswith("cookies-")
+    ]
+    for kind in ("content-missing", "unsupported-site", "no-formats", "auth-required", "geo-blocked", "rate-limited", "timeout", "network-error"):
+        if kind in primary_kinds:
+            return kind
+    cookie_kinds = [
+        str(item.get("kind") or "")
+        for item in diagnostics
+        if str(item.get("name") or "").startswith("cookies-")
+    ]
+    if "cookies-unavailable" in cookie_kinds:
+        return "cookies-unavailable"
+    return classify_resolution_error(last_error)
 
 
 def select_stream_format(info: dict) -> dict | None:
@@ -479,6 +595,15 @@ def build_proxy_url(target_url: str, referer: str | None = None) -> str:
     return f"http://{HOST}:{PORT}/api/stream/proxy?{urlencode(params)}"
 
 
+def media_kind_for_url(media_url: str, ext: str | None = None, content_type: str | None = None) -> str:
+    lowered_url = str(media_url or "").lower()
+    lowered_ext = str(ext or "").lower()
+    lowered_type = str(content_type or "").lower()
+    if lowered_ext == "m3u8" or ".m3u8" in lowered_url or "mpegurl" in lowered_type:
+        return "hls"
+    return "file"
+
+
 def build_stream_state(payload: dict) -> dict:
     media_url = str(payload.get("media_url") or "").strip()
     if not media_url:
@@ -492,7 +617,7 @@ def build_stream_state(payload: dict) -> dict:
     )
     media_kind = str(payload.get("media_kind") or "").strip().lower()
     if not media_kind:
-        media_kind = "hls" if ".m3u8" in media_url.lower() else "file"
+        media_kind = media_kind_for_url(media_url)
     playback_url = str(payload.get("playback_url") or "").strip() or build_proxy_url(media_url, referer)
     prepared_at = int(time.time() * 1000)
     stream_key = hashlib.sha1(f"{payload.get('entry_id')}-{media_url}-{prepared_at}".encode("utf-8")).hexdigest()[:12]
@@ -509,6 +634,23 @@ def build_stream_state(payload: dict) -> dict:
         "webpage_url": submitted_url or None,
         "referer": referer,
         "stream_key": stream_key,
+        "prepared_at": prepared_at,
+    }
+
+
+def build_video_intro_state(payload: dict) -> dict:
+    prepared_at = int(time.time() * 1000)
+    entry_id = int(payload.get("entry_id") or 0) or None
+    video_title = str(payload.get("video_title") or payload.get("title") or "").strip() or "Untitled video"
+    display_name = str(payload.get("display_name") or payload.get("entrant_name") or "").strip() or "Unknown"
+    username = str(payload.get("username") or "").strip().lstrip("@")
+    intro_key = hashlib.sha1(f"{entry_id}-{video_title}-{display_name}-{username}-{prepared_at}".encode("utf-8")).hexdigest()[:12]
+    return {
+        "entry_id": entry_id,
+        "video_title": video_title,
+        "display_name": display_name,
+        "username": username,
+        "intro_key": intro_key,
         "prepared_at": prepared_at,
     }
 
@@ -562,6 +704,7 @@ def build_resolved_media_payload(
         "webpage_url": source,
         "submitted_url": source,
         "normalized_url": source,
+        "media_kind": media_kind_for_url(media_url, ext),
         "resolve_strategy": strategy,
         "attempts": [],
     }
@@ -711,6 +854,27 @@ def inspect_remote_stream(target_url: str, referer: str | None) -> dict:
     }
 
 
+def is_playable_stream_candidate(media_url: str, referer: str | None) -> bool:
+    try:
+        inspected = inspect_remote_stream(media_url, referer)
+    except Exception:
+        return False
+    status_code = int(inspected.get("status_code") or 0)
+    content_type = str(inspected.get("content_type") or "").lower()
+    final_url = str(inspected.get("final_url") or media_url).lower()
+    if status_code >= 400:
+        return False
+    if content_type.startswith("image/") or content_type.startswith("text/html"):
+        return False
+    if "mpegurl" in content_type or ".m3u8" in final_url:
+        return True
+    if content_type.startswith("video/"):
+        return True
+    if "octet-stream" in content_type and any(token in final_url for token in (".mp4", ".webm", ".m4v", ".mov")):
+        return True
+    return False
+
+
 def download_captured_media(media_url: str, referer: str | None, entry_id: int, title: str | None, ext_hint: str | None = None) -> Path:
     DOWNLOADS_DIR.mkdir(parents=True, exist_ok=True)
     inspected = inspect_remote_stream(media_url, referer)
@@ -807,6 +971,44 @@ def download_clip_test(media_url: str, referer: str | None, title: str | None, s
     raise RuntimeError(error_text[-400:] if len(error_text) > 400 else error_text)
 
 
+def trim_local_clip(source_path: Path, title: str | None, start_seconds: float, end_seconds: float) -> Path:
+    if not ffmpeg_available():
+        return source_path
+    if end_seconds <= start_seconds:
+        return source_path
+    DOWNLOADS_DIR.mkdir(parents=True, exist_ok=True)
+    safe_title = clean_video_title(title) if title else source_path.stem
+    target_path = ensure_unique_path(DOWNLOADS_DIR / f"clip_{safe_title}_{format_timecode(start_seconds).replace(':', '')}_{format_timecode(end_seconds).replace(':', '')}.mp4")
+    duration = max(0.1, end_seconds - start_seconds)
+    command = [
+        str(FFMPEG_EXE),
+        "-y",
+        "-ss",
+        f"{start_seconds:.3f}",
+        "-t",
+        f"{duration:.3f}",
+        "-i",
+        str(source_path),
+        "-map",
+        "0:v:0",
+        "-map",
+        "0:a?",
+        "-movflags",
+        "+faststart",
+        "-c",
+        "copy",
+        str(target_path),
+    ]
+    result = subprocess.run(command, capture_output=True, text=True, timeout=900)
+    if result.returncode == 0 and target_path.exists():
+        try:
+            source_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        return target_path
+    return source_path
+
+
 def websocket_handshake(sock: socket.socket, host: str, path: str) -> None:
     key = base64.b64encode(os.urandom(16)).decode("ascii")
     headers = (
@@ -895,6 +1097,18 @@ def chrome_devtools_json(path: str, method: str = "GET", port: int | None = None
         return json.loads(response.read().decode("utf-8"))
 
 
+def close_chrome_target(target_id: str | None, port: int | None = None) -> None:
+    if not target_id:
+        return
+    if port is None:
+        port = CDP_PORT
+    try:
+        with urlopen(f"http://127.0.0.1:{port}/json/close/{quote(target_id, safe='')}", timeout=5):
+            pass
+    except Exception:
+        pass
+
+
 def wait_for_devtools(port: int | None = None) -> None:
     if port is None:
         port = CDP_PORT
@@ -908,6 +1122,57 @@ def wait_for_devtools(port: int | None = None) -> None:
             last_error = exc
             time.sleep(0.35)
     raise RuntimeError(f"Chrome DevTools endpoint did not start on port {port}: {last_error}")
+
+
+def auth_browser_running() -> bool:
+    try:
+        chrome_devtools_json("/json/version", port=AUTH_BROWSER_PORT)
+        return True
+    except Exception:
+        return False
+
+
+def start_auth_browser(start_url: str | None = None) -> dict:
+    global AUTH_BROWSER_PROCESS
+    browser = browser_executable(prefer_brave=True)
+    if not browser:
+        raise RuntimeError("No Brave, Chrome, or Edge executable was found on this machine.")
+
+    AUTH_BROWSER_PROFILE_DIR.mkdir(parents=True, exist_ok=True)
+    target_url = str(start_url or AUTH_BROWSER_START_URL or "about:blank").strip() or "about:blank"
+    if auth_browser_running():
+        try:
+            chrome_devtools_json(f"/json/new?{quote(target_url, safe=':/?&=%#')}", method="PUT", port=AUTH_BROWSER_PORT)
+        except Exception:
+            pass
+        return {
+            "status": "ok",
+            "already_running": True,
+            "browser_path": str(browser),
+            "profile_dir": str(AUTH_BROWSER_PROFILE_DIR),
+            "debug_port": AUTH_BROWSER_PORT,
+            "start_url": target_url,
+        }
+
+    command = [
+        str(browser),
+        f"--remote-debugging-port={AUTH_BROWSER_PORT}",
+        f"--user-data-dir={AUTH_BROWSER_PROFILE_DIR}",
+        "--autoplay-policy=no-user-gesture-required",
+        "--no-first-run",
+        "--no-default-browser-check",
+        target_url,
+    ]
+    AUTH_BROWSER_PROCESS = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    wait_for_devtools(AUTH_BROWSER_PORT)
+    return {
+        "status": "ok",
+        "already_running": False,
+        "browser_path": str(browser),
+        "profile_dir": str(AUTH_BROWSER_PROFILE_DIR),
+        "debug_port": AUTH_BROWSER_PORT,
+        "start_url": target_url,
+    }
 
 
 def start_capture_browser() -> tuple[subprocess.Popen, int]:
@@ -941,9 +1206,16 @@ def start_capture_browser() -> tuple[subprocess.Popen, int]:
 def browser_capture_media(source: str) -> dict:
     process = None
     actual_port = CDP_PORT
+    using_auth_browser = False
+    target_id = None
     try:
-        process, actual_port = start_capture_browser()
+        if auth_browser_running():
+            actual_port = AUTH_BROWSER_PORT
+            using_auth_browser = True
+        else:
+            process, actual_port = start_capture_browser()
         new_target = chrome_devtools_json(f"/json/new?{quote(source, safe=':/?&=%#')}", method="PUT", port=actual_port)
+        target_id = str(new_target.get("id") or "").strip() or None
         ws_url = new_target.get("webSocketDebuggerUrl")
         if not ws_url:
             raise RuntimeError("Chrome did not provide a DevTools websocket URL.")
@@ -1042,12 +1314,15 @@ def browser_capture_media(source: str) -> dict:
             "webpage_url": source,
             "submitted_url": source,
             "normalized_url": source,
-            "media_kind": "hls" if ".m3u8" in media_url.lower() or "mpegurl" in (preferred.get("mime") or "").lower() else "file",
+            "media_kind": media_kind_for_url(media_url, None, preferred.get("mime")),
             "resolve_strategy": "browser-capture",
-            "attempts": [{"name": "browser-capture", "status": "ok"}],
+            "attempts": [{"name": "auth-browser-capture" if using_auth_browser else "browser-capture", "status": "ok"}],
+            "capture_mode": "auth-browser" if using_auth_browser else "headless-browser",
         }
     finally:
-        if process:
+        if using_auth_browser:
+            close_chrome_target(target_id, actual_port)
+        if process and not using_auth_browser:
             try:
                 process.terminate()
                 process.wait(timeout=5)
@@ -1089,6 +1364,11 @@ def resolve_direct_media(url: str) -> dict:
             },
         },
     ]
+    for target in YTDLP_IMPERSONATE_TARGETS:
+        attempts.append({
+            "name": f"impersonate-{target}",
+            "options": impersonate_options(target, origin),
+        })
     for browser in COOKIE_BROWSER_ATTEMPTS:
         attempts.append({
             "name": f"cookies-{browser}",
@@ -1113,7 +1393,7 @@ def resolve_direct_media(url: str) -> dict:
             height = int((chosen or {}).get("height") or info.get("height") or 0) or None
             extractor = str(info.get("extractor") or info.get("extractor_key") or "").strip() or None
             webpage_url = str(info.get("webpage_url") or source).strip()
-            media_kind = "hls" if (ext or "").lower() == "m3u8" else "file"
+            media_kind = media_kind_for_url(direct_url, ext)
             diagnostics.append({"name": attempt["name"], "status": "ok"})
             return {
                 "media_url": direct_url,
@@ -1140,22 +1420,28 @@ def resolve_direct_media(url: str) -> dict:
 
     page_scan = resolve_from_page_scan(source)
     if page_scan:
-        page_scan["playback_url"] = build_proxy_url(page_scan["media_url"], origin or page_origin(page_scan["webpage_url"]) or page_scan["webpage_url"])
-        page_scan["media_kind"] = "hls" if (page_scan.get("ext") or "").lower() == "m3u8" else "file"
-        page_scan["attempts"] = diagnostics + [{"name": "page-scan", "status": "ok"}]
-        return page_scan
+        page_referer = origin or page_origin(page_scan["webpage_url"]) or page_scan["webpage_url"]
+        if is_playable_stream_candidate(page_scan["media_url"], page_referer):
+            page_scan["playback_url"] = build_proxy_url(page_scan["media_url"], page_referer)
+            page_scan["media_kind"] = media_kind_for_url(page_scan["media_url"], page_scan.get("ext"))
+            page_scan["attempts"] = diagnostics + [{"name": "page-scan", "status": "ok"}]
+            return page_scan
+        diagnostics.append({"name": "page-scan", "status": "error", "message": "candidate was not playable media", "kind": "not-media"})
 
     script_scan = resolve_from_script_payload(source)
     if script_scan:
-        script_scan["playback_url"] = build_proxy_url(script_scan["media_url"], origin or page_origin(script_scan["webpage_url"]) or script_scan["webpage_url"])
-        script_scan["media_kind"] = "hls" if (script_scan.get("ext") or "").lower() == "m3u8" else "file"
-        script_scan["attempts"] = diagnostics + [{"name": "script-scan", "status": "ok"}]
-        return script_scan
+        script_referer = origin or page_origin(script_scan["webpage_url"]) or script_scan["webpage_url"]
+        if is_playable_stream_candidate(script_scan["media_url"], script_referer):
+            script_scan["playback_url"] = build_proxy_url(script_scan["media_url"], script_referer)
+            script_scan["media_kind"] = media_kind_for_url(script_scan["media_url"], script_scan.get("ext"))
+            script_scan["attempts"] = diagnostics + [{"name": "script-scan", "status": "ok"}]
+            return script_scan
+        diagnostics.append({"name": "script-scan", "status": "error", "message": "candidate was not playable media", "kind": "not-media"})
 
     raise RuntimeError(json.dumps({
         "message": last_error,
         "attempts": diagnostics,
-        "failure_class": classify_resolution_error(last_error),
+        "failure_class": summarize_resolution_failure(diagnostics, last_error),
     }))
 
 
@@ -1189,7 +1475,7 @@ class HelperHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_GET(self):
-        global CURRENT_STREAM_STATE
+        global CURRENT_STREAM_STATE, CURRENT_VIDEO_INTRO_STATE
         if self.path == "/api/health":
             return json_response(
                 self,
@@ -1209,6 +1495,33 @@ class HelperHandler(BaseHTTPRequestHandler):
                     },
                     "stream_resolve_available": True,
                     "stream_resolve_cookie_attempts": list(COOKIE_BROWSER_ATTEMPTS),
+                    "auth_browser": {
+                        "running": auth_browser_running(),
+                        "profile_dir": str(AUTH_BROWSER_PROFILE_DIR),
+                        "debug_port": AUTH_BROWSER_PORT,
+                        "preferred_browser": str(browser_executable(prefer_brave=True) or ""),
+                    },
+                },
+            )
+        if self.path.startswith("/api/auth-browser/open"):
+            parsed = urlparse(self.path)
+            params = parse_qs(parsed.query)
+            start_url = str((params.get("url") or [AUTH_BROWSER_START_URL])[0] or "").strip()
+            try:
+                result = start_auth_browser(start_url)
+            except Exception as exc:
+                return json_response(self, 200, {"status": "error", "message": str(exc)})
+            return json_response(self, 200, result)
+        if self.path == "/api/auth-browser/status":
+            return json_response(
+                self,
+                200,
+                {
+                    "status": "ok",
+                    "running": auth_browser_running(),
+                    "profile_dir": str(AUTH_BROWSER_PROFILE_DIR),
+                    "debug_port": AUTH_BROWSER_PORT,
+                    "preferred_browser": str(browser_executable(prefer_brave=True) or ""),
                 },
             )
         if self.path == "/api/stream/current":
@@ -1219,6 +1532,16 @@ class HelperHandler(BaseHTTPRequestHandler):
                     "status": "ok",
                     "active": bool(CURRENT_STREAM_STATE),
                     "stream": CURRENT_STREAM_STATE,
+                },
+            )
+        if self.path == "/api/video-intro/current":
+            return json_response(
+                self,
+                200,
+                {
+                    "status": "ok",
+                    "active": bool(CURRENT_VIDEO_INTRO_STATE),
+                    "intro": CURRENT_VIDEO_INTRO_STATE,
                 },
             )
         if self.path.startswith("/api/stream/proxy"):
@@ -1278,7 +1601,7 @@ class HelperHandler(BaseHTTPRequestHandler):
         return json_response(self, 404, {"status": "error", "message": "Not found"})
 
     def do_POST(self):
-        global CURRENT_STREAM_STATE
+        global CURRENT_STREAM_STATE, CURRENT_VIDEO_INTRO_STATE
         try:
             content_length = int(self.headers.get("Content-Length", "0") or "0")
             raw = self.rfile.read(content_length) if content_length else b"{}"
@@ -1295,6 +1618,16 @@ class HelperHandler(BaseHTTPRequestHandler):
             except Exception as exc:
                 return json_response(self, 200, {"status": "error", "message": str(exc)})
             return json_response(self, 200, {"status": "ok", "active": True, "stream": CURRENT_STREAM_STATE})
+
+        if self.path == "/api/video-intro/current":
+            if payload.get("clear"):
+                CURRENT_VIDEO_INTRO_STATE = None
+                return json_response(self, 200, {"status": "ok", "active": False, "intro": None})
+            try:
+                CURRENT_VIDEO_INTRO_STATE = build_video_intro_state(payload)
+            except Exception as exc:
+                return json_response(self, 200, {"status": "error", "message": str(exc)})
+            return json_response(self, 200, {"status": "ok", "active": True, "intro": CURRENT_VIDEO_INTRO_STATE})
 
         if self.path == "/api/downloads/manual-ready-latest":
             entry_id = int(payload.get("entry_id") or 0)
@@ -1348,18 +1681,71 @@ class HelperHandler(BaseHTTPRequestHandler):
             api_base = payload.get("api_base") or API_DEFAULT
             submitted_url = str(payload.get("submitted_url") or "").strip()
             video_title = payload.get("video_title")
+            clip_start_seconds, clip_end_seconds = clip_window_from_payload(payload)
             if not submitted_url:
                 return json_response(self, 200, {"status": "error", "message": "No source URL was supplied."})
+            report_processing_started(api_base, entry_id)
             try:
+                captured_result = None
+                capture_error = None
+
+                def get_captured_media_once() -> dict:
+                    nonlocal captured_result, capture_error
+                    if captured_result is not None:
+                        return captured_result
+                    if capture_error is not None:
+                        raise capture_error
+                    try:
+                        captured_result = browser_capture_media(submitted_url)
+                        return captured_result
+                    except Exception as exc:
+                        capture_error = exc
+                        raise
+
                 try:
                     resolved = resolve_direct_media(submitted_url)
+                except Exception:
+                    resolved = None
+
+                if resolved:
                     final_title = resolved.get("title") or video_title
-                    remote = report_stream_ready(
+                    stream_candidate = {
+                        "direct_media_url": resolved["media_url"],
+                        "media_url": resolved["media_url"],
+                        "playback_url": resolved.get("playback_url"),
+                        "media_kind": resolved.get("media_kind"),
+                        "video_title": final_title,
+                        "download_method": resolved.get("resolve_strategy") or "stream-resolve",
+                        "resolve_strategy": resolved.get("resolve_strategy") or "stream-resolve",
+                        **clip_fields(clip_start_seconds, clip_end_seconds),
+                    }
+                    download_candidate = None
+                    if clip_start_seconds is not None and clip_end_seconds is not None:
+                        try:
+                            clip_path = download_clip_test(
+                                resolved["media_url"],
+                                page_origin(submitted_url) or submitted_url,
+                                final_title,
+                                clip_start_seconds,
+                                clip_end_seconds,
+                            )
+                            target = move_to_ready(clip_path, entry_id, display_name, final_title, use_ffmpeg=False)
+                            download_candidate = {
+                                "local_filename": target.name,
+                                "local_path": str(target),
+                                "video_title": final_title,
+                                "download_method": "stream-clip",
+                                **clip_fields(clip_start_seconds, clip_end_seconds),
+                            }
+                        except Exception:
+                            download_candidate = None
+                    remote = report_processed_options(
                         api_base,
                         entry_id,
-                        resolved["media_url"],
-                        final_title,
-                        resolved.get("resolve_strategy") or "stream-resolve",
+                        stream_candidate=stream_candidate,
+                        download_candidate=download_candidate,
+                        video_title=final_title,
+                        process_method=stream_candidate["download_method"],
                     )
                     return json_response(self, 200, {
                         "status": remote.get("status", "ok"),
@@ -1369,49 +1755,104 @@ class HelperHandler(BaseHTTPRequestHandler):
                         "playback_url": resolved.get("playback_url"),
                         "media_kind": resolved.get("media_kind"),
                         "stream_support": "supported",
+                        "stream_candidate": stream_candidate,
+                        "download_candidate": download_candidate,
                         "remote": remote,
                     })
+
+                try:
+                    captured = get_captured_media_once()
                 except Exception:
-                    try:
-                        captured = browser_capture_media(submitted_url)
-                        final_title = captured.get("title") or video_title
-                        remote = report_stream_ready(
-                            api_base,
-                            entry_id,
-                            captured["media_url"],
-                            final_title,
-                            captured.get("resolve_strategy") or "browser-capture",
-                        )
-                        return json_response(self, 200, {
-                            "status": remote.get("status", "ok"),
-                            "video_title": final_title,
-                            "download_method": captured.get("resolve_strategy") or "browser-capture",
-                            "direct_media_url": captured["media_url"],
-                            "playback_url": captured.get("playback_url"),
-                            "media_kind": captured.get("media_kind"),
-                            "stream_support": "supported",
-                            "remote": remote,
-                        })
-                    except Exception:
-                        download_method = "yt-dlp"
+                    captured = None
+
+                if captured:
+                    final_title = captured.get("title") or video_title
+                    stream_candidate = {
+                        "direct_media_url": captured["media_url"],
+                        "media_url": captured["media_url"],
+                        "playback_url": captured.get("playback_url"),
+                        "media_kind": captured.get("media_kind"),
+                        "video_title": final_title,
+                        "download_method": captured.get("resolve_strategy") or "browser-capture",
+                        "resolve_strategy": captured.get("resolve_strategy") or "browser-capture",
+                        **clip_fields(clip_start_seconds, clip_end_seconds),
+                    }
+                    download_candidate = None
+                    if clip_start_seconds is not None and clip_end_seconds is not None:
                         try:
-                            source, extracted_title = download_low_res_video(submitted_url, entry_id)
-                            final_title = extracted_title or video_title
-                        except Exception:
-                            captured = browser_capture_media(submitted_url)
-                            referer = page_origin(submitted_url) or submitted_url
-                            source = download_captured_media(
+                            clip_path = download_clip_test(
                                 captured["media_url"],
-                                referer,
-                                entry_id,
-                                captured.get("title") or video_title,
-                                captured.get("ext"),
+                                page_origin(submitted_url) or submitted_url,
+                                final_title,
+                                clip_start_seconds,
+                                clip_end_seconds,
                             )
-                            final_title = captured.get("title") or video_title
-                            download_method = "browser-capture-fallback"
-                        target = move_to_ready(source, entry_id, display_name, final_title, use_ffmpeg=False)
-                        remote = report_download_ready(api_base, entry_id, target, final_title)
+                            target = move_to_ready(clip_path, entry_id, display_name, final_title, use_ffmpeg=False)
+                            download_candidate = {
+                                "local_filename": target.name,
+                                "local_path": str(target),
+                                "video_title": final_title,
+                                "download_method": "browser-capture-clip",
+                                **clip_fields(clip_start_seconds, clip_end_seconds),
+                            }
+                        except Exception:
+                            download_candidate = None
+                    remote = report_processed_options(
+                        api_base,
+                        entry_id,
+                        stream_candidate=stream_candidate,
+                        download_candidate=download_candidate,
+                        video_title=final_title,
+                        process_method=stream_candidate["download_method"],
+                    )
+                    return json_response(self, 200, {
+                        "status": remote.get("status", "ok"),
+                        "video_title": final_title,
+                        "download_method": captured.get("resolve_strategy") or "browser-capture",
+                        "direct_media_url": captured["media_url"],
+                        "playback_url": captured.get("playback_url"),
+                        "media_kind": captured.get("media_kind"),
+                        "stream_support": "supported",
+                        "stream_candidate": stream_candidate,
+                        "download_candidate": download_candidate,
+                        "remote": remote,
+                    })
+
+                download_method = "yt-dlp"
+                try:
+                    source, extracted_title = download_low_res_video(submitted_url, entry_id)
+                    final_title = extracted_title or video_title
+                except Exception:
+                    captured = get_captured_media_once()
+                    referer = page_origin(submitted_url) or submitted_url
+                    source = download_captured_media(
+                        captured["media_url"],
+                        referer,
+                        entry_id,
+                        captured.get("title") or video_title,
+                        captured.get("ext"),
+                    )
+                    final_title = captured.get("title") or video_title
+                    download_method = "browser-capture-fallback"
+                if clip_start_seconds is not None and clip_end_seconds is not None:
+                    source = trim_local_clip(source, final_title, clip_start_seconds, clip_end_seconds)
+                target = move_to_ready(source, entry_id, display_name, final_title, use_ffmpeg=False)
+                download_candidate = {
+                    "local_filename": target.name,
+                    "local_path": str(target),
+                    "video_title": final_title,
+                    "download_method": download_method,
+                    **clip_fields(clip_start_seconds, clip_end_seconds),
+                }
+                remote = report_processed_options(
+                    api_base,
+                    entry_id,
+                    download_candidate=download_candidate,
+                    video_title=final_title,
+                    process_method=download_method,
+                )
             except Exception as exc:
+                report_processing_failed(api_base, entry_id, str(exc))
                 return json_response(self, 200, {"status": "error", "message": str(exc)})
             return json_response(self, 200, {
                 "status": remote.get("status", "ok"),
@@ -1419,6 +1860,7 @@ class HelperHandler(BaseHTTPRequestHandler):
                 "local_filename": target.name,
                 "video_title": final_title,
                 "download_method": download_method,
+                "download_candidate": download_candidate,
                 "remote": remote,
             })
 

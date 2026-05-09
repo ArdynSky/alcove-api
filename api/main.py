@@ -204,6 +204,7 @@ UK_TZ = ZoneInfo("Europe/London")
 state = {
     "current_round": 1,
     "round_status": "closed",  # closed | open | locked | spinning | playing
+    "winner_intro_loaded": False,
     "room_open": True,
     "closing_soon": False,
     "review_prompt_open": False,
@@ -436,6 +437,9 @@ class WheelEntry(BaseModel):
     link: str
     note: str | None = None
     video_title: str | None = None
+    video_longer_than_5_minutes: bool | None = None
+    clip_start_seconds: int | None = None
+    clip_start_label: str | None = None
 
 
 class VideoReview(BaseModel):
@@ -474,6 +478,13 @@ class DownloadCompletePayload(BaseModel):
     direct_media_url: str | None = None
     video_title: str | None = None
     download_method: str = "auto"
+
+
+class DownloadProcessedPayload(BaseModel):
+    stream_candidate: dict | None = None
+    download_candidate: dict | None = None
+    video_title: str | None = None
+    process_method: str | None = None
 
 
 class DownloadFailedPayload(BaseModel):
@@ -1769,6 +1780,12 @@ def entry_is_download_ready(entry: dict) -> bool:
     return entry.get("download_status") in {"ready", "manual_ready"}
 
 
+def clear_processed_candidates(entry: dict) -> None:
+    entry["stream_candidate"] = None
+    entry["download_candidate"] = None
+    entry["processed_at"] = None
+
+
 def get_ready_unplayed_entries(round_number: int):
     return [
         entry
@@ -1858,6 +1875,7 @@ def assign_local_file_to_entry(entry: dict, source_path: str, video_title: str |
     entry["download_completed_at"] = now_iso()
     if video_title:
         entry["data"]["video_title"] = video_title
+    clear_processed_candidates(entry)
 
     ws_broadcast_bundle()
     return {"status": "ok", "entry": entry}
@@ -2023,6 +2041,7 @@ def get_app_state():
         "review_prompt_open": state.get("review_prompt_open", False),
         "review_reveal_active": state.get("review_reveal_active", False),
         "review_score_reveal_active": state.get("review_score_reveal_active", False),
+        "winner_intro_loaded": state.get("winner_intro_loaded", False),
         "video_reviews": video_reviews,
         "video_review_average": review_average_rating(),
         "active_wheel_reaction": current_active_wheel_reaction(),
@@ -2076,6 +2095,7 @@ def start_spin():
         return {"status": "error", "message": "No ready entries left to spin in this round."}
 
     state["round_status"] = "spinning"
+    state["winner_intro_loaded"] = False
     current_now_playing = None
     chosen = random.choice(pool)
     current_winner = {
@@ -2084,6 +2104,8 @@ def start_spin():
         "video_title": chosen["data"].get("video_title"),
         "local_filename": chosen.get("local_filename"),
         "local_path": chosen.get("local_path"),
+        "clip_start_seconds": chosen.get("clip_start_seconds"),
+        "clip_end_seconds": chosen.get("clip_end_seconds"),
         "time": now_iso(),
     }
     add_notification("winner", f"Winner: {current_winner['entrant_name']}", True)
@@ -2098,6 +2120,7 @@ def end_round():
     global current_winner, current_now_playing
     current_round = state["current_round"]
     state["round_status"] = "closed"
+    state["winner_intro_loaded"] = False
     state["review_prompt_open"] = False
     state["review_reveal_active"] = False
     state["review_score_reveal_active"] = False
@@ -2260,6 +2283,15 @@ def submit_wheel(entry: WheelEntry):
         "local_path": None,
         "download_started_at": None,
         "download_completed_at": None,
+        "stream_candidate": None,
+        "download_candidate": None,
+        "processed_at": None,
+        "clip_start_seconds": entry_data.get("clip_start_seconds"),
+        "clip_end_seconds": (
+            int(entry_data["clip_start_seconds"]) + 300
+            if entry_data.get("clip_start_seconds") is not None
+            else None
+        ),
         "approval_status": "pending",
         "approval_time": None,
         "rejection_time": None,
@@ -2299,6 +2331,11 @@ def list_wheel_entries_host():
             "download_method": entry.get("download_method"),
             "local_filename": entry.get("local_filename"),
             "local_path": entry.get("local_path"),
+            "stream_candidate": entry.get("stream_candidate"),
+            "download_candidate": entry.get("download_candidate"),
+            "processed_at": entry.get("processed_at"),
+            "clip_start_seconds": entry.get("clip_start_seconds"),
+            "clip_end_seconds": entry.get("clip_end_seconds"),
             "played": entry.get("played", False),
             "played_at": entry.get("played_at"),
             "time": entry.get("time"),
@@ -2405,6 +2442,7 @@ def reject_entry(entry_id: int):
     entry["local_filename"] = None
     entry["local_path"] = None
     entry["download_method"] = None
+    clear_processed_candidates(entry)
     add_notification("system", f"Rejected: {entry['data'].get('display_name', 'Unknown')}", False)
     ws_broadcast_bundle()
     return {"status": "ok", "entry_id": entry_id, "approval_status": "rejected"}
@@ -2422,6 +2460,7 @@ def mark_download_start(entry_id: int):
     entry["download_status"] = "extracting"
     entry["download_started_at"] = now_iso()
     entry["download_error"] = None
+    clear_processed_candidates(entry)
     return {"status": "ok"}
 
 
@@ -2458,7 +2497,103 @@ def mark_download_complete(entry_id: int, payload: DownloadCompletePayload):
     entry["download_completed_at"] = now_iso()
     if payload.video_title:
         entry["data"]["video_title"] = payload.video_title
+    clear_processed_candidates(entry)
     return {"status": "ok"}
+
+
+@app.post("/api/downloads/processed/{entry_id}")
+def mark_download_processed(entry_id: int, payload: DownloadProcessedPayload):
+    entry = find_entry(entry_id)
+    if not entry:
+        return {"status": "error", "message": "entry not found"}
+
+    if not entry_is_approved(entry):
+        return {"status": "error", "message": "entry is not approved"}
+
+    stream_candidate = payload.stream_candidate if isinstance(payload.stream_candidate, dict) else None
+    download_candidate = payload.download_candidate if isinstance(payload.download_candidate, dict) else None
+    if not stream_candidate and not download_candidate:
+        return {"status": "error", "message": "no stream or download option was produced"}
+
+    entry["download_status"] = "processed"
+    entry["download_error"] = None
+    entry["download_method"] = payload.process_method or "process-link"
+    entry["stream_candidate"] = stream_candidate
+    entry["download_candidate"] = download_candidate
+    entry["processed_at"] = now_iso()
+    entry["download_completed_at"] = None
+    entry["direct_media_url"] = None
+    entry["local_filename"] = None
+    entry["local_path"] = None
+    if payload.video_title:
+        entry["data"]["video_title"] = payload.video_title
+    ws_broadcast_bundle()
+    return {"status": "ok", "entry": entry}
+
+
+@app.post("/api/downloads/select-stream/{entry_id}")
+def select_stream_ready(entry_id: int):
+    entry = find_entry(entry_id)
+    if not entry:
+        return {"status": "error", "message": "entry not found"}
+    if not entry_is_approved(entry):
+        return {"status": "error", "message": "entry is not approved"}
+
+    candidate = entry.get("stream_candidate") or {}
+    media_url = str(candidate.get("direct_media_url") or candidate.get("media_url") or "").strip()
+    if not media_url:
+        return {"status": "error", "message": "no stream option is available"}
+
+    title = candidate.get("video_title") or candidate.get("title")
+    clip_start_seconds = candidate.get("clip_start_seconds") if candidate.get("clip_start_seconds") is not None else entry.get("clip_start_seconds")
+    clip_end_seconds = candidate.get("clip_end_seconds") if candidate.get("clip_end_seconds") is not None else entry.get("clip_end_seconds")
+    entry["download_status"] = "ready"
+    entry["download_error"] = None
+    entry["direct_media_url"] = media_url
+    entry["local_filename"] = ""
+    entry["local_path"] = ""
+    entry["download_method"] = candidate.get("download_method") or candidate.get("resolve_strategy") or "stream-ready"
+    entry["download_completed_at"] = now_iso()
+    if title:
+        entry["data"]["video_title"] = title
+    entry["clip_start_seconds"] = clip_start_seconds
+    entry["clip_end_seconds"] = clip_end_seconds
+    clear_processed_candidates(entry)
+    ws_broadcast_bundle()
+    return {"status": "ok", "entry": entry}
+
+
+@app.post("/api/downloads/select-download/{entry_id}")
+def select_download_ready(entry_id: int):
+    entry = find_entry(entry_id)
+    if not entry:
+        return {"status": "error", "message": "entry not found"}
+    if not entry_is_approved(entry):
+        return {"status": "error", "message": "entry is not approved"}
+
+    candidate = entry.get("download_candidate") or {}
+    local_path = str(candidate.get("local_path") or "").strip()
+    local_filename = str(candidate.get("local_filename") or os.path.basename(local_path)).strip()
+    if not local_path:
+        return {"status": "error", "message": "no download option is available"}
+
+    title = candidate.get("video_title") or candidate.get("title")
+    clip_start_seconds = candidate.get("clip_start_seconds") if candidate.get("clip_start_seconds") is not None else entry.get("clip_start_seconds")
+    clip_end_seconds = candidate.get("clip_end_seconds") if candidate.get("clip_end_seconds") is not None else entry.get("clip_end_seconds")
+    entry["download_status"] = "manual_ready"
+    entry["download_error"] = None
+    entry["direct_media_url"] = None
+    entry["local_filename"] = local_filename
+    entry["local_path"] = local_path
+    entry["download_method"] = candidate.get("download_method") or "download-ready"
+    entry["download_completed_at"] = now_iso()
+    if title:
+        entry["data"]["video_title"] = title
+    entry["clip_start_seconds"] = clip_start_seconds
+    entry["clip_end_seconds"] = clip_end_seconds
+    clear_processed_candidates(entry)
+    ws_broadcast_bundle()
+    return {"status": "ok", "entry": entry}
 
 
 @app.post("/api/downloads/failed/{entry_id}")
@@ -2473,6 +2608,7 @@ def mark_download_failed(entry_id: int, payload: DownloadFailedPayload):
     entry["download_status"] = "failed"
     entry["download_error"] = payload.error
     entry["download_method"] = "auto"
+    ws_broadcast_bundle()
     return {"status": "ok"}
 
 
@@ -2493,6 +2629,7 @@ def mark_manual_ready(entry_id: int, payload: ManualReadyPayload):
     entry["download_completed_at"] = now_iso()
     if payload.video_title:
         entry["data"]["video_title"] = payload.video_title
+    clear_processed_candidates(entry)
     return {"status": "ok"}
 
 
@@ -2557,6 +2694,7 @@ def retry_download(entry_id: int):
     entry["direct_media_url"] = None
     entry["download_started_at"] = None
     entry["download_completed_at"] = None
+    clear_processed_candidates(entry)
     return {"status": "ok"}
 
 
@@ -2578,12 +2716,15 @@ def set_spin_result(payload: dict):
     if not entry_is_download_ready(entry):
         return {"status": "error", "message": "winner is not download-ready"}
 
+    state["winner_intro_loaded"] = False
     current_winner = {
         "entry_id": entry["id"],
         "entrant_name": entry["data"].get("display_name", "Unknown"),
         "video_title": entry["data"].get("video_title"),
         "local_filename": entry.get("local_filename"),
         "local_path": entry.get("local_path"),
+        "clip_start_seconds": entry.get("clip_start_seconds"),
+        "clip_end_seconds": entry.get("clip_end_seconds"),
         "time": now_iso(),
     }
     add_notification("winner", f"Winner: {current_winner['entrant_name']}", True)
@@ -2596,12 +2737,22 @@ def set_spin_result(payload: dict):
 def clear_winner():
     global current_winner
     current_winner = None
+    state["winner_intro_loaded"] = False
     return {"status": "ok"}
 
 
 @app.get("/api/current-winner")
 def get_current_winner():
     return current_winner
+
+
+@app.post("/api/winner/intro-loaded/{entry_id}")
+def mark_winner_intro_loaded(entry_id: int):
+    if not current_winner or int(current_winner.get("entry_id") or 0) != int(entry_id):
+        return {"status": "error", "message": "winner does not match"}
+    state["winner_intro_loaded"] = True
+    ws_broadcast_bundle()
+    return {"status": "ok", "entry_id": entry_id, "winner_intro_loaded": True}
 
 
 # ---------------------------------
