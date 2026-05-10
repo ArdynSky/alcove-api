@@ -1797,6 +1797,41 @@ def get_ready_unplayed_entries(round_number: int):
     ]
 
 
+def reset_wheel_session_state() -> None:
+    global current_winner, current_now_playing, current_wheel_reaction, latest_review_overlay
+    global synced_alcove_users, synced_alcove_analytics, last_bot_sync_at
+
+    wheel_entries.clear()
+    archived_wheel_entries.clear()
+    pending_comments.clear()
+    approved_comments.clear()
+    notification_feed.clear()
+    video_reviews.clear()
+    wheel_reaction_events.clear()
+    wheel_reaction_history.clear()
+    wheel_review_history.clear()
+    wheel_user_engagement.clear()
+    wheel_submission_limits.clear()
+    muted_users.clear()
+
+    synced_alcove_users = []
+    synced_alcove_analytics = {}
+    last_bot_sync_at = None
+    current_winner = None
+    current_now_playing = None
+    current_wheel_reaction = None
+    latest_review_overlay = None
+
+    state["current_round"] = 1
+    state["round_status"] = "closed"
+    state["winner_intro_loaded"] = False
+    state["room_open"] = True
+    state["closing_soon"] = False
+    state["review_prompt_open"] = False
+    state["review_reveal_active"] = False
+    state["review_score_reveal_active"] = False
+
+
 def find_entry(entry_id: int):
     for entry in wheel_entries:
         if entry["id"] == entry_id:
@@ -2048,6 +2083,14 @@ def get_app_state():
         "active_wheel_reactions": current_active_wheel_reactions(),
         "active_review_overlay": current_active_review_overlay(),
     }
+
+
+@app.post("/api/session/hard-reset")
+def hard_reset_session():
+    reset_wheel_session_state()
+    save_runtime_state()
+    ws_broadcast_bundle()
+    return {"status": "ok", "message": "Wheel session reset", "current_round": state["current_round"]}
 
 
 # ---------------------------------
