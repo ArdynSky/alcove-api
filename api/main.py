@@ -12,6 +12,7 @@ import asyncio
 import json
 import random
 import sqlite3
+import hashlib
 from fastapi import Header, HTTPException, WebSocket, WebSocketDisconnect
 from .websocket_manager import manager
 
@@ -197,6 +198,7 @@ notification_feed = []
 wheel_submission_limits = {}
 muted_users = set()
 current_winner = None
+current_video_intro = None
 PULSE_DEFAULT_HEAT_THRESHOLD = int(os.getenv("PULSE_HEAT_THRESHOLD", "50"))
 PULSE_TESTING_UNLIMITED = os.getenv("PULSE_TESTING_UNLIMITED", "0").strip().lower() in {"1", "true", "yes", "on"}
 UK_TZ = ZoneInfo("Europe/London")
@@ -2130,7 +2132,7 @@ def lock_round():
 
 @app.post("/api/round/start-spin")
 def start_spin():
-    global current_winner, current_now_playing
+    global current_winner, current_now_playing, current_video_intro
     current_round = state["current_round"]
     pool = get_next_spin_pool(current_round)
 
@@ -2139,6 +2141,7 @@ def start_spin():
 
     state["round_status"] = "spinning"
     state["winner_intro_loaded"] = False
+    current_video_intro = None
     current_now_playing = None
     chosen = random.choice(pool)
     current_winner = {
@@ -2747,7 +2750,7 @@ def retry_download(entry_id: int):
 
 @app.post("/api/spin-result")
 def set_spin_result(payload: dict):
-    global current_winner
+    global current_winner, current_video_intro
     entry_id = payload.get("entry_id")
     if entry_id is None:
         return {"status": "error", "message": "entry_id required"}
@@ -2760,6 +2763,7 @@ def set_spin_result(payload: dict):
         return {"status": "error", "message": "winner is not download-ready"}
 
     state["winner_intro_loaded"] = False
+    current_video_intro = None
     current_winner = {
         "entry_id": entry["id"],
         "entrant_name": entry["data"].get("display_name", "Unknown"),
@@ -2778,8 +2782,9 @@ def set_spin_result(payload: dict):
 
 @app.post("/api/winner/clear")
 def clear_winner():
-    global current_winner
+    global current_winner, current_video_intro
     current_winner = None
+    current_video_intro = None
     state["winner_intro_loaded"] = False
     return {"status": "ok"}
 
@@ -2787,6 +2792,48 @@ def clear_winner():
 @app.get("/api/current-winner")
 def get_current_winner():
     return current_winner
+
+
+def build_video_intro_state(payload: dict) -> dict:
+    prepared_at = int(datetime.datetime.now(datetime.timezone.utc).timestamp() * 1000)
+    entry_id = int(payload.get("entry_id") or 0) or None
+    video_title = str(payload.get("video_title") or payload.get("title") or "").strip() or "Untitled video"
+    display_name = str(payload.get("display_name") or payload.get("entrant_name") or "").strip() or "Unknown"
+    username = str(payload.get("username") or "").strip().lstrip("@")
+    intro_key = hashlib.sha1(f"{entry_id}-{video_title}-{display_name}-{username}-{prepared_at}".encode("utf-8")).hexdigest()[:12]
+    return {
+        "entry_id": entry_id,
+        "video_title": video_title,
+        "display_name": display_name,
+        "username": username,
+        "intro_key": intro_key,
+        "prepared_at": prepared_at,
+    }
+
+
+@app.get("/api/video-intro/current")
+def get_video_intro_current():
+    return {
+        "status": "ok",
+        "active": bool(current_video_intro),
+        "intro": current_video_intro,
+    }
+
+
+@app.post("/api/video-intro/current")
+def set_video_intro_current(payload: dict):
+    global current_video_intro
+    if payload.get("clear"):
+        current_video_intro = None
+        state["winner_intro_loaded"] = False
+        ws_broadcast_bundle()
+        return {"status": "ok", "active": False, "intro": None}
+    try:
+        current_video_intro = build_video_intro_state(payload)
+    except Exception as exc:
+        return {"status": "error", "message": str(exc)}
+    ws_broadcast_bundle()
+    return {"status": "ok", "active": True, "intro": current_video_intro}
 
 
 @app.post("/api/winner/intro-loaded/{entry_id}")
