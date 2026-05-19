@@ -66,6 +66,10 @@ STATE_DB_PATH = os.getenv(
     "ALCOVE_STATE_DB_PATH",
     os.path.join(os.getcwd(), "alcove_state.db"),
 )
+VERIFY_FLOW_LOG_PATH = os.getenv(
+    "VERIFY_FLOW_LOG_PATH",
+    os.path.join(os.getcwd(), "verification_flow_events.jsonl"),
+)
 
 for path in [DOWNLOADS_DIR, READY_DIR, ARCHIVE_DIR, PLAYOUT_DIR]:
     os.makedirs(path, exist_ok=True)
@@ -439,6 +443,7 @@ class WheelEntry(BaseModel):
     link: str
     note: str | None = None
     video_title: str | None = None
+    skin_id: str | None = None
     video_longer_than_5_minutes: bool | None = None
     clip_start_seconds: int | None = None
     clip_start_label: str | None = None
@@ -458,6 +463,16 @@ class StreamComment(BaseModel):
     username: str | None = None
     display_name: str
     text: str
+    skin_id: str | None = None
+
+
+class FoxMessagePayload(BaseModel):
+    text: str
+
+
+class FoxWheelEntryPayload(BaseModel):
+    video_title: str | None = None
+    note: str | None = None
 
 
 class WheelReaction(BaseModel):
@@ -574,12 +589,107 @@ class FeatureFlagsUpdate(BaseModel):
     admin_secret: str | None = None
 
 
+class VerificationLogPayload(BaseModel):
+    session_id: str | None = None
+    event: str
+    level: str = "info"
+    user_id: int | None = None
+    username: str | None = None
+    display_name: str | None = None
+    step_index: int | None = None
+    step_title: str | None = None
+    step_pose: str | None = None
+    action: str | None = None
+    selected_pack: str | None = None
+    message: str | None = None
+    detail: dict | None = None
+    user_agent: str | None = None
+    url: str | None = None
+    client_time: str | None = None
+
+
 # ---------------------------------
 # Helpers
 # ---------------------------------
 
 def now_iso() -> str:
     return datetime.datetime.utcnow().isoformat()
+
+
+def clipped_text(value, limit=500):
+    if value is None:
+        return None
+    text = str(value)
+    return text if len(text) <= limit else text[:limit] + "..."
+
+
+def clipped_detail(value):
+    if not isinstance(value, dict):
+        return {}
+    detail = {}
+    for key, item in value.items():
+        clean_key = clipped_text(key, 80)
+        if clean_key:
+            detail[clean_key] = clipped_text(item, 700)
+    return detail
+
+
+def append_verification_flow_log(payload: VerificationLogPayload):
+    entry = {
+        "received_at": now_iso(),
+        "session_id": clipped_text(payload.session_id, 120),
+        "event": clipped_text(payload.event, 120) or "unknown",
+        "level": clipped_text(payload.level, 20) or "info",
+        "user_id": payload.user_id,
+        "username": clipped_text(payload.username, 80),
+        "display_name": clipped_text(payload.display_name, 120),
+        "step_index": payload.step_index,
+        "step_title": clipped_text(payload.step_title, 160),
+        "step_pose": clipped_text(payload.step_pose, 60),
+        "action": clipped_text(payload.action, 120),
+        "selected_pack": clipped_text(payload.selected_pack, 60),
+        "message": clipped_text(payload.message, 900),
+        "detail": clipped_detail(payload.detail),
+        "user_agent": clipped_text(payload.user_agent, 300),
+        "url": clipped_text(payload.url, 500),
+        "client_time": clipped_text(payload.client_time, 80),
+    }
+    directory = os.path.dirname(VERIFY_FLOW_LOG_PATH)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    with open(VERIFY_FLOW_LOG_PATH, "a", encoding="utf-8") as handle:
+        handle.write(json.dumps(entry, ensure_ascii=False, sort_keys=True) + "\n")
+    if entry["level"] in {"warn", "error"} or "error" in str(entry["event"]).lower():
+        print(
+            f"[{entry['received_at']}] verification {entry['level']} "
+            f"user_id={entry['user_id']} username={entry['username']!r} "
+            f"step={entry['step_index']} event={entry['event']!r} message={entry['message']!r}",
+            flush=True,
+        )
+    return entry
+
+
+def read_verification_flow_logs(limit=80, user_id=None, username=None, session_id=None):
+    limit = max(1, min(int(limit or 80), 500))
+    if not os.path.exists(VERIFY_FLOW_LOG_PATH):
+        return []
+    username = (username or "").strip().lstrip("@").lower()
+    session_id = (session_id or "").strip()
+    rows = []
+    with open(VERIFY_FLOW_LOG_PATH, "r", encoding="utf-8") as handle:
+        for line in handle:
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if user_id is not None and int(entry.get("user_id") or 0) != int(user_id):
+                continue
+            if username and (entry.get("username") or "").strip().lstrip("@").lower() != username:
+                continue
+            if session_id and entry.get("session_id") != session_id:
+                continue
+            rows.append(entry)
+    return rows[-limit:]
 
 
 def iso_in_seconds(seconds: int) -> str:
@@ -1635,6 +1745,52 @@ def get_room_users():
     return sorted(users.values(), key=lambda u: (u["display_name"] or "").lower())
 
 
+def create_fox_manual_entry(video_title: str | None = None, note: str | None = None):
+    now = now_iso()
+    entry_data = {
+        "telegram_id": -9001,
+        "username": "F.O.X",
+        "display_name": "F.O.X",
+        "link": "fox://manual-entry",
+        "note": note or "F.O.X has entered the wheel.",
+        "video_title": video_title or "F.O.X wants in on the wheel",
+        "skin_id": "fox_green",
+        "video_longer_than_5_minutes": False,
+        "clip_start_seconds": None,
+        "clip_start_label": None,
+    }
+    new_entry = {
+        "id": len(wheel_entries) + len(archived_wheel_entries) + 1,
+        "round_id": state["current_round"],
+        "time": now,
+        "played": False,
+        "played_at": None,
+        "data": entry_data,
+        "submitted_url": entry_data["link"],
+        "source_domain": "fox",
+        "direct_media_url": None,
+        "download_status": "manual_ready",
+        "download_error": None,
+        "download_method": "fox-manual",
+        "local_filename": "fox-manual",
+        "local_path": "",
+        "download_started_at": None,
+        "download_completed_at": now,
+        "stream_candidate": None,
+        "download_candidate": None,
+        "processed_at": None,
+        "clip_start_seconds": None,
+        "clip_end_seconds": None,
+        "approval_status": "approved",
+        "approval_time": now,
+        "rejection_time": None,
+    }
+    wheel_entries.append(new_entry)
+    add_notification("fox", "F.O.X joined the wheel", True)
+    ws_broadcast_bundle()
+    return new_entry
+
+
 def wheel_user_key(user_id=None, username=None, display_name=None) -> str | None:
     if user_id is not None:
         return f"user:{int(user_id)}"
@@ -2031,6 +2187,159 @@ def bot_sync_alcove(payload: BotSyncPayload, x_bot_sync_secret: str | None = Hea
     }
 
 
+def after_iso_window(value, since: datetime.datetime) -> bool:
+    if not value:
+        return False
+    try:
+        return datetime.datetime.fromisoformat(str(value)) >= since
+    except (TypeError, ValueError):
+        return False
+
+
+def activity_user_label(entry: dict, username_key="username", display_key="display_name", user_id_key="user_id") -> str:
+    username = (entry.get(username_key) or "").strip()
+    if username:
+        return f"@{username}"
+    display_name = (entry.get(display_key) or "").strip()
+    if display_name:
+        return display_name
+    user_id = entry.get(user_id_key)
+    return str(user_id or "Unknown")
+
+
+def count_by_label(entries, label_func):
+    counts = {}
+    for entry in entries:
+        label = label_func(entry)
+        counts[label] = counts.get(label, 0) + 1
+    return [
+        {"display_name": label, "count": count}
+        for label, count in sorted(counts.items(), key=lambda item: item[1], reverse=True)
+    ]
+
+
+@app.get("/api/bot-sync/activity-summary")
+def bot_activity_summary(hours: int = 3, x_bot_sync_secret: str | None = Header(default=None)):
+    verify_bot_sync_secret(x_bot_sync_secret)
+
+    hours = max(1, min(int(hours or 3), 24))
+    now = datetime.datetime.utcnow()
+    since = now - datetime.timedelta(hours=hours)
+
+    recent_comments = [
+        comment for comment in approved_comments
+        if after_iso_window(comment.get("time"), since)
+    ]
+    user_comments = [comment for comment in recent_comments if not comment.get("system")]
+    fox_comments = [comment for comment in recent_comments if comment.get("system")]
+    recent_spotlights = [
+        entry for entry in spotlight_entries
+        if after_iso_window(entry.get("time"), since)
+    ]
+    reviewed_spotlights = [
+        entry for entry in spotlight_entries
+        if after_iso_window(entry.get("reviewed_at"), since)
+    ]
+    recent_pulses = [
+        entry for entry in pulse_entries
+        if after_iso_window(entry.get("sent_at"), since)
+    ]
+    completed_pulses = [
+        entry for entry in pulse_entries
+        if after_iso_window(entry.get("responded_at"), since)
+    ]
+    recent_question_suggestions = [
+        entry for entry in pulse_question_suggestions
+        if after_iso_window(entry.get("submitted_at"), since)
+    ]
+    red_activations = [
+        entry for entry in pulse_red_activations
+        if after_iso_window(entry.get("activated_at"), since)
+    ]
+
+    return {
+        "status": "ok",
+        "window": {
+            "hours": hours,
+            "since": since.isoformat(),
+            "to": now.isoformat(),
+        },
+        "counts": {
+            "stream_comments": len(user_comments),
+            "fox_messages": len(fox_comments),
+            "spotlights_submitted": len(recent_spotlights),
+            "spotlights_approved": len([entry for entry in reviewed_spotlights if entry.get("status") == "approved"]),
+            "spotlights_rejected": len([entry for entry in reviewed_spotlights if entry.get("status") == "rejected"]),
+            "pulses_sent": len(recent_pulses),
+            "pulses_completed": len(completed_pulses),
+            "red_pulse_activations": len(red_activations),
+            "pulse_questions_submitted": len(recent_question_suggestions),
+        },
+        "top_commenters": count_by_label(
+            user_comments,
+            lambda entry: activity_user_label(entry),
+        )[:5],
+        "recent_spotlights": [
+            {
+                "id": entry.get("id"),
+                "nominator": activity_user_label(entry, "nominator_username", "nominator_display_name", "nominator_user_id"),
+                "nominee": activity_user_label(entry, "nominee_username", "nominee_display_name", "nominee_user_id"),
+                "style": entry.get("style"),
+                "status": entry.get("status"),
+                "time": entry.get("time"),
+            }
+            for entry in recent_spotlights[-5:]
+        ],
+        "recent_pulses": [
+            {
+                "id": entry.get("id"),
+                "sender": activity_user_label(entry, "sender_username", "sender_display_name", "sender_user_id"),
+                "pulse_type": entry.get("pulse_type"),
+                "status": entry.get("status"),
+                "sent_at": entry.get("sent_at"),
+            }
+            for entry in recent_pulses[-5:]
+        ],
+        "recent_pulse_questions": [
+            {
+                "id": entry.get("id"),
+                "sender": activity_user_label(entry),
+                "pool": entry.get("pool"),
+                "category": entry.get("category"),
+                "status": entry.get("status"),
+                "submitted_at": entry.get("submitted_at"),
+            }
+            for entry in recent_question_suggestions[-5:]
+        ],
+    }
+
+
+@app.post("/api/verification-log")
+def verification_log(payload: VerificationLogPayload):
+    entry = append_verification_flow_log(payload)
+    return {"status": "ok", "received_at": entry["received_at"]}
+
+
+@app.get("/api/bot-sync/verification-logs")
+def bot_verification_logs(
+    limit: int = 80,
+    user_id: int | None = None,
+    username: str | None = None,
+    session_id: str | None = None,
+    x_bot_sync_secret: str | None = Header(default=None),
+):
+    verify_bot_sync_secret(x_bot_sync_secret)
+    return {
+        "status": "ok",
+        "logs": read_verification_flow_logs(
+            limit=limit,
+            user_id=user_id,
+            username=username,
+            session_id=session_id,
+        ),
+    }
+
+
 @app.get("/api/app-state")
 def get_app_state():
     current_round = state["current_round"]
@@ -2311,6 +2620,8 @@ def submit_wheel(entry: WheelEntry):
 
     if not entry_data.get("video_title"):
         entry_data["video_title"] = derive_video_title_from_url(submitted_url)
+    if entry_data.get("skin_id"):
+        entry_data["skin_id"] = str(entry_data.get("skin_id")).strip()
 
     new_entry = {
         "id": len(wheel_entries) + len(archived_wheel_entries) + 1,
@@ -2406,6 +2717,7 @@ def current_round_ready_entries():
         {
             "entry_id": entry["id"],
             "entrant_name": entry["data"].get("display_name", "Unknown"),
+            "skin_id": entry["data"].get("skin_id"),
         }
         for entry in ready_entries
     ]
@@ -3046,6 +3358,7 @@ def submit_stream_comment(comment: StreamComment):
             "username": comment.username,
             "display_name": display_name,
             "text": text,
+            "skin_id": (comment.skin_id or "").strip() or None,
             "time": now_iso(),
             "approved": True,
         }
@@ -3053,6 +3366,40 @@ def submit_stream_comment(comment: StreamComment):
     add_notification("comment", f"{display_name}: {text}", False)
     ws_broadcast_bundle()
     return {"status": "ok", "message": "Message sent."}
+
+
+@app.post("/api/admin/fox-message")
+def post_fox_message(payload: FoxMessagePayload):
+    text = payload.text.strip()
+    if not text:
+        return {"status": "error", "message": "Message cannot be empty."}
+    if len(text) > 220:
+        return {"status": "error", "message": "F.O.X messages must be 220 characters or fewer."}
+    approved_comments.append(
+        {
+            "comment_id": get_next_comment_id(),
+            "user_id": -9001,
+            "username": "F.O.X",
+            "display_name": "F.O.X",
+            "text": text,
+            "skin_id": "fox_green",
+            "time": now_iso(),
+            "approved": True,
+            "system": True,
+        }
+    )
+    add_notification("fox", f"F.O.X: {text}", True)
+    ws_broadcast_bundle()
+    return {"status": "ok", "message": "F.O.X message posted."}
+
+
+@app.post("/api/admin/fox-wheel-entry")
+def post_fox_wheel_entry(payload: FoxWheelEntryPayload | None = None):
+    entry = create_fox_manual_entry(
+        video_title=payload.video_title if payload else None,
+        note=payload.note if payload else None,
+    )
+    return {"status": "ok", "entry_id": entry["id"], "entry": entry}
 
 
 @app.get("/api/comments/pending")
