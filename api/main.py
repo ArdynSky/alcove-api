@@ -2,19 +2,32 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import re
-from urllib.parse import urlparse, unquote
+from urllib.parse import parse_qsl, urlparse, unquote
 from pathlib import Path
 from zoneinfo import ZoneInfo
 import datetime
+import hashlib
+import hmac
 import os
 import shutil
 import asyncio
 import json
 import random
 import sqlite3
-import hashlib
 from fastapi import Header, HTTPException, WebSocket, WebSocketDisconnect
 from .websocket_manager import manager
+from .cards_game import (
+    CreateRoomPayload,
+    JoinRoomPayload,
+    LoadoutPayload,
+    QueuePayload,
+    RoomActionPayload,
+    UserIdPayload,
+    cards_resolve_player,
+    get_cards_service,
+)
+from .cards_progress import fetch_pending_rewards, mark_rewards_claimed, profile_summary
+from .cards_ws_manager import cards_ws_manager
 
 app = FastAPI()
 
@@ -50,6 +63,7 @@ FOX_LOGS_DB_PATH = os.getenv(
     os.path.join(ALCOVE_ROOT, "Bot-Review", "ALCOVE_FOX", "fox_logs.db"),
 )
 BOT_SYNC_SECRET = os.getenv("BOT_SYNC_SECRET", "")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("ALCOVE_TELEGRAM_BOT_TOKEN", "")
 FEATURE_FLAGS_PATH = os.getenv(
     "FEATURE_FLAGS_PATH",
     os.path.join(os.getcwd(), "feature_flags.json"),
@@ -62,13 +76,13 @@ RUNTIME_STATE_PATH = os.getenv(
     "ALCOVE_RUNTIME_STATE_PATH",
     os.path.join(os.getcwd(), "alcove_runtime_state.json"),
 )
-STATE_DB_PATH = os.getenv(
-    "ALCOVE_STATE_DB_PATH",
-    os.path.join(os.getcwd(), "alcove_state.db"),
-)
 VERIFY_FLOW_LOG_PATH = os.getenv(
     "VERIFY_FLOW_LOG_PATH",
     os.path.join(os.getcwd(), "verification_flow_events.jsonl"),
+)
+STATE_DB_PATH = os.getenv(
+    "ALCOVE_STATE_DB_PATH",
+    os.path.join(os.getcwd(), "alcove_state.db"),
 )
 
 for path in [DOWNLOADS_DIR, READY_DIR, ARCHIVE_DIR, PLAYOUT_DIR]:
@@ -181,6 +195,7 @@ pulse_red_activations = []
 pulse_question_suggestions = []
 pulse_daily_summary_posts = []
 pulse_disabled_questions = []
+miniapp_verifications = []
 synced_alcove_users = []
 synced_alcove_analytics = {}
 last_bot_sync_at = None
@@ -202,7 +217,6 @@ notification_feed = []
 wheel_submission_limits = {}
 muted_users = set()
 current_winner = None
-current_video_intro = None
 PULSE_DEFAULT_HEAT_THRESHOLD = int(os.getenv("PULSE_HEAT_THRESHOLD", "50"))
 PULSE_TESTING_UNLIMITED = os.getenv("PULSE_TESTING_UNLIMITED", "0").strip().lower() in {"1", "true", "yes", "on"}
 UK_TZ = ZoneInfo("Europe/London")
@@ -234,6 +248,7 @@ def runtime_state_payload() -> dict:
         "pulse_question_suggestions": pulse_question_suggestions,
         "pulse_daily_summary_posts": pulse_daily_summary_posts,
         "pulse_disabled_questions": pulse_disabled_questions,
+        "miniapp_verifications": miniapp_verifications,
         "wheel_reaction_history": wheel_reaction_history,
         "wheel_review_history": wheel_review_history,
         "wheel_user_engagement": wheel_user_engagement,
@@ -260,7 +275,7 @@ def ensure_state_store() -> None:
 def apply_runtime_payload(payload: dict) -> None:
     global spotlight_entries, pulse_entries, pulse_receipts, pulse_red_activations
     global pulse_question_suggestions, pulse_daily_summary_posts, pulse_disabled_questions
-    global wheel_reaction_history, wheel_review_history, wheel_user_engagement
+    global miniapp_verifications, wheel_reaction_history, wheel_review_history, wheel_user_engagement
 
     spotlight_entries = payload.get("spotlight_entries") if isinstance(payload.get("spotlight_entries"), list) else []
     pulse_entries = payload.get("pulse_entries") if isinstance(payload.get("pulse_entries"), list) else []
@@ -269,6 +284,7 @@ def apply_runtime_payload(payload: dict) -> None:
     pulse_question_suggestions = payload.get("pulse_question_suggestions") if isinstance(payload.get("pulse_question_suggestions"), list) else []
     pulse_daily_summary_posts = payload.get("pulse_daily_summary_posts") if isinstance(payload.get("pulse_daily_summary_posts"), list) else []
     pulse_disabled_questions = payload.get("pulse_disabled_questions") if isinstance(payload.get("pulse_disabled_questions"), list) else []
+    miniapp_verifications = payload.get("miniapp_verifications") if isinstance(payload.get("miniapp_verifications"), list) else []
     wheel_reaction_history = payload.get("wheel_reaction_history") if isinstance(payload.get("wheel_reaction_history"), list) else []
     wheel_review_history = payload.get("wheel_review_history") if isinstance(payload.get("wheel_review_history"), list) else []
     wheel_user_engagement = payload.get("wheel_user_engagement") if isinstance(payload.get("wheel_user_engagement"), dict) else {}
@@ -358,6 +374,7 @@ DEFAULT_FEATURE_FLAGS = {
         "wellbeing": True,
         "pulse": False,
         "connect": False,
+        "cards": True,
     },
     "wellbeing": {
         "daily_checkin": True,
@@ -443,7 +460,6 @@ class WheelEntry(BaseModel):
     link: str
     note: str | None = None
     video_title: str | None = None
-    skin_id: str | None = None
     video_longer_than_5_minutes: bool | None = None
     clip_start_seconds: int | None = None
     clip_start_label: str | None = None
@@ -463,16 +479,6 @@ class StreamComment(BaseModel):
     username: str | None = None
     display_name: str
     text: str
-    skin_id: str | None = None
-
-
-class FoxMessagePayload(BaseModel):
-    text: str
-
-
-class FoxWheelEntryPayload(BaseModel):
-    video_title: str | None = None
-    note: str | None = None
 
 
 class WheelReaction(BaseModel):
@@ -563,6 +569,31 @@ class PulseQuestionSuggestion(BaseModel):
     question: str
 
 
+class MiniappVerificationPayload(BaseModel):
+    init_data: str | None = None
+    selected_pack: str | None = None
+    feedback: str | None = None
+
+
+class VerificationLogPayload(BaseModel):
+    session_id: str | None = None
+    event: str | None = None
+    level: str | None = "info"
+    user_id: int | None = None
+    username: str | None = None
+    display_name: str | None = None
+    step_index: int | None = None
+    step_title: str | None = None
+    step_pose: str | None = None
+    action: str | None = None
+    selected_pack: str | None = None
+    message: str | None = None
+    detail: dict | None = None
+    user_agent: str | None = None
+    url: str | None = None
+    client_time: str | None = None
+
+
 class PulseSettingsUpdate(BaseModel):
     heat_threshold: int
     reset_interval_hours: int | None = None
@@ -589,107 +620,12 @@ class FeatureFlagsUpdate(BaseModel):
     admin_secret: str | None = None
 
 
-class VerificationLogPayload(BaseModel):
-    session_id: str | None = None
-    event: str
-    level: str = "info"
-    user_id: int | None = None
-    username: str | None = None
-    display_name: str | None = None
-    step_index: int | None = None
-    step_title: str | None = None
-    step_pose: str | None = None
-    action: str | None = None
-    selected_pack: str | None = None
-    message: str | None = None
-    detail: dict | None = None
-    user_agent: str | None = None
-    url: str | None = None
-    client_time: str | None = None
-
-
 # ---------------------------------
 # Helpers
 # ---------------------------------
 
 def now_iso() -> str:
     return datetime.datetime.utcnow().isoformat()
-
-
-def clipped_text(value, limit=500):
-    if value is None:
-        return None
-    text = str(value)
-    return text if len(text) <= limit else text[:limit] + "..."
-
-
-def clipped_detail(value):
-    if not isinstance(value, dict):
-        return {}
-    detail = {}
-    for key, item in value.items():
-        clean_key = clipped_text(key, 80)
-        if clean_key:
-            detail[clean_key] = clipped_text(item, 700)
-    return detail
-
-
-def append_verification_flow_log(payload: VerificationLogPayload):
-    entry = {
-        "received_at": now_iso(),
-        "session_id": clipped_text(payload.session_id, 120),
-        "event": clipped_text(payload.event, 120) or "unknown",
-        "level": clipped_text(payload.level, 20) or "info",
-        "user_id": payload.user_id,
-        "username": clipped_text(payload.username, 80),
-        "display_name": clipped_text(payload.display_name, 120),
-        "step_index": payload.step_index,
-        "step_title": clipped_text(payload.step_title, 160),
-        "step_pose": clipped_text(payload.step_pose, 60),
-        "action": clipped_text(payload.action, 120),
-        "selected_pack": clipped_text(payload.selected_pack, 60),
-        "message": clipped_text(payload.message, 900),
-        "detail": clipped_detail(payload.detail),
-        "user_agent": clipped_text(payload.user_agent, 300),
-        "url": clipped_text(payload.url, 500),
-        "client_time": clipped_text(payload.client_time, 80),
-    }
-    directory = os.path.dirname(VERIFY_FLOW_LOG_PATH)
-    if directory:
-        os.makedirs(directory, exist_ok=True)
-    with open(VERIFY_FLOW_LOG_PATH, "a", encoding="utf-8") as handle:
-        handle.write(json.dumps(entry, ensure_ascii=False, sort_keys=True) + "\n")
-    if entry["level"] in {"warn", "error"} or "error" in str(entry["event"]).lower():
-        print(
-            f"[{entry['received_at']}] verification {entry['level']} "
-            f"user_id={entry['user_id']} username={entry['username']!r} "
-            f"step={entry['step_index']} event={entry['event']!r} message={entry['message']!r}",
-            flush=True,
-        )
-    return entry
-
-
-def read_verification_flow_logs(limit=80, user_id=None, username=None, session_id=None):
-    limit = max(1, min(int(limit or 80), 500))
-    if not os.path.exists(VERIFY_FLOW_LOG_PATH):
-        return []
-    username = (username or "").strip().lstrip("@").lower()
-    session_id = (session_id or "").strip()
-    rows = []
-    with open(VERIFY_FLOW_LOG_PATH, "r", encoding="utf-8") as handle:
-        for line in handle:
-            try:
-                entry = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if user_id is not None and int(entry.get("user_id") or 0) != int(user_id):
-                continue
-            if username and (entry.get("username") or "").strip().lstrip("@").lower() != username:
-                continue
-            if session_id and entry.get("session_id") != session_id:
-                continue
-            rows.append(entry)
-    return rows[-limit:]
 
 
 def iso_in_seconds(seconds: int) -> str:
@@ -906,6 +842,180 @@ def verify_bot_sync_secret(x_bot_sync_secret: str | None):
         raise HTTPException(status_code=503, detail="Bot sync secret is not configured")
     if x_bot_sync_secret != BOT_SYNC_SECRET:
         raise HTTPException(status_code=403, detail="Invalid bot sync secret")
+
+
+def verify_telegram_init_data(init_data: str) -> dict:
+    if not TELEGRAM_BOT_TOKEN:
+        raise HTTPException(status_code=503, detail="Telegram bot token is not configured")
+    if not init_data:
+        raise HTTPException(status_code=400, detail="Missing Telegram Mini App data")
+
+    params = dict(parse_qsl(init_data, keep_blank_values=True))
+    received_hash = params.pop("hash", None)
+    if not received_hash:
+        raise HTTPException(status_code=400, detail="Missing Telegram Mini App hash")
+
+    data_check_string = "\n".join(f"{key}={params[key]}" for key in sorted(params))
+    secret_key = hmac.new(b"WebAppData", TELEGRAM_BOT_TOKEN.encode("utf-8"), hashlib.sha256).digest()
+    expected_hash = hmac.new(secret_key, data_check_string.encode("utf-8"), hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(expected_hash, received_hash):
+        raise HTTPException(status_code=403, detail="Invalid Telegram Mini App signature")
+
+    try:
+        auth_date = int(params.get("auth_date") or 0)
+    except ValueError:
+        auth_date = 0
+    if auth_date and (datetime.datetime.utcnow().timestamp() - auth_date) > 86400:
+        raise HTTPException(status_code=403, detail="Telegram Mini App session expired")
+
+    try:
+        user = json.loads(params.get("user") or "{}")
+    except json.JSONDecodeError:
+        user = {}
+    if not isinstance(user, dict) or not user.get("id"):
+        raise HTTPException(status_code=400, detail="Telegram Mini App user was not provided")
+    return user
+
+
+def clipped_text(value, limit=500):
+    if value is None:
+        return None
+    text = str(value)
+    return text if len(text) <= limit else text[:limit] + "..."
+
+
+def clipped_detail(value):
+    if not isinstance(value, dict):
+        return {}
+    detail = {}
+    for key, item in value.items():
+        clean_key = clipped_text(key, 80)
+        if clean_key:
+            detail[clean_key] = clipped_text(item, 700)
+    return detail
+
+
+def append_verification_flow_log(payload: VerificationLogPayload):
+    entry = {
+        "received_at": now_iso(),
+        "session_id": clipped_text(payload.session_id, 120),
+        "event": clipped_text(payload.event, 120) or "unknown",
+        "level": clipped_text(payload.level, 20) or "info",
+        "user_id": payload.user_id,
+        "username": clipped_text(payload.username, 80),
+        "display_name": clipped_text(payload.display_name, 120),
+        "step_index": payload.step_index,
+        "step_title": clipped_text(payload.step_title, 160),
+        "step_pose": clipped_text(payload.step_pose, 60),
+        "action": clipped_text(payload.action, 120),
+        "selected_pack": clipped_text(payload.selected_pack, 60),
+        "message": clipped_text(payload.message, 900),
+        "detail": clipped_detail(payload.detail),
+        "user_agent": clipped_text(payload.user_agent, 300),
+        "url": clipped_text(payload.url, 500),
+        "client_time": clipped_text(payload.client_time, 80),
+    }
+    directory = os.path.dirname(VERIFY_FLOW_LOG_PATH)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    with open(VERIFY_FLOW_LOG_PATH, "a", encoding="utf-8") as handle:
+        handle.write(json.dumps(entry, ensure_ascii=False, sort_keys=True) + "\n")
+    if entry["level"] in {"warn", "error"} or "error" in str(entry["event"]).lower():
+        print(
+            f"[{entry['received_at']}] verification {entry['level']} "
+            f"user_id={entry['user_id']} username={entry['username']!r} "
+            f"step={entry['step_index']} event={entry['event']!r} message={entry['message']!r}",
+            flush=True,
+        )
+    return entry
+
+
+def read_verification_flow_logs(limit=80, user_id=None, username=None, session_id=None):
+    limit = max(1, min(int(limit or 80), 500))
+    if not os.path.exists(VERIFY_FLOW_LOG_PATH):
+        return []
+    username = (username or "").strip().lstrip("@").lower()
+    session_id = (session_id or "").strip()
+    rows = []
+    with open(VERIFY_FLOW_LOG_PATH, "r", encoding="utf-8") as handle:
+        for line in handle:
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if user_id is not None and int(entry.get("user_id") or 0) != int(user_id):
+                continue
+            if username and (entry.get("username") or "").strip().lstrip("@").lower() != username:
+                continue
+            if session_id and entry.get("session_id") != session_id:
+                continue
+            rows.append(entry)
+    return rows[-limit:]
+
+
+def miniapp_verification_payload(entry: dict) -> dict:
+    return {
+        "id": entry.get("id"),
+        "user_id": entry.get("user_id"),
+        "username": entry.get("username"),
+        "first_name": entry.get("first_name"),
+        "last_name": entry.get("last_name"),
+        "display_name": entry.get("display_name"),
+        "selected_pack": entry.get("selected_pack"),
+        "feedback": entry.get("feedback"),
+        "status": entry.get("status"),
+        "requested_at": entry.get("requested_at"),
+        "completed_at": entry.get("completed_at"),
+        "detail": entry.get("detail"),
+    }
+
+
+def upsert_miniapp_verification(user: dict) -> dict:
+    now = now_iso()
+    user_id = int(user.get("id"))
+    display_name = " ".join(
+        part for part in [user.get("first_name"), user.get("last_name")] if part
+    ).strip() or user.get("username") or str(user_id)
+
+    existing = next(
+        (
+            entry for entry in miniapp_verifications
+            if int(entry.get("user_id") or 0) == user_id and entry.get("status") in {"pending", "completed"}
+        ),
+        None,
+    )
+    if existing:
+        existing.update({
+            "username": user.get("username"),
+            "first_name": user.get("first_name"),
+            "last_name": user.get("last_name"),
+            "display_name": display_name,
+            "last_seen_at": now,
+        })
+        return existing
+
+    entry = {
+        "id": (max([int(item.get("id") or 0) for item in miniapp_verifications] or [0]) + 1),
+        "user_id": user_id,
+        "username": user.get("username"),
+        "first_name": user.get("first_name"),
+        "last_name": user.get("last_name"),
+        "display_name": display_name,
+        "status": "pending",
+        "requested_at": now,
+        "last_seen_at": now,
+        "completed_at": None,
+    }
+    miniapp_verifications.append(entry)
+    return entry
+
+
+def update_miniapp_verification_details(entry: dict, payload: MiniappVerificationPayload) -> dict:
+    if payload.selected_pack:
+        entry["selected_pack"] = clipped_text(payload.selected_pack, 60)
+    if payload.feedback:
+        entry["feedback"] = clipped_text(payload.feedback, 1200)
+    return entry
 
 
 def merged_feature_flags(saved: dict | None = None) -> dict:
@@ -1745,52 +1855,6 @@ def get_room_users():
     return sorted(users.values(), key=lambda u: (u["display_name"] or "").lower())
 
 
-def create_fox_manual_entry(video_title: str | None = None, note: str | None = None):
-    now = now_iso()
-    entry_data = {
-        "telegram_id": -9001,
-        "username": "F.O.X",
-        "display_name": "F.O.X",
-        "link": "fox://manual-entry",
-        "note": note or "F.O.X has entered the wheel.",
-        "video_title": video_title or "F.O.X wants in on the wheel",
-        "skin_id": "fox_green",
-        "video_longer_than_5_minutes": False,
-        "clip_start_seconds": None,
-        "clip_start_label": None,
-    }
-    new_entry = {
-        "id": len(wheel_entries) + len(archived_wheel_entries) + 1,
-        "round_id": state["current_round"],
-        "time": now,
-        "played": False,
-        "played_at": None,
-        "data": entry_data,
-        "submitted_url": entry_data["link"],
-        "source_domain": "fox",
-        "direct_media_url": None,
-        "download_status": "manual_ready",
-        "download_error": None,
-        "download_method": "fox-manual",
-        "local_filename": "fox-manual",
-        "local_path": "",
-        "download_started_at": None,
-        "download_completed_at": now,
-        "stream_candidate": None,
-        "download_candidate": None,
-        "processed_at": None,
-        "clip_start_seconds": None,
-        "clip_end_seconds": None,
-        "approval_status": "approved",
-        "approval_time": now,
-        "rejection_time": None,
-    }
-    wheel_entries.append(new_entry)
-    add_notification("fox", "F.O.X joined the wheel", True)
-    ws_broadcast_bundle()
-    return new_entry
-
-
 def wheel_user_key(user_id=None, username=None, display_name=None) -> str | None:
     if user_id is not None:
         return f"user:{int(user_id)}"
@@ -2139,6 +2203,98 @@ async def websocket_endpoint(websocket: WebSocket):
     except Exception:
         manager.disconnect(websocket)
 
+
+@app.websocket("/ws/cards")
+async def cards_websocket_endpoint(websocket: WebSocket):
+    user_id: int | None = None
+    room_code: str | None = None
+    try:
+        await websocket.accept()
+        auth_raw = await websocket.receive_text()
+        auth_payload = json.loads(auth_raw)
+        init_data = auth_payload.get("init_data") or ""
+        claimed_user_id = auth_payload.get("user_id")
+        claimed_username = auth_payload.get("username")
+        room_code = auth_payload.get("room_code")
+
+        if init_data:
+            try:
+                tg_user = verify_telegram_init_data(init_data)
+                user_id = int(tg_user.get("id"))
+                claimed_username = tg_user.get("username") or claimed_username
+            except HTTPException:
+                user_id = None
+
+        if user_id is None and claimed_user_id:
+            user_id = int(claimed_user_id)
+
+        if user_id is None:
+            await websocket.close(code=4401)
+            return
+
+        player, _is_verified = cards_resolve_player(user_id, claimed_username, find_verified_alcove_user)
+        if not player:
+            await websocket.send_text(json.dumps({
+                "event": "error",
+                "data": {"message": "Could not identify your Telegram account for Alcove Cards."},
+            }))
+            await websocket.close(code=4403)
+            return
+
+        if not room_code:
+            await websocket.send_text(json.dumps({
+                "event": "error",
+                "data": {"message": "room_code is required."},
+            }))
+            await websocket.close(code=4400)
+            return
+
+        cards_service = get_cards_service(find_verified_alcove_user)
+        cards_service.set_event_loop(asyncio.get_running_loop())
+        await cards_ws_manager.connect(room_code, user_id, websocket)
+        cards_service.attach_user(user_id, True)
+        resync = cards_service.resync_room(room_code, user_id)
+        if resync:
+            await websocket.send_text(json.dumps({"event": "resync", "data": resync}))
+
+        while True:
+            raw = await websocket.receive_text()
+            message = json.loads(raw)
+            action_payload = RoomActionPayload(
+                user_id=user_id,
+                action=message.get("action") or "",
+                payload=message.get("payload") or {},
+            )
+            result = cards_service.handle_action(room_code, action_payload)
+            await websocket.send_text(json.dumps({"event": "action_result", "data": result}))
+    except WebSocketDisconnect:
+        pass
+    except Exception:
+        pass
+    finally:
+        if user_id is not None:
+            await cards_ws_manager.disconnect(user_id)
+            if user_id:
+                get_cards_service(find_verified_alcove_user).attach_user(user_id, False)
+
+
+@app.on_event("startup")
+async def cards_startup_tasks():
+    loop = asyncio.get_running_loop()
+    service = get_cards_service(find_verified_alcove_user)
+    service.set_event_loop(loop)
+
+    async def cleanup_loop():
+        while True:
+            await asyncio.sleep(120)
+            try:
+                service.cleanup_stale()
+            except Exception:
+                pass
+
+    asyncio.create_task(cleanup_loop())
+
+
 @app.get("/")
 def root():
     return {"status": "Alcove API running"}
@@ -2170,6 +2326,41 @@ def alcove_analytics():
     }
 
 
+@app.post("/api/verification/miniapp")
+def submit_miniapp_verification(payload: MiniappVerificationPayload):
+    if not payload.init_data:
+        raise HTTPException(status_code=400, detail="Missing Telegram Mini App data")
+    user = verify_telegram_init_data(payload.init_data)
+    entry = upsert_miniapp_verification(user)
+    update_miniapp_verification_details(entry, payload)
+    save_runtime_state()
+    return {"status": "ok", "verification": miniapp_verification_payload(entry)}
+
+
+@app.post("/api/verification/miniapp/status")
+def miniapp_verification_status(payload: MiniappVerificationPayload):
+    if not payload.init_data:
+        raise HTTPException(status_code=400, detail="Missing Telegram Mini App data")
+    user = verify_telegram_init_data(payload.init_data)
+    user_id = int(user.get("id") or 0)
+    entry = next(
+        (
+            item for item in reversed(miniapp_verifications)
+            if int(item.get("user_id") or 0) == user_id
+        ),
+        None,
+    )
+    if not entry:
+        raise HTTPException(status_code=404, detail="Mini App verification not found")
+    return {"status": "ok", "verification": miniapp_verification_payload(entry)}
+
+
+@app.post("/api/verification-log")
+def verification_log(payload: VerificationLogPayload):
+    entry = append_verification_flow_log(payload)
+    return {"status": "ok", "received_at": entry["received_at"]}
+
+
 @app.post("/api/bot-sync/alcove")
 def bot_sync_alcove(payload: BotSyncPayload, x_bot_sync_secret: str | None = Header(default=None)):
     global synced_alcove_users, synced_alcove_analytics, last_bot_sync_at
@@ -2187,137 +2378,15 @@ def bot_sync_alcove(payload: BotSyncPayload, x_bot_sync_secret: str | None = Hea
     }
 
 
-def after_iso_window(value, since: datetime.datetime) -> bool:
-    if not value:
-        return False
-    try:
-        return datetime.datetime.fromisoformat(str(value)) >= since
-    except (TypeError, ValueError):
-        return False
-
-
-def activity_user_label(entry: dict, username_key="username", display_key="display_name", user_id_key="user_id") -> str:
-    username = (entry.get(username_key) or "").strip()
-    if username:
-        return f"@{username}"
-    display_name = (entry.get(display_key) or "").strip()
-    if display_name:
-        return display_name
-    user_id = entry.get(user_id_key)
-    return str(user_id or "Unknown")
-
-
-def count_by_label(entries, label_func):
-    counts = {}
-    for entry in entries:
-        label = label_func(entry)
-        counts[label] = counts.get(label, 0) + 1
-    return [
-        {"display_name": label, "count": count}
-        for label, count in sorted(counts.items(), key=lambda item: item[1], reverse=True)
-    ]
-
-
-@app.get("/api/bot-sync/activity-summary")
-def bot_activity_summary(hours: int = 3, x_bot_sync_secret: str | None = Header(default=None)):
+@app.get("/api/bot-sync/verification/pending")
+def bot_pending_miniapp_verifications(x_bot_sync_secret: str | None = Header(default=None)):
     verify_bot_sync_secret(x_bot_sync_secret)
-
-    hours = max(1, min(int(hours or 3), 24))
-    now = datetime.datetime.utcnow()
-    since = now - datetime.timedelta(hours=hours)
-
-    recent_comments = [
-        comment for comment in approved_comments
-        if after_iso_window(comment.get("time"), since)
+    entries = [
+        miniapp_verification_payload(entry)
+        for entry in miniapp_verifications
+        if entry.get("status") == "pending"
     ]
-    user_comments = [comment for comment in recent_comments if not comment.get("system")]
-    fox_comments = [comment for comment in recent_comments if comment.get("system")]
-    recent_spotlights = [
-        entry for entry in spotlight_entries
-        if after_iso_window(entry.get("time"), since)
-    ]
-    reviewed_spotlights = [
-        entry for entry in spotlight_entries
-        if after_iso_window(entry.get("reviewed_at"), since)
-    ]
-    recent_pulses = [
-        entry for entry in pulse_entries
-        if after_iso_window(entry.get("sent_at"), since)
-    ]
-    completed_pulses = [
-        entry for entry in pulse_entries
-        if after_iso_window(entry.get("responded_at"), since)
-    ]
-    recent_question_suggestions = [
-        entry for entry in pulse_question_suggestions
-        if after_iso_window(entry.get("submitted_at"), since)
-    ]
-    red_activations = [
-        entry for entry in pulse_red_activations
-        if after_iso_window(entry.get("activated_at"), since)
-    ]
-
-    return {
-        "status": "ok",
-        "window": {
-            "hours": hours,
-            "since": since.isoformat(),
-            "to": now.isoformat(),
-        },
-        "counts": {
-            "stream_comments": len(user_comments),
-            "fox_messages": len(fox_comments),
-            "spotlights_submitted": len(recent_spotlights),
-            "spotlights_approved": len([entry for entry in reviewed_spotlights if entry.get("status") == "approved"]),
-            "spotlights_rejected": len([entry for entry in reviewed_spotlights if entry.get("status") == "rejected"]),
-            "pulses_sent": len(recent_pulses),
-            "pulses_completed": len(completed_pulses),
-            "red_pulse_activations": len(red_activations),
-            "pulse_questions_submitted": len(recent_question_suggestions),
-        },
-        "top_commenters": count_by_label(
-            user_comments,
-            lambda entry: activity_user_label(entry),
-        )[:5],
-        "recent_spotlights": [
-            {
-                "id": entry.get("id"),
-                "nominator": activity_user_label(entry, "nominator_username", "nominator_display_name", "nominator_user_id"),
-                "nominee": activity_user_label(entry, "nominee_username", "nominee_display_name", "nominee_user_id"),
-                "style": entry.get("style"),
-                "status": entry.get("status"),
-                "time": entry.get("time"),
-            }
-            for entry in recent_spotlights[-5:]
-        ],
-        "recent_pulses": [
-            {
-                "id": entry.get("id"),
-                "sender": activity_user_label(entry, "sender_username", "sender_display_name", "sender_user_id"),
-                "pulse_type": entry.get("pulse_type"),
-                "status": entry.get("status"),
-                "sent_at": entry.get("sent_at"),
-            }
-            for entry in recent_pulses[-5:]
-        ],
-        "recent_pulse_questions": [
-            {
-                "id": entry.get("id"),
-                "sender": activity_user_label(entry),
-                "pool": entry.get("pool"),
-                "category": entry.get("category"),
-                "status": entry.get("status"),
-                "submitted_at": entry.get("submitted_at"),
-            }
-            for entry in recent_question_suggestions[-5:]
-        ],
-    }
-
-
-@app.post("/api/verification-log")
-def verification_log(payload: VerificationLogPayload):
-    entry = append_verification_flow_log(payload)
-    return {"status": "ok", "received_at": entry["received_at"]}
+    return {"status": "ok", "entries": entries}
 
 
 @app.get("/api/bot-sync/verification-logs")
@@ -2338,6 +2407,31 @@ def bot_verification_logs(
             session_id=session_id,
         ),
     }
+
+
+@app.post("/api/bot-sync/verification/{verification_id}")
+def bot_update_miniapp_verification(
+    verification_id: int,
+    payload: dict | None = None,
+    x_bot_sync_secret: str | None = Header(default=None),
+):
+    verify_bot_sync_secret(x_bot_sync_secret)
+    entry = next(
+        (item for item in miniapp_verifications if int(item.get("id") or 0) == int(verification_id)),
+        None,
+    )
+    if not entry:
+        return {"status": "error", "message": "Mini App verification not found."}
+    payload = payload or {}
+    status = payload.get("status")
+    if status not in {"pending", "completed", "failed"}:
+        return {"status": "error", "message": "Invalid Mini App verification status."}
+    entry["status"] = status
+    entry["completed_at"] = now_iso() if status in {"completed", "failed"} else None
+    if payload.get("detail"):
+        entry["detail"] = str(payload.get("detail"))[:500]
+    save_runtime_state()
+    return {"status": "ok", "verification": miniapp_verification_payload(entry)}
 
 
 @app.get("/api/app-state")
@@ -2441,7 +2535,7 @@ def lock_round():
 
 @app.post("/api/round/start-spin")
 def start_spin():
-    global current_winner, current_now_playing, current_video_intro
+    global current_winner, current_now_playing
     current_round = state["current_round"]
     pool = get_next_spin_pool(current_round)
 
@@ -2450,7 +2544,6 @@ def start_spin():
 
     state["round_status"] = "spinning"
     state["winner_intro_loaded"] = False
-    current_video_intro = None
     current_now_playing = None
     chosen = random.choice(pool)
     current_winner = {
@@ -2620,8 +2713,6 @@ def submit_wheel(entry: WheelEntry):
 
     if not entry_data.get("video_title"):
         entry_data["video_title"] = derive_video_title_from_url(submitted_url)
-    if entry_data.get("skin_id"):
-        entry_data["skin_id"] = str(entry_data.get("skin_id")).strip()
 
     new_entry = {
         "id": len(wheel_entries) + len(archived_wheel_entries) + 1,
@@ -2717,7 +2808,6 @@ def current_round_ready_entries():
         {
             "entry_id": entry["id"],
             "entrant_name": entry["data"].get("display_name", "Unknown"),
-            "skin_id": entry["data"].get("skin_id"),
         }
         for entry in ready_entries
     ]
@@ -3062,7 +3152,7 @@ def retry_download(entry_id: int):
 
 @app.post("/api/spin-result")
 def set_spin_result(payload: dict):
-    global current_winner, current_video_intro
+    global current_winner
     entry_id = payload.get("entry_id")
     if entry_id is None:
         return {"status": "error", "message": "entry_id required"}
@@ -3075,7 +3165,6 @@ def set_spin_result(payload: dict):
         return {"status": "error", "message": "winner is not download-ready"}
 
     state["winner_intro_loaded"] = False
-    current_video_intro = None
     current_winner = {
         "entry_id": entry["id"],
         "entrant_name": entry["data"].get("display_name", "Unknown"),
@@ -3094,9 +3183,8 @@ def set_spin_result(payload: dict):
 
 @app.post("/api/winner/clear")
 def clear_winner():
-    global current_winner, current_video_intro
+    global current_winner
     current_winner = None
-    current_video_intro = None
     state["winner_intro_loaded"] = False
     return {"status": "ok"}
 
@@ -3104,48 +3192,6 @@ def clear_winner():
 @app.get("/api/current-winner")
 def get_current_winner():
     return current_winner
-
-
-def build_video_intro_state(payload: dict) -> dict:
-    prepared_at = int(datetime.datetime.now(datetime.timezone.utc).timestamp() * 1000)
-    entry_id = int(payload.get("entry_id") or 0) or None
-    video_title = str(payload.get("video_title") or payload.get("title") or "").strip() or "Untitled video"
-    display_name = str(payload.get("display_name") or payload.get("entrant_name") or "").strip() or "Unknown"
-    username = str(payload.get("username") or "").strip().lstrip("@")
-    intro_key = hashlib.sha1(f"{entry_id}-{video_title}-{display_name}-{username}-{prepared_at}".encode("utf-8")).hexdigest()[:12]
-    return {
-        "entry_id": entry_id,
-        "video_title": video_title,
-        "display_name": display_name,
-        "username": username,
-        "intro_key": intro_key,
-        "prepared_at": prepared_at,
-    }
-
-
-@app.get("/api/video-intro/current")
-def get_video_intro_current():
-    return {
-        "status": "ok",
-        "active": bool(current_video_intro),
-        "intro": current_video_intro,
-    }
-
-
-@app.post("/api/video-intro/current")
-def set_video_intro_current(payload: dict):
-    global current_video_intro
-    if payload.get("clear"):
-        current_video_intro = None
-        state["winner_intro_loaded"] = False
-        ws_broadcast_bundle()
-        return {"status": "ok", "active": False, "intro": None}
-    try:
-        current_video_intro = build_video_intro_state(payload)
-    except Exception as exc:
-        return {"status": "error", "message": str(exc)}
-    ws_broadcast_bundle()
-    return {"status": "ok", "active": True, "intro": current_video_intro}
 
 
 @app.post("/api/winner/intro-loaded/{entry_id}")
@@ -3358,7 +3404,6 @@ def submit_stream_comment(comment: StreamComment):
             "username": comment.username,
             "display_name": display_name,
             "text": text,
-            "skin_id": (comment.skin_id or "").strip() or None,
             "time": now_iso(),
             "approved": True,
         }
@@ -3366,40 +3411,6 @@ def submit_stream_comment(comment: StreamComment):
     add_notification("comment", f"{display_name}: {text}", False)
     ws_broadcast_bundle()
     return {"status": "ok", "message": "Message sent."}
-
-
-@app.post("/api/admin/fox-message")
-def post_fox_message(payload: FoxMessagePayload):
-    text = payload.text.strip()
-    if not text:
-        return {"status": "error", "message": "Message cannot be empty."}
-    if len(text) > 220:
-        return {"status": "error", "message": "F.O.X messages must be 220 characters or fewer."}
-    approved_comments.append(
-        {
-            "comment_id": get_next_comment_id(),
-            "user_id": -9001,
-            "username": "F.O.X",
-            "display_name": "F.O.X",
-            "text": text,
-            "skin_id": "fox_green",
-            "time": now_iso(),
-            "approved": True,
-            "system": True,
-        }
-    )
-    add_notification("fox", f"F.O.X: {text}", True)
-    ws_broadcast_bundle()
-    return {"status": "ok", "message": "F.O.X message posted."}
-
-
-@app.post("/api/admin/fox-wheel-entry")
-def post_fox_wheel_entry(payload: FoxWheelEntryPayload | None = None):
-    entry = create_fox_manual_entry(
-        video_title=payload.video_title if payload else None,
-        note=payload.note if payload else None,
-    )
-    return {"status": "ok", "entry_id": entry["id"], "entry": entry}
 
 
 @app.get("/api/comments/pending")
@@ -4343,3 +4354,83 @@ def submit_story(payload: dict):
 @app.get("/api/story-entries")
 def list_story():
     return story_entries
+
+
+# ---------------------------------
+# Alcove Cards multiplayer
+# ---------------------------------
+
+@app.get("/api/cards/status")
+def cards_status(user_id: int | None = None, username: str | None = None):
+    return get_cards_service(find_verified_alcove_user).status(user_id, username)
+
+
+@app.get("/api/cards/rooms/{code}/sync")
+def cards_sync_room(code: str, user_id: int | None = None, username: str | None = None):
+    return get_cards_service(find_verified_alcove_user).sync_room(code, user_id, username)
+
+
+@app.get("/api/cards/profile")
+def cards_profile(user_id: int | None = None, username: str | None = None):
+    user = find_verified_alcove_user(user_id, username)
+    if not user:
+        return {"status": "error", "message": "Verified Alcove membership required."}
+    return {"status": "ok", "profile": profile_summary(int(user["user_id"]))}
+
+
+@app.get("/api/cards/challenges")
+def cards_challenges(user_id: int | None = None, username: str | None = None):
+    user = find_verified_alcove_user(user_id, username)
+    if not user:
+        return {"status": "error", "message": "Verified Alcove membership required."}
+    profile = profile_summary(int(user["user_id"]))
+    return {"status": "ok", "challenges": profile.get("challenges") or {}}
+
+
+@app.post("/api/cards/rooms")
+def cards_create_room(payload: CreateRoomPayload):
+    return get_cards_service(find_verified_alcove_user).create_room(payload)
+
+
+@app.post("/api/cards/rooms/{code}/join")
+def cards_join_room(code: str, payload: JoinRoomPayload):
+    return get_cards_service(find_verified_alcove_user).join_room(code, payload)
+
+
+@app.delete("/api/cards/rooms/{code}")
+def cards_leave_room(code: str, user_id: int):
+    return get_cards_service(find_verified_alcove_user).leave_room(user_id)
+
+
+@app.post("/api/cards/queue/join")
+def cards_join_queue(payload: QueuePayload):
+    return get_cards_service(find_verified_alcove_user).join_queue(payload)
+
+
+@app.post("/api/cards/queue/leave")
+def cards_leave_queue(payload: UserIdPayload):
+    return get_cards_service(find_verified_alcove_user).leave_queue(payload.user_id)
+
+
+@app.post("/api/cards/loadout")
+def cards_save_loadout(payload: LoadoutPayload):
+    return get_cards_service(find_verified_alcove_user).set_loadout(payload)
+
+
+@app.post("/api/cards/rooms/{code}/action")
+def cards_room_action(code: str, payload: RoomActionPayload):
+    return get_cards_service(find_verified_alcove_user).handle_action(code, payload)
+
+
+@app.get("/api/bot-sync/cards/rewards/pending")
+def bot_cards_pending_rewards(x_bot_sync_secret: str | None = Header(default=None)):
+    verify_bot_sync_secret(x_bot_sync_secret)
+    return {"status": "ok", "rewards": fetch_pending_rewards()}
+
+
+@app.post("/api/bot-sync/cards/rewards/claim")
+def bot_cards_claim_rewards(payload: dict | None = None, x_bot_sync_secret: str | None = Header(default=None)):
+    verify_bot_sync_secret(x_bot_sync_secret)
+    reward_ids = (payload or {}).get("reward_ids") or []
+    mark_rewards_claimed([int(item) for item in reward_ids])
+    return {"status": "ok", "claimed": len(reward_ids)}
