@@ -198,6 +198,7 @@ spotlight_entries = []
 pulse_entries = []
 pulse_receipts = []
 pulse_red_activations = []
+pulse_red_unlock_notifications = []
 pulse_question_suggestions = []
 pulse_daily_summary_posts = []
 pulse_disabled_questions = []
@@ -237,6 +238,10 @@ PULSE_RETENTION_DAYS = max(
     int(os.getenv("PULSE_RETENTION_DAYS", "14" if LEAN_MODE else "30") or (14 if LEAN_MODE else 30)),
 )
 CARDS_API_ENABLED = os.getenv("CARDS_API_ENABLED", "0").strip().lower() in {"1", "true", "yes", "on"}
+PULSE_RED_UNLOCK_NOTIFY_USERNAMES_RAW = os.getenv(
+    "PULSE_RED_UNLOCK_NOTIFY_USERNAMES",
+    "Ardyn_Sky,The_Alcove",
+).strip()
 UK_TZ = ZoneInfo("Europe/London")
 _last_saved_runtime_fingerprint: str | None = None
 _last_pulse_prune_day: str | None = None
@@ -269,6 +274,7 @@ def runtime_state_payload() -> dict:
         "pulse_entries": pulse_entries,
         "pulse_receipts": pulse_receipts,
         "pulse_red_activations": pulse_red_activations,
+        "pulse_red_unlock_notifications": pulse_red_unlock_notifications,
         "pulse_question_suggestions": pulse_question_suggestions,
         "pulse_daily_summary_posts": pulse_daily_summary_posts,
         "pulse_disabled_questions": pulse_disabled_questions,
@@ -303,7 +309,7 @@ def ensure_state_store() -> None:
 
 
 def apply_runtime_payload(payload: dict) -> None:
-    global spotlight_entries, pulse_entries, pulse_receipts, pulse_red_activations
+    global spotlight_entries, pulse_entries, pulse_receipts, pulse_red_activations, pulse_red_unlock_notifications
     global pulse_question_suggestions, pulse_daily_summary_posts, pulse_disabled_questions
     global miniapp_verifications, wheel_reaction_history, wheel_review_history, wheel_user_engagement
     global synced_alcove_users, synced_alcove_analytics, last_bot_sync_at
@@ -312,6 +318,11 @@ def apply_runtime_payload(payload: dict) -> None:
     pulse_entries = payload.get("pulse_entries") if isinstance(payload.get("pulse_entries"), list) else []
     pulse_receipts = payload.get("pulse_receipts") if isinstance(payload.get("pulse_receipts"), list) else []
     pulse_red_activations = payload.get("pulse_red_activations") if isinstance(payload.get("pulse_red_activations"), list) else []
+    pulse_red_unlock_notifications = (
+        payload.get("pulse_red_unlock_notifications")
+        if isinstance(payload.get("pulse_red_unlock_notifications"), list)
+        else []
+    )
     pulse_question_suggestions = payload.get("pulse_question_suggestions") if isinstance(payload.get("pulse_question_suggestions"), list) else []
     pulse_daily_summary_posts = payload.get("pulse_daily_summary_posts") if isinstance(payload.get("pulse_daily_summary_posts"), list) else []
     pulse_disabled_questions = payload.get("pulse_disabled_questions") if isinstance(payload.get("pulse_disabled_questions"), list) else []
@@ -1862,6 +1873,68 @@ def pulse_red_unlocked_cycles(day_key: str | None = None) -> int:
     return pulse_sent_today_count(day_key) // threshold
 
 
+def pulse_user_red_answers_today(user_id=None, username=None, day_key: str | None = None) -> int:
+    sent = pulse_user_sent_entries(user_id, username, day_key)
+    return len([entry for entry in sent if (entry.get("pulse_type") or "green") == "red"])
+
+
+def pulse_red_unlock_notify_usernames() -> set[str] | None:
+    """Return allowlist of usernames, or None to notify everyone."""
+    raw = PULSE_RED_UNLOCK_NOTIFY_USERNAMES_RAW
+    if not raw or raw == "*":
+        return None
+    return {
+        part.strip().lower().lstrip("@")
+        for part in raw.split(",")
+        if part.strip()
+    }
+
+
+def pulse_red_unlock_notify_allowed(user: dict) -> bool:
+    allowlist = pulse_red_unlock_notify_usernames()
+    if allowlist is None:
+        return True
+    username = (user.get("username") or "").strip().lower().lstrip("@")
+    return username in allowlist
+
+
+def queue_red_pulse_unlock_notifications(day_key: str, cycle_number: int):
+    users = get_verified_alcove_users()
+    if not users:
+        return
+    for user in users:
+        if not pulse_red_unlock_notify_allowed(user):
+            continue
+        user_id = user.get("user_id")
+        if not user_id:
+            continue
+        dedupe_key = f"{day_key}:{cycle_number}:{int(user_id)}"
+        if any(
+            item.get("dedupe_key") == dedupe_key
+            for item in pulse_red_unlock_notifications
+        ):
+            continue
+        pulse_red_unlock_notifications.append({
+            "notification_id": f"red-unlock-{len(pulse_red_unlock_notifications) + 1}",
+            "dedupe_key": dedupe_key,
+            "kind": "red_pulse_active",
+            "day_key": day_key,
+            "cycle_number": cycle_number,
+            "recipient_user_id": int(user_id),
+            "recipient_username": user.get("username"),
+            "recipient_display_name": user.get("display_name"),
+            "created_at": now_iso(),
+            "notified_at": None,
+        })
+
+
+def maybe_queue_red_pulse_unlock_notifications(day_key: str, previous_cycles: int, new_cycles: int):
+    if new_cycles <= previous_cycles:
+        return
+    for cycle_number in range(previous_cycles + 1, new_cycles + 1):
+        queue_red_pulse_unlock_notifications(day_key, cycle_number)
+
+
 def pulse_user_sent_entries(user_id, username=None, day_key: str | None = None):
     day = day_key or pulse_day_key()
     uname = (username or "").lower().lstrip("@")
@@ -1944,22 +2017,24 @@ def pulse_slot_state(user_id=None, username=None, now: datetime.datetime | None 
     day = pulse_day_key(current)
     sent = pulse_user_sent_entries(user_id, username, day)
     green_used = len([entry for entry in sent if entry.get("pulse_type") == "green"])
-    red_used = len([entry for entry in sent if entry.get("pulse_type") == "red"])
+    red_used = pulse_user_red_answers_today(user_id, username, day)
     green_total = pulse_base_green_slots(current)
-    red_unlocked = pulse_heat_unlocked(day)
     sent_today = pulse_sent_today_count(day)
     threshold = pulse_heat_threshold()
     testing = pulse_testing_unlimited()
     green_interval_hours = pulse_green_unlock_interval_hours()
     unlocked_cycles = pulse_red_unlocked_cycles(day)
-    activated_cycles = len(pulse_red_activations_for_user(user_id, username, day))
-    red_ready = unlocked_cycles > activated_cycles
-    red_activated = activated_cycles > 0
-    red_available = max(activated_cycles - red_used, 0)
-    cycle_completed = max(sent_today - (activated_cycles * threshold), 0)
-    if red_ready:
+    community_red_unlocked = unlocked_cycles > 0
+    red_available = max(0, unlocked_cycles - red_used)
+    red_ready = red_available > 0
+    red_unlocked = community_red_unlocked
+    red_activated = community_red_unlocked and red_available > 0
+    remainder = sent_today % threshold if threshold else 0
+    if community_red_unlocked:
         cycle_completed = threshold
-    remaining_today = 0 if red_ready else max(threshold - min(cycle_completed, threshold), 0)
+    else:
+        cycle_completed = min(sent_today, threshold)
+    remaining_today = 0 if community_red_unlocked else max(threshold - min(cycle_completed, threshold), 0)
     green_available = 99 if testing else max(green_total - green_used, 0)
     return {
         "day_key": day,
@@ -1974,7 +2049,8 @@ def pulse_slot_state(user_id=None, username=None, now: datetime.datetime | None 
         "red_used": red_used,
         "red_available": red_available,
         "red_unlocked_cycles": unlocked_cycles,
-        "red_activated_cycles": activated_cycles,
+        "red_activated_cycles": red_used,
+        "community_red_unlocked": community_red_unlocked,
         "sent_today": sent_today,
         "heat_threshold": threshold,
         "reset_interval_hours": green_interval_hours,
@@ -4616,20 +4692,23 @@ def activate_pulse_red(payload: PulseReceiptAck):
         return {"status": "error", "message": "Could not identify this Pulse user."}
 
     slots = pulse_slot_state(identity.get("user_id"), identity.get("username"))
-    if not slots["red_ready"]:
+    if not slots["red_unlocked"]:
         return {
             "status": "error",
             "message": "Red Pulse has not been unlocked yet.",
             "slots": slots,
         }
+    if slots["red_available"] <= 0:
+        return {
+            "status": "error",
+            "message": "You have already answered today's Red Pulse.",
+            "slots": slots,
+        }
 
-    activation = activate_red_pulse_for_user(identity, slots["day_key"])
-    updated_slots = pulse_slot_state(identity.get("user_id"), identity.get("username"))
     return {
         "status": "ok",
-        "message": "Your Red Pulse is now active.",
-        "activation": activation,
-        "slots": updated_slots,
+        "message": "Red Pulse is active for you. Submit your answer when you're ready.",
+        "slots": slots,
     }
 
 
@@ -4671,11 +4750,16 @@ def submit_pulse(entry: PulseEntry):
     if pulse_type == "green" and slots["green_available"] <= 0:
         print(f"[{now_iso()}] pulse submit rejected: no green slot available", flush=True)
         return {"status": "error", "message": "You do not have a green Pulse available right now."}
+    if pulse_type == "red" and not slots["red_unlocked"]:
+        print(f"[{now_iso()}] pulse submit rejected: red pulse not unlocked", flush=True)
+        return {"status": "error", "message": "Red Pulse has not been unlocked by the community yet."}
     if pulse_type == "red" and slots["red_available"] <= 0:
-        print(f"[{now_iso()}] pulse submit rejected: no red slot available", flush=True)
-        return {"status": "error", "message": "A red Pulse is not available right now."}
+        print(f"[{now_iso()}] pulse submit rejected: red pulse already used", flush=True)
+        return {"status": "error", "message": "You have already answered today's Red Pulse."}
 
     responded_at = now_iso()
+    day = slots["day_key"]
+    previous_cycles = pulse_red_unlocked_cycles(day)
     data = {
         "id": len(pulse_entries) + 1,
         "day_key": pulse_day_key(),
@@ -4704,11 +4788,15 @@ def submit_pulse(entry: PulseEntry):
         "responder_user_id": identity.get("user_id"),
         "responder_username": identity.get("username"),
         "responder_display_name": identity.get("display_name") or identity.get("label"),
-        "admin_posted_at": None,
+        "admin_posted_at": responded_at if pulse_type == "red" else None,
     }
     pulse_entries.append(data)
     receipt = None
-    if owner and not pulse_identities_match(identity, owner):
+    if (
+        pulse_type != "red"
+        and owner
+        and not pulse_identities_match(identity, owner)
+    ):
         receipt = {
             "id": len(pulse_receipts) + 1,
             "pulse_id": data["id"],
@@ -4721,16 +4809,19 @@ def submit_pulse(entry: PulseEntry):
             "notify_after": pulse_notification_due_at(),
         }
         pulse_receipts.append(receipt)
+    new_cycles = pulse_red_unlocked_cycles(day)
+    maybe_queue_red_pulse_unlock_notifications(day, previous_cycles, new_cycles)
     save_runtime_state()
-    telegram_admin_notify(
-        "\n".join([
-            "<b>New Pulse answer</b>",
-            f"Question: <code>{escape(question)}</code>",
-            f"Type: <b>{escape(pulse_type.title())}</b>",
-            f"Category: <b>{escape(data.get('category') or 'General')}</b>",
-        ]),
-        PULSE_REPORTS_TOPIC_ID,
-    )
+    if pulse_type != "red":
+        telegram_admin_notify(
+            "\n".join([
+                "<b>New Pulse answer</b>",
+                f"Question: <code>{escape(question)}</code>",
+                f"Type: <b>{escape(pulse_type.title())}</b>",
+                f"Category: <b>{escape(data.get('category') or 'General')}</b>",
+            ]),
+            PULSE_REPORTS_TOPIC_ID,
+        )
     print(
         f"[{now_iso()}] pulse submit success pulse_id={data['id']} pulse_type={pulse_type} "
         f"sender_user_id={identity.get('user_id')} sender_username={identity.get('username')!r} "
@@ -4740,9 +4831,13 @@ def submit_pulse(entry: PulseEntry):
     updated_slots = pulse_slot_state(identity.get("user_id"), identity.get("username"))
     add_notification("pulse", "Anonymous Pulse submitted", False)
     message = (
-        "You answered someone's Pulse. If they submitted that Pulse, they'll receive your anonymous answer."
-        if receipt
-        else "You answered a Pulse."
+        "Your Red Pulse answer is in. Thanks for contributing to the community heat."
+        if pulse_type == "red"
+        else (
+            "You answered someone's Pulse. If they submitted that Pulse, they'll receive your anonymous answer."
+            if receipt
+            else "You answered a Pulse."
+        )
     )
     return {
         "status": "ok",
@@ -4785,6 +4880,8 @@ def respond_to_pulse_assignment(pulse_id: int, payload: PulseAssignmentResponse)
         print(f"[{now_iso()}] pulse answer rejected: answer too short", flush=True)
         return {"status": "error", "message": "Please add a little more before sending your answer."}
 
+    day = entry.get("day_key") or pulse_day_key()
+    previous_cycles = pulse_red_unlocked_cycles(day)
     entry["status"] = "completed"
     entry["response_answer"] = answer
     entry["responder_user_id"] = identity.get("user_id")
@@ -4803,6 +4900,8 @@ def respond_to_pulse_assignment(pulse_id: int, payload: PulseAssignmentResponse)
         "notify_after": pulse_notification_due_at(),
     }
     pulse_receipts.append(receipt)
+    new_cycles = pulse_red_unlocked_cycles(day)
+    maybe_queue_red_pulse_unlock_notifications(day, previous_cycles, new_cycles)
     save_runtime_state()
     print(
         f"[{now_iso()}] pulse answer success pulse_id={pulse_id} responder_user_id={identity.get('user_id')} "
@@ -4879,6 +4978,8 @@ def bot_respond_to_pulse(
         or str(responder_user_id or "Anonymous")
     )
 
+    day = entry.get("day_key") or pulse_day_key()
+    previous_cycles = pulse_red_unlocked_cycles(day)
     entry["status"] = "completed"
     entry["response_answer"] = answer
     entry["responder_user_id"] = responder_user_id
@@ -4897,6 +4998,8 @@ def bot_respond_to_pulse(
         "notify_after": pulse_notification_due_at(),
     }
     pulse_receipts.append(receipt)
+    new_cycles = pulse_red_unlocked_cycles(day)
+    maybe_queue_red_pulse_unlock_notifications(day, previous_cycles, new_cycles)
     save_runtime_state()
     print(
         f"[{now_iso()}] bot pulse answer success pulse_id={pulse_id} responder_user_id={responder_user_id} "
@@ -5270,6 +5373,8 @@ def bot_pending_pulse_notifications(x_bot_sync_secret: str | None = Header(defau
         payload = pulse_receipt_payload(receipt)
         if not payload:
             continue
+        if (payload.get("pulse_type") or "").lower() == "red":
+            continue
         delivery_mode = payload.get("delivery_mode") or "chain"
         rows.append({
             "notification_id": f"receipt-{receipt.get('id')}",
@@ -5281,6 +5386,24 @@ def bot_pending_pulse_notifications(x_bot_sync_secret: str | None = Header(defau
             "received_at": receipt.get("received_at"),
             "notify_after": receipt.get("notify_after"),
             "pulse": payload,
+        })
+    for alert in pulse_red_unlock_notifications:
+        if alert.get("notified_at"):
+            continue
+        if not pulse_red_unlock_notify_allowed({
+            "user_id": alert.get("recipient_user_id"),
+            "username": alert.get("recipient_username"),
+        }):
+            continue
+        rows.append({
+            "notification_id": alert.get("notification_id"),
+            "kind": "red_pulse_active",
+            "day_key": alert.get("day_key"),
+            "cycle_number": alert.get("cycle_number"),
+            "recipient_user_id": alert.get("recipient_user_id"),
+            "recipient_username": alert.get("recipient_username"),
+            "recipient_display_name": alert.get("recipient_display_name"),
+            "created_at": alert.get("created_at"),
         })
     return {"status": "ok", "notifications": rows}
 
@@ -5296,6 +5419,17 @@ def mark_pulse_notification_sent(notification_id: str, x_bot_sync_secret: str | 
         entry["assignment_notified_at"] = now_iso()
         save_runtime_state()
         return {"status": "ok", "pulse": public_pulse_payload(entry)}
+
+    if notification_id.startswith("red-unlock-"):
+        alert = next(
+            (item for item in pulse_red_unlock_notifications if item.get("notification_id") == notification_id),
+            None,
+        )
+        if not alert:
+            return {"status": "error", "message": "Red Pulse unlock notification not found."}
+        alert["notified_at"] = now_iso()
+        save_runtime_state()
+        return {"status": "ok", "notification": alert}
 
     receipt_id = int(notification_id.replace("receipt-", "", 1))
     receipt = next((item for item in pulse_receipts if int(item.get("id") or 0) == receipt_id), None)
