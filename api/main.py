@@ -767,6 +767,14 @@ class AdminPulseQuestionAction(BaseModel):
     edited_question: str | None = None
 
 
+class AdminPulseQuestionCreate(BaseModel):
+    admin_secret: str
+    question: str
+    pool: str = "green"
+    category: str = "General"
+    schedule_mode: str = "tomorrow"
+
+
 class AdminSpotlightAction(BaseModel):
     admin_secret: str
     action: str
@@ -1368,6 +1376,57 @@ def apply_admin_pulse_question_action(entry: dict, action: str, edited_question:
         entry["needs_admin_notify"] = False
         return
     raise HTTPException(status_code=400, detail="Unknown Pulse question action.")
+
+
+def create_admin_pulse_question(
+    question: str,
+    pool: str = "green",
+    category: str = "General",
+    schedule_mode: str = "tomorrow",
+    *,
+    source: str = "feature_admin",
+    display_name: str = "Feature Admin",
+) -> dict:
+    pool = (pool or "green").strip().lower()
+    category = (category or "General").strip()
+    question = (question or "").strip()
+    allowed_categories = {"Mental health", "Physical health", "General"}
+    if pool not in {"green", "red"}:
+        raise HTTPException(status_code=400, detail="Pool must be green or red.")
+    if category not in allowed_categories:
+        raise HTTPException(
+            status_code=400,
+            detail="Category must be Mental health, Physical health, or General.",
+        )
+    if len(question) < 8:
+        raise HTTPException(status_code=400, detail="Question must be at least 8 characters.")
+
+    schedule = normalize_pulse_schedule_mode(schedule_mode)
+    entry = {
+        "id": len(pulse_question_suggestions) + 1,
+        "pool": pool,
+        "category": category,
+        "question": question,
+        "edited_question": None,
+        "submitted_at": now_iso(),
+        "day_key": pulse_day_key(),
+        "user_id": None,
+        "username": None,
+        "display_name": display_name,
+        "status": "pending_review",
+        "schedule_mode": schedule,
+        "needs_admin_notify": False,
+        "review_message_sent": True,
+        "reviewed_at": None,
+        "reviewed_by": None,
+        "active_from_day_key": None,
+        "source": source,
+    }
+    apply_pulse_suggestion_schedule(entry, schedule, approve=True)
+    entry["reviewed_at"] = now_iso()
+    pulse_question_suggestions.append(entry)
+    save_runtime_state()
+    return entry
 
 
 def verify_telegram_init_data(init_data: str) -> dict:
@@ -3339,6 +3398,18 @@ def admin_review_queue(admin_secret: str):
         "spotlights_pending": pending_spotlights,
         "pulse_answers_today": recent_answers,
     }
+
+
+@app.post("/api/admin/pulse-questions/create")
+def admin_create_pulse_question(payload: AdminPulseQuestionCreate):
+    verify_admin_secret(payload.admin_secret)
+    entry = create_admin_pulse_question(
+        payload.question,
+        payload.pool,
+        payload.category,
+        payload.schedule_mode,
+    )
+    return {"status": "ok", "entry": pulse_question_suggestion_admin_payload(entry)}
 
 
 @app.post("/api/admin/pulse-questions/{suggestion_id}")
