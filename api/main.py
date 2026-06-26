@@ -2,19 +2,34 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import re
-from urllib.parse import urlparse, unquote
+from urllib.parse import parse_qsl, urlparse, unquote
 from pathlib import Path
 from zoneinfo import ZoneInfo
 import datetime
+import hashlib
+import hmac
 import os
 import shutil
 import asyncio
 import json
 import random
 import sqlite3
-import hashlib
+import urllib.request
+from html import escape
 from fastapi import Header, HTTPException, WebSocket, WebSocketDisconnect
 from .websocket_manager import manager
+from .cards_game import (
+    CreateRoomPayload,
+    JoinRoomPayload,
+    LoadoutPayload,
+    QueuePayload,
+    RoomActionPayload,
+    UserIdPayload,
+    cards_resolve_player,
+    get_cards_service,
+)
+from .cards_progress import fetch_pending_rewards, mark_rewards_claimed, profile_summary
+from .cards_ws_manager import cards_ws_manager
 
 app = FastAPI()
 
@@ -50,6 +65,11 @@ FOX_LOGS_DB_PATH = os.getenv(
     os.path.join(ALCOVE_ROOT, "Bot-Review", "ALCOVE_FOX", "fox_logs.db"),
 )
 BOT_SYNC_SECRET = os.getenv("BOT_SYNC_SECRET", "")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("ALCOVE_TELEGRAM_BOT_TOKEN", "")
+ALCOVE_ADMIN_GROUP_ID = int(os.getenv("ALCOVE_ADMIN_GROUP_ID", "-1003971041191") or "-1003971041191")
+PULSE_QUESTIONS_TOPIC_ID = int(os.getenv("PULSE_QUESTIONS_TOPIC_ID", "289") or "289")
+PULSE_REPORTS_TOPIC_ID = int(os.getenv("PULSE_REPORTS_TOPIC_ID", "365") or "365")
+SPOTLIGHT_REVIEW_TOPIC_ID = int(os.getenv("SPOTLIGHT_REVIEW_TOPIC_ID", "97") or "97")
 FEATURE_FLAGS_PATH = os.getenv(
     "FEATURE_FLAGS_PATH",
     os.path.join(os.getcwd(), "feature_flags.json"),
@@ -62,13 +82,13 @@ RUNTIME_STATE_PATH = os.getenv(
     "ALCOVE_RUNTIME_STATE_PATH",
     os.path.join(os.getcwd(), "alcove_runtime_state.json"),
 )
-STATE_DB_PATH = os.getenv(
-    "ALCOVE_STATE_DB_PATH",
-    os.path.join(os.getcwd(), "alcove_state.db"),
-)
 VERIFY_FLOW_LOG_PATH = os.getenv(
     "VERIFY_FLOW_LOG_PATH",
     os.path.join(os.getcwd(), "verification_flow_events.jsonl"),
+)
+STATE_DB_PATH = os.getenv(
+    "ALCOVE_STATE_DB_PATH",
+    os.path.join(os.getcwd(), "alcove_state.db"),
 )
 
 for path in [DOWNLOADS_DIR, READY_DIR, ARCHIVE_DIR, PLAYOUT_DIR]:
@@ -181,6 +201,7 @@ pulse_red_activations = []
 pulse_question_suggestions = []
 pulse_daily_summary_posts = []
 pulse_disabled_questions = []
+miniapp_verifications = []
 synced_alcove_users = []
 synced_alcove_analytics = {}
 last_bot_sync_at = None
@@ -202,10 +223,23 @@ notification_feed = []
 wheel_submission_limits = {}
 muted_users = set()
 current_winner = None
-current_video_intro = None
 PULSE_DEFAULT_HEAT_THRESHOLD = int(os.getenv("PULSE_HEAT_THRESHOLD", "50"))
+PULSE_GREEN_UNLOCK_INTERVAL_HOURS = 4
+PULSE_MAX_GREEN_SLOTS = 6
 PULSE_TESTING_UNLIMITED = os.getenv("PULSE_TESTING_UNLIMITED", "0").strip().lower() in {"1", "true", "yes", "on"}
+LEAN_MODE = os.getenv("LEAN_MODE", "0").strip().lower() in {"1", "true", "yes", "on"}
+PULSE_UNLIMITED_QUESTION_SUBMIT = os.getenv(
+    "PULSE_UNLIMITED_QUESTION_SUBMIT",
+    "0" if LEAN_MODE else "1",
+).strip().lower() in {"1", "true", "yes", "on"}
+PULSE_RETENTION_DAYS = max(
+    7,
+    int(os.getenv("PULSE_RETENTION_DAYS", "14" if LEAN_MODE else "30") or (14 if LEAN_MODE else 30)),
+)
+CARDS_API_ENABLED = os.getenv("CARDS_API_ENABLED", "0").strip().lower() in {"1", "true", "yes", "on"}
 UK_TZ = ZoneInfo("Europe/London")
+_last_saved_runtime_fingerprint: str | None = None
+_last_pulse_prune_day: str | None = None
 
 state = {
     "current_round": 1,
@@ -225,8 +259,12 @@ state = {
 }
 
 
+def lean_mode_enabled() -> bool:
+    return LEAN_MODE
+
+
 def runtime_state_payload() -> dict:
-    return {
+    payload = {
         "spotlight_entries": spotlight_entries,
         "pulse_entries": pulse_entries,
         "pulse_receipts": pulse_receipts,
@@ -234,10 +272,17 @@ def runtime_state_payload() -> dict:
         "pulse_question_suggestions": pulse_question_suggestions,
         "pulse_daily_summary_posts": pulse_daily_summary_posts,
         "pulse_disabled_questions": pulse_disabled_questions,
-        "wheel_reaction_history": wheel_reaction_history,
-        "wheel_review_history": wheel_review_history,
-        "wheel_user_engagement": wheel_user_engagement,
+        "miniapp_verifications": miniapp_verifications,
+        "synced_alcove_users": synced_alcove_users,
+        "last_bot_sync_at": last_bot_sync_at,
     }
+    if lean_mode_enabled():
+        return payload
+    payload["wheel_reaction_history"] = wheel_reaction_history
+    payload["wheel_review_history"] = wheel_review_history
+    payload["wheel_user_engagement"] = wheel_user_engagement
+    payload["synced_alcove_analytics"] = synced_alcove_analytics
+    return payload
 
 
 def ensure_state_store() -> None:
@@ -260,7 +305,8 @@ def ensure_state_store() -> None:
 def apply_runtime_payload(payload: dict) -> None:
     global spotlight_entries, pulse_entries, pulse_receipts, pulse_red_activations
     global pulse_question_suggestions, pulse_daily_summary_posts, pulse_disabled_questions
-    global wheel_reaction_history, wheel_review_history, wheel_user_engagement
+    global miniapp_verifications, wheel_reaction_history, wheel_review_history, wheel_user_engagement
+    global synced_alcove_users, synced_alcove_analytics, last_bot_sync_at
 
     spotlight_entries = payload.get("spotlight_entries") if isinstance(payload.get("spotlight_entries"), list) else []
     pulse_entries = payload.get("pulse_entries") if isinstance(payload.get("pulse_entries"), list) else []
@@ -269,9 +315,19 @@ def apply_runtime_payload(payload: dict) -> None:
     pulse_question_suggestions = payload.get("pulse_question_suggestions") if isinstance(payload.get("pulse_question_suggestions"), list) else []
     pulse_daily_summary_posts = payload.get("pulse_daily_summary_posts") if isinstance(payload.get("pulse_daily_summary_posts"), list) else []
     pulse_disabled_questions = payload.get("pulse_disabled_questions") if isinstance(payload.get("pulse_disabled_questions"), list) else []
-    wheel_reaction_history = payload.get("wheel_reaction_history") if isinstance(payload.get("wheel_reaction_history"), list) else []
-    wheel_review_history = payload.get("wheel_review_history") if isinstance(payload.get("wheel_review_history"), list) else []
-    wheel_user_engagement = payload.get("wheel_user_engagement") if isinstance(payload.get("wheel_user_engagement"), dict) else {}
+    miniapp_verifications = payload.get("miniapp_verifications") if isinstance(payload.get("miniapp_verifications"), list) else []
+    if lean_mode_enabled():
+        wheel_reaction_history.clear()
+        wheel_review_history.clear()
+        wheel_user_engagement.clear()
+        synced_alcove_analytics = {}
+    else:
+        wheel_reaction_history = payload.get("wheel_reaction_history") if isinstance(payload.get("wheel_reaction_history"), list) else []
+        wheel_review_history = payload.get("wheel_review_history") if isinstance(payload.get("wheel_review_history"), list) else []
+        wheel_user_engagement = payload.get("wheel_user_engagement") if isinstance(payload.get("wheel_user_engagement"), dict) else {}
+        synced_alcove_analytics = payload.get("synced_alcove_analytics") if isinstance(payload.get("synced_alcove_analytics"), dict) else {}
+    synced_alcove_users = payload.get("synced_alcove_users") if isinstance(payload.get("synced_alcove_users"), list) else []
+    last_bot_sync_at = payload.get("last_bot_sync_at") if isinstance(payload.get("last_bot_sync_at"), str) else None
 
 
 def load_runtime_state_from_db() -> dict | None:
@@ -297,7 +353,7 @@ def load_runtime_state_from_db() -> dict | None:
 
 def save_runtime_state_to_db(payload: dict) -> None:
     ensure_state_store()
-    serialized = json.dumps(payload, indent=2, sort_keys=True)
+    serialized = json.dumps(payload, separators=(",", ":"), sort_keys=True)
     with sqlite3.connect(STATE_DB_PATH) as conn:
         conn.execute(
             """
@@ -310,6 +366,116 @@ def save_runtime_state_to_db(payload: dict) -> None:
             ("alcove_runtime", serialized, datetime.datetime.utcnow().isoformat()),
         )
         conn.commit()
+
+
+def runtime_entry_day(entry: dict) -> str:
+    return (
+        entry.get("day_key")
+        or entry.get("submitted_at")
+        or entry.get("time")
+        or entry.get("created_at")
+        or ""
+    )[:10]
+
+
+def prune_pulse_runtime_data(force: bool = False) -> dict:
+    global pulse_entries, pulse_receipts, pulse_red_activations, miniapp_verifications
+    global pulse_question_suggestions, spotlight_entries, _last_pulse_prune_day
+
+    today = datetime.datetime.now(UK_TZ).strftime("%Y-%m-%d")
+    if not force and _last_pulse_prune_day == today:
+        return {
+            "pruned_entries": 0,
+            "pruned_receipts": 0,
+            "pruned_activations": 0,
+            "pruned_verifications": 0,
+            "pruned_suggestions": 0,
+            "pruned_spotlights": 0,
+        }
+
+    cutoff = (datetime.datetime.now(UK_TZ) - datetime.timedelta(days=PULSE_RETENTION_DAYS)).strftime("%Y-%m-%d")
+    before_entries = len(pulse_entries)
+    pulse_entries[:] = [
+        entry for entry in pulse_entries
+        if (entry.get("day_key") or "") >= cutoff
+    ]
+    kept_pulse_ids = {int(entry.get("id") or 0) for entry in pulse_entries if entry.get("id")}
+
+    before_receipts = len(pulse_receipts)
+    pulse_receipts[:] = [
+        receipt for receipt in pulse_receipts
+        if int(receipt.get("pulse_id") or 0) in kept_pulse_ids
+    ]
+
+    before_activations = len(pulse_red_activations)
+    pulse_red_activations[:] = [
+        entry for entry in pulse_red_activations
+        if (entry.get("day_key") or "") >= cutoff
+    ]
+
+    before_verifications = len(miniapp_verifications)
+    miniapp_verifications[:] = [
+        entry for entry in miniapp_verifications
+        if entry.get("status") == "pending"
+        or runtime_entry_day(entry) >= cutoff
+    ]
+
+    before_suggestions = len(pulse_question_suggestions)
+    before_spotlights = len(spotlight_entries)
+    if lean_mode_enabled():
+        pulse_question_suggestions[:] = [
+            entry for entry in pulse_question_suggestions
+            if entry.get("status") in {"pending_review", "reserved", "approved"}
+            or runtime_entry_day(entry) >= cutoff
+        ]
+        spotlight_entries[:] = [
+            entry for entry in spotlight_entries
+            if entry.get("status") == "pending_review"
+            or runtime_entry_day(entry) >= cutoff
+        ]
+
+    _last_pulse_prune_day = today
+    return {
+        "pruned_entries": before_entries - len(pulse_entries),
+        "pruned_receipts": before_receipts - len(pulse_receipts),
+        "pruned_activations": before_activations - len(pulse_red_activations),
+        "pruned_verifications": before_verifications - len(miniapp_verifications),
+        "pruned_suggestions": before_suggestions - len(pulse_question_suggestions),
+        "pruned_spotlights": before_spotlights - len(spotlight_entries),
+    }
+
+
+def cards_api_enabled() -> bool:
+    return CARDS_API_ENABLED
+
+
+def ensure_cards_api_enabled():
+    if not cards_api_enabled():
+        raise HTTPException(status_code=503, detail="Cards is temporarily disabled.")
+
+
+def save_runtime_state(force: bool = False) -> bool:
+    global _last_saved_runtime_fingerprint
+
+    prune_stats = prune_pulse_runtime_data()
+    payload = runtime_state_payload()
+    fingerprint = json.dumps(payload, separators=(",", ":"), sort_keys=True)
+    data_changed = any(prune_stats.values())
+    if not force and not data_changed and fingerprint == _last_saved_runtime_fingerprint:
+        return False
+
+    save_runtime_state_to_db(payload)
+
+    directory = os.path.dirname(RUNTIME_STATE_PATH)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    temp_path = f"{RUNTIME_STATE_PATH}.tmp"
+    with open(temp_path, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, separators=(",", ":"), sort_keys=True)
+    os.replace(temp_path, RUNTIME_STATE_PATH)
+
+    _last_saved_runtime_fingerprint = fingerprint
+    return True
 
 
 def load_runtime_state() -> None:
@@ -335,20 +501,16 @@ def load_runtime_state() -> None:
         pass
 
 
-def save_runtime_state() -> None:
-    payload = runtime_state_payload()
-    save_runtime_state_to_db(payload)
-
-    directory = os.path.dirname(RUNTIME_STATE_PATH)
-    if directory:
-        os.makedirs(directory, exist_ok=True)
-    temp_path = f"{RUNTIME_STATE_PATH}.tmp"
-    with open(temp_path, "w", encoding="utf-8") as handle:
-        json.dump(payload, handle, indent=2, sort_keys=True)
-    os.replace(temp_path, RUNTIME_STATE_PATH)
-
-
 load_runtime_state()
+prune_pulse_runtime_data(force=True)
+save_runtime_state(force=True)
+if lean_mode_enabled():
+    print(
+        f"[{now_iso()}] LEAN_MODE enabled: retention={PULSE_RETENTION_DAYS}d, "
+        f"unlimited_question_submit={PULSE_UNLIMITED_QUESTION_SUBMIT}, "
+        "wheel history omitted from runtime state.",
+        flush=True,
+    )
 
 DEFAULT_FEATURE_FLAGS = {
     "pages": {
@@ -358,6 +520,7 @@ DEFAULT_FEATURE_FLAGS = {
         "wellbeing": True,
         "pulse": False,
         "connect": False,
+        "cards": False,
     },
     "wellbeing": {
         "daily_checkin": True,
@@ -367,38 +530,8 @@ DEFAULT_FEATURE_FLAGS = {
 }
 
 PULSE_QUESTIONS = {
-    "green": [
-        "What’s been on your mind more than usual lately?",
-        "What kind of day have you really been having?",
-        "What’s something you’ve been overthinking recently?",
-        "When you’re not feeling great, what usually helps a bit?",
-        "What’s something you wish people asked you more often?",
-        "What’s been draining your energy lately?",
-        "What helps you feel a bit more like yourself again?",
-        "What’s one thing you need more of right now?",
-        "How has your body been feeling lately?",
-        "What’s your sleep been like recently?",
-        "What’s one small thing that usually makes your body feel better?",
-        "Have you been looking after yourself properly lately?",
-        "What’s been affecting your energy the most?",
-        "What’s one healthy habit you’re trying to get back into?",
-        "When do you feel most relaxed in your body?",
-        "What’s something physical you know you should probably give more attention to?",
-        "What’s something you’ve been wanting to say out loud?",
-        "What kind of connection are you in the mood for lately?",
-        "What’s been making life feel a bit easier recently?",
-        "What’s something small that’s meant a lot to you lately?",
-        "What’s one thing people often get wrong about you?",
-        "What have you been craving more of lately?",
-        "What’s something you’d love a bit more honesty about?",
-        "What’s been giving you hope lately?",
-    ],
-    "red": [
-        "What’s your hottest forbidden fantasy you’ve never told anyone?",
-        "What’s the sluttiest thing you’ve ever done in public or semi-public?",
-        "What exact thing during foreplay instantly makes your cock leak and your hole twitch?",
-        "Is there a time you hooked up with someone you really shouldn’t have — who it was and how filthy it got?",
-    ],
+    "green": [],
+    "red": [],
 }
 
 PULSE_QUESTION_CATEGORIES = {
@@ -443,7 +576,6 @@ class WheelEntry(BaseModel):
     link: str
     note: str | None = None
     video_title: str | None = None
-    skin_id: str | None = None
     video_longer_than_5_minutes: bool | None = None
     clip_start_seconds: int | None = None
     clip_start_label: str | None = None
@@ -463,16 +595,6 @@ class StreamComment(BaseModel):
     username: str | None = None
     display_name: str
     text: str
-    skin_id: str | None = None
-
-
-class FoxMessagePayload(BaseModel):
-    text: str
-
-
-class FoxWheelEntryPayload(BaseModel):
-    video_title: str | None = None
-    note: str | None = None
 
 
 class WheelReaction(BaseModel):
@@ -561,6 +683,32 @@ class PulseQuestionSuggestion(BaseModel):
     pool: str = "green"
     category: str
     question: str
+    schedule_mode: str | None = None
+
+
+class MiniappVerificationPayload(BaseModel):
+    init_data: str | None = None
+    selected_pack: str | None = None
+    feedback: str | None = None
+
+
+class VerificationLogPayload(BaseModel):
+    session_id: str | None = None
+    event: str | None = None
+    level: str | None = "info"
+    user_id: int | None = None
+    username: str | None = None
+    display_name: str | None = None
+    step_index: int | None = None
+    step_title: str | None = None
+    step_pose: str | None = None
+    action: str | None = None
+    selected_pack: str | None = None
+    message: str | None = None
+    detail: dict | None = None
+    user_agent: str | None = None
+    url: str | None = None
+    client_time: str | None = None
 
 
 class PulseSettingsUpdate(BaseModel):
@@ -581,6 +729,8 @@ class SpotlightReviewUpdate(BaseModel):
     review_message_sent: bool | None = None
     reviewed_by: int | None = None
     reviewed_at: str | None = None
+    publish_pending: bool | None = None
+    published_at: str | None = None
 
 
 class FeatureFlagsUpdate(BaseModel):
@@ -589,23 +739,20 @@ class FeatureFlagsUpdate(BaseModel):
     admin_secret: str | None = None
 
 
-class VerificationLogPayload(BaseModel):
-    session_id: str | None = None
-    event: str
-    level: str = "info"
-    user_id: int | None = None
-    username: str | None = None
-    display_name: str | None = None
-    step_index: int | None = None
-    step_title: str | None = None
-    step_pose: str | None = None
-    action: str | None = None
-    selected_pack: str | None = None
-    message: str | None = None
-    detail: dict | None = None
-    user_agent: str | None = None
-    url: str | None = None
-    client_time: str | None = None
+class AdminSecretQuery(BaseModel):
+    admin_secret: str
+
+
+class AdminPulseQuestionAction(BaseModel):
+    admin_secret: str
+    action: str
+    edited_question: str | None = None
+
+
+class AdminSpotlightAction(BaseModel):
+    admin_secret: str
+    action: str
+    edited_reason: str | None = None
 
 
 # ---------------------------------
@@ -614,6 +761,596 @@ class VerificationLogPayload(BaseModel):
 
 def now_iso() -> str:
     return datetime.datetime.utcnow().isoformat()
+
+
+def iso_in_seconds(seconds: int) -> str:
+    return (datetime.datetime.utcnow() + datetime.timedelta(seconds=seconds)).isoformat()
+
+
+def pulse_notification_due_at() -> str:
+    return iso_in_seconds(random.randint(120, 180))
+
+
+def iso_has_passed(value: str | None) -> bool:
+    if not value:
+        return True
+    try:
+        return datetime.datetime.fromisoformat(value) <= datetime.datetime.utcnow()
+    except ValueError:
+        return True
+
+
+def uk_now() -> datetime.datetime:
+    return datetime.datetime.now(UK_TZ)
+
+
+def pulse_day_key(at: datetime.datetime | None = None) -> str:
+    return (at or datetime.datetime.now(UK_TZ)).strftime("%Y-%m-%d")
+
+
+def normalize_pulse_schedule_mode(raw: str | None) -> str:
+    mode = (raw or "tomorrow").strip().lower()
+    if mode in {"today", "now", "live"}:
+        return "today"
+    if mode in {"reserve", "reserved", "hold"}:
+        return "reserve"
+    return "tomorrow"
+
+
+def active_from_for_schedule_mode(mode: str | None) -> str | None:
+    schedule = normalize_pulse_schedule_mode(mode)
+    if schedule == "today":
+        return pulse_day_key()
+    if schedule == "tomorrow":
+        return pulse_next_day_key()
+    return None
+
+
+def apply_pulse_suggestion_schedule(entry: dict, mode: str | None = None, *, approve: bool = False) -> dict:
+    schedule = normalize_pulse_schedule_mode(mode or entry.get("schedule_mode"))
+    entry["schedule_mode"] = schedule
+    if schedule == "reserve":
+        entry["status"] = "reserved"
+        entry["active_from_day_key"] = None
+        return entry
+    if approve or schedule == "today":
+        entry["status"] = "approved"
+        entry["active_from_day_key"] = active_from_for_schedule_mode(schedule)
+    return entry
+
+
+def pulse_next_day_key(at: datetime.datetime | None = None) -> str:
+    current = at or uk_now()
+    return (current + datetime.timedelta(days=1)).strftime("%Y-%m-%d")
+
+
+def pulse_day_label(day_key: str | None = None) -> str:
+    raw = day_key or pulse_day_key()
+    try:
+        parsed = datetime.date.fromisoformat(raw)
+    except ValueError:
+        return raw
+    return parsed.strftime("%d %B %Y")
+
+
+def normalized_pulse_reset_interval(value) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return 12
+    return parsed if parsed in {1, 3, 6, 12} else 12
+
+
+def pulse_question_category(question: str | None, pulse_type: str | None = None) -> str:
+    question = (question or "").strip()
+    if question in PULSE_QUESTION_CATEGORIES:
+        return PULSE_QUESTION_CATEGORIES[question]
+    if (pulse_type or "").strip().lower() == "red":
+        return "General"
+    return "Mental health"
+
+
+def pulse_default_question_entries():
+    rows = []
+    for pool, questions in PULSE_QUESTIONS.items():
+        for question in questions:
+            rows.append({
+                "source": "default",
+                "pool": pool,
+                "category": pulse_question_category(question, pool),
+                "question": question,
+                "active": {"pool": pool, "question": question} not in pulse_disabled_questions,
+            })
+    return rows
+
+
+def pulse_approved_question_entries():
+    rows = []
+    today = pulse_day_key()
+    for entry in pulse_question_suggestions:
+        if entry.get("status") != "approved":
+            continue
+        active_from = (entry.get("active_from_day_key") or "").strip()
+        if active_from and active_from > today:
+            continue
+        rows.append({
+            "source": "suggested",
+            "suggestion_id": entry.get("id"),
+            "pool": entry.get("pool") or "green",
+            "category": entry.get("category") or "General",
+            "question": entry.get("edited_question") or entry.get("question") or "",
+            "active": True,
+        })
+    return rows
+
+
+def pulse_active_questions(pool: str):
+    active = []
+    for entry in pulse_default_question_entries() + pulse_approved_question_entries():
+        if entry.get("pool") != pool:
+            continue
+        if not entry.get("active", True):
+            continue
+        question = (entry.get("question") or "").strip()
+        if question:
+            active.append(question)
+    return active
+
+
+def pulse_question_answer_count(question: str, pool: str | None = None):
+    count = 0
+    for entry in pulse_entries:
+        if entry.get("status") != "completed":
+            continue
+        if (entry.get("question") or "").strip() != (question or "").strip():
+            continue
+        if pool and (entry.get("pulse_type") or "green") != pool:
+            continue
+        count += 1
+    return count
+
+
+def pulse_question_answer_count_for_day(question: str, pool: str | None = None, day_key: str | None = None):
+    day = day_key or pulse_day_key()
+    count = 0
+    for entry in pulse_entries:
+        if entry.get("status") != "completed":
+            continue
+        if entry.get("day_key") != day:
+            continue
+        if (entry.get("question") or "").strip() != (question or "").strip():
+            continue
+        if pool and (entry.get("pulse_type") or "green") != pool:
+            continue
+        count += 1
+    return count
+
+
+def pulse_daily_spread_report(day_key: str | None = None):
+    day = day_key or pulse_day_key()
+    questions = []
+    for row in pulse_question_roster():
+        today_count = pulse_question_answer_count_for_day(row.get("question"), row.get("pool"), day)
+        questions.append({
+            **row,
+            "answers_today": today_count,
+            "answers_all_time": int(row.get("answers_count") or 0),
+        })
+    questions.sort(key=lambda item: (item.get("answers_today") or 0, (item.get("question") or "").lower()))
+    total_answers = sum(int(item.get("answers_today") or 0) for item in questions)
+    lowest = min((int(item.get("answers_today") or 0) for item in questions), default=0) if questions else 0
+    underserved = [item for item in questions if int(item.get("answers_today") or 0) == lowest]
+    return {
+        "day_key": day,
+        "day_label": pulse_day_label(day),
+        "question_count": len(questions),
+        "total_answers_today": total_answers,
+        "lowest_count": lowest,
+        "underserved": underserved,
+        "questions": questions,
+    }
+
+
+def pulse_question_roster():
+    rows = []
+    current_id = 1
+    all_entries = pulse_default_question_entries() + pulse_approved_question_entries()
+    sort_key = {"Mental health": 0, "Physical health": 1, "General": 2}
+    all_entries.sort(key=lambda item: (item.get("pool") != "green", sort_key.get(item.get("category"), 99), item.get("question", "").lower()))
+    for entry in all_entries:
+        if not entry.get("active", True):
+            continue
+        owner = pulse_question_suggestion_owner_fields(entry.get("suggestion_id"))
+        rows.append({
+            "roster_id": current_id,
+            "source": entry.get("source"),
+            "suggestion_id": entry.get("suggestion_id"),
+            "pool": entry.get("pool"),
+            "category": entry.get("category"),
+            "question": entry.get("question"),
+            "answers_count": pulse_question_answer_count(entry.get("question"), entry.get("pool")),
+            "answers_today": pulse_question_answer_count_for_day(entry.get("question"), entry.get("pool")),
+            **owner,
+        })
+        current_id += 1
+    return rows
+
+
+def clear_pulse_question_roster(reviewed_by=None):
+    removed_defaults = 0
+    removed_suggested = 0
+    reviewed_at = now_iso()
+    for row in pulse_question_roster():
+        if row.get("source") == "default":
+            marker = {"pool": row.get("pool"), "question": row.get("question")}
+            if marker not in pulse_disabled_questions:
+                pulse_disabled_questions.append(marker)
+                removed_defaults += 1
+            continue
+        suggestion_id = row.get("suggestion_id")
+        if not suggestion_id:
+            continue
+        suggestion = find_pulse_question_suggestion(suggestion_id)
+        if not suggestion or suggestion.get("status") != "approved":
+            continue
+        suggestion["status"] = "deleted"
+        suggestion["reviewed_at"] = reviewed_at
+        if reviewed_by is not None:
+            suggestion["reviewed_by"] = reviewed_by
+        removed_suggested += 1
+    save_runtime_state()
+    return {
+        "removed_defaults": removed_defaults,
+        "removed_suggested": removed_suggested,
+        "remaining": len(pulse_question_roster()),
+    }
+
+
+def find_pulse_question_suggestion(suggestion_id: int):
+    for entry in pulse_question_suggestions:
+        if int(entry.get("id") or 0) == int(suggestion_id):
+            return entry
+    return None
+
+
+def prioritized_random_question(entries: list[dict], seed_value: str = "") -> dict | None:
+    if not entries:
+        return None
+    by_count = sorted(entries, key=lambda item: int(item.get("answers_count") or 0))
+    lowest_count = int(by_count[0].get("answers_count") or 0)
+    lowest_group = [item for item in by_count if int(item.get("answers_count") or 0) == lowest_count]
+    chooser = random.Random(seed_value or pulse_day_key())
+    return chooser.choice(lowest_group)
+
+
+def pulse_question_choices(pool: str, user_id=None, username=None):
+    roster = [row for row in pulse_question_roster() if row.get("pool") == pool]
+    questions = []
+    seen = set()
+    for row in roster:
+        question = (row.get("question") or "").strip()
+        if not question or question in seen:
+            continue
+        seen.add(question)
+        questions.append(question)
+    return questions
+
+
+def pulse_identities_match(left, right):
+    if not left or not right:
+        return False
+    left_id = left.get("user_id")
+    right_id = right.get("user_id")
+    if left_id is not None and right_id is not None and int(left_id) == int(right_id):
+        return True
+    left_username = (left.get("username") or "").lower()
+    right_username = (right.get("username") or "").lower()
+    return bool(left_username and right_username and left_username == right_username)
+
+
+def pulse_question_owner(question: str, pool: str):
+    question = (question or "").strip()
+    pool = (pool or "green").strip().lower()
+    today = pulse_day_key()
+    for entry in pulse_question_suggestions:
+        if entry.get("status") != "approved":
+            continue
+        active_from = (entry.get("active_from_day_key") or "").strip()
+        if active_from and active_from > today:
+            continue
+        if (entry.get("pool") or "green") != pool:
+            continue
+        candidate = (entry.get("edited_question") or entry.get("question") or "").strip()
+        if candidate == question:
+            return {
+                "user_id": entry.get("user_id"),
+                "username": entry.get("username"),
+                "display_name": entry.get("display_name"),
+            }
+    return None
+
+
+def pulse_user_answered_question_today(identity, question: str, pulse_type: str, day_key: str | None = None):
+    day = day_key or pulse_day_key()
+    question = (question or "").strip()
+    pulse_type = (pulse_type or "green").strip().lower()
+    for entry in pulse_entries_for_day(day):
+        if (entry.get("question") or "").strip() != question:
+            continue
+        if (entry.get("pulse_type") or "green") != pulse_type:
+            continue
+        if pulse_identities_match(identity, {
+            "user_id": entry.get("sender_user_id"),
+            "username": entry.get("sender_username"),
+        }):
+            return True
+    return False
+
+
+def pulse_suggestion_question(entry):
+    return (entry.get("edited_question") or entry.get("question") or "").strip()
+
+
+def pulse_question_suggestion_admin_payload(entry):
+    if not entry:
+        return None
+    return {
+        "id": entry.get("id"),
+        "pool": entry.get("pool") or "green",
+        "category": entry.get("category") or "General",
+        "question": entry.get("question") or "",
+        "edited_question": entry.get("edited_question"),
+        "display_question": pulse_suggestion_question(entry),
+        "status": entry.get("status"),
+        "submitted_at": entry.get("submitted_at"),
+        "day_key": entry.get("day_key"),
+        "active_from_day_key": entry.get("active_from_day_key"),
+        "user_id": entry.get("user_id"),
+        "username": entry.get("username"),
+        "display_name": entry.get("display_name"),
+        "reviewed_at": entry.get("reviewed_at"),
+        "reviewed_by": entry.get("reviewed_by"),
+        "review_message_sent": entry.get("review_message_sent"),
+        "schedule_mode": entry.get("schedule_mode") or "tomorrow",
+        "needs_admin_notify": entry.get("needs_admin_notify"),
+        "source": entry.get("source"),
+        "answers_count": pulse_question_answer_count(pulse_suggestion_question(entry), entry.get("pool")),
+    }
+
+
+def pulse_question_suggestion_owner_fields(suggestion_id: int | None):
+    if not suggestion_id:
+        return {}
+    entry = find_pulse_question_suggestion(suggestion_id)
+    if not entry:
+        return {}
+    return {
+        "submitter_user_id": entry.get("user_id"),
+        "submitter_username": entry.get("username"),
+        "submitter_display_name": entry.get("display_name"),
+        "submitted_at": entry.get("submitted_at"),
+        "active_from_day_key": entry.get("active_from_day_key"),
+    }
+
+
+def pulse_suggestions_for_user(user_id=None, username=None):
+    identity = {"user_id": user_id, "username": username}
+    rows = []
+    for entry in pulse_question_suggestions:
+        if entry.get("status") in {"rejected", "deleted"}:
+            continue
+        owner = {"user_id": entry.get("user_id"), "username": entry.get("username")}
+        if pulse_identities_match(identity, owner):
+            rows.append(entry)
+    return rows
+
+
+def pulse_answers_to_suggestion(identity, suggestion):
+    question = pulse_suggestion_question(suggestion)
+    pool = (suggestion.get("pool") or "green").strip().lower()
+    answers = []
+    for entry in pulse_entries:
+        if entry.get("status") != "completed":
+            continue
+        if (entry.get("question") or "").strip() != question:
+            continue
+        if (entry.get("pulse_type") or "green") != pool:
+            continue
+        owner = {
+            "user_id": entry.get("question_owner_user_id"),
+            "username": entry.get("question_owner_username"),
+        }
+        if owner.get("user_id") or owner.get("username"):
+            if not pulse_identities_match(identity, owner):
+                continue
+        else:
+            roster_owner = pulse_question_owner(question, pool)
+            if not roster_owner or not pulse_identities_match(identity, roster_owner):
+                continue
+        answers.append({
+            "pulse_id": entry.get("id"),
+            "answer": entry.get("response_answer") or entry.get("sender_note") or entry.get("answer"),
+            "received_at": entry.get("responded_at") or entry.get("sent_at"),
+            "day_key": entry.get("day_key"),
+        })
+    answers.sort(key=lambda item: item.get("received_at") or "", reverse=True)
+    return answers
+
+
+def pulse_owned_suggestion_payload(identity, suggestion):
+    question = pulse_suggestion_question(suggestion)
+    answers = pulse_answers_to_suggestion(identity, suggestion)
+    active_from = (suggestion.get("active_from_day_key") or "").strip()
+    return {
+        "suggestion_id": suggestion.get("id"),
+        "question": question,
+        "pool": suggestion.get("pool") or "green",
+        "category": suggestion.get("category") or "General",
+        "status": suggestion.get("status"),
+        "review_status": suggestion.get("status"),
+        "submitted_at": suggestion.get("submitted_at"),
+        "submitted_day_key": suggestion.get("day_key"),
+        "active_from_day_key": active_from or None,
+        "active_from_label": pulse_day_label(active_from) if active_from else None,
+        "answers_count": len(answers),
+        "answers": answers,
+    }
+
+
+def pulse_my_pulses_payload(identity):
+    today_key = pulse_day_key()
+    today_rows = []
+    past_rows = []
+    for suggestion in pulse_suggestions_for_user(identity.get("user_id"), identity.get("username")):
+        row = pulse_owned_suggestion_payload(identity, suggestion)
+        status = suggestion.get("status")
+        active_from = (suggestion.get("active_from_day_key") or "").strip()
+        submitted_day = (suggestion.get("day_key") or "").strip()
+
+        if status in {"pending_review", "reserved"} or submitted_day == today_key or (active_from and active_from >= today_key):
+            today_rows.append(row)
+        elif status == "approved" and active_from and active_from < today_key:
+            past_rows.append(row)
+        elif status == "approved" and not active_from:
+            past_rows.append(row)
+
+    sort_key = lambda row: row.get("active_from_day_key") or row.get("submitted_day_key") or ""
+    today_rows.sort(key=sort_key, reverse=True)
+    past_rows.sort(key=sort_key, reverse=True)
+    return {"today": today_rows, "past": past_rows}
+
+
+def seconds_until_next_uk_midnight() -> int:
+    current = uk_now()
+    tomorrow = (current + datetime.timedelta(days=1)).date()
+    reset_at = datetime.datetime.combine(tomorrow, datetime.time.min, tzinfo=UK_TZ)
+    return max(0, int((reset_at - current).total_seconds()))
+
+
+def pulse_reset_interval_hours() -> int:
+    return load_pulse_settings()["reset_interval_hours"]
+
+
+def pulse_green_unlock_interval_hours() -> int:
+    return PULSE_GREEN_UNLOCK_INTERVAL_HOURS
+
+
+def next_pulse_unlock_at(now: datetime.datetime | None = None, interval_hours: int | None = None) -> datetime.datetime:
+    current = now or uk_now()
+    interval = normalized_pulse_reset_interval(interval_hours or pulse_reset_interval_hours())
+    midnight = datetime.datetime.combine(current.date(), datetime.time.min, tzinfo=UK_TZ)
+    elapsed_seconds = max(0, int((current - midnight).total_seconds()))
+    interval_seconds = interval * 3600
+    next_boundary_seconds = ((elapsed_seconds // interval_seconds) + 1) * interval_seconds
+    if next_boundary_seconds >= 24 * 3600:
+        return midnight + datetime.timedelta(days=1)
+    return midnight + datetime.timedelta(seconds=next_boundary_seconds)
+
+
+def seconds_until_next_pulse_unlock(now: datetime.datetime | None = None, interval_hours: int | None = None) -> int:
+    current = now or uk_now()
+    return max(0, int((next_pulse_unlock_at(current, interval_hours) - current).total_seconds()))
+
+
+def pulse_unlock_label(now: datetime.datetime | None = None, interval_hours: int | None = None) -> str:
+    unlock_at = next_pulse_unlock_at(now, interval_hours)
+    return unlock_at.astimezone(UK_TZ).strftime("%H:%M")
+
+
+def verify_bot_sync_secret(x_bot_sync_secret: str | None):
+    if not BOT_SYNC_SECRET:
+        raise HTTPException(status_code=503, detail="Bot sync secret is not configured")
+    if x_bot_sync_secret != BOT_SYNC_SECRET:
+        raise HTTPException(status_code=403, detail="Invalid bot sync secret")
+
+
+def verify_admin_secret(admin_secret: str | None):
+    verify_bot_sync_secret(admin_secret)
+
+
+def telegram_admin_notify(text: str, topic_id: int | None = None) -> bool:
+    if not TELEGRAM_BOT_TOKEN or not ALCOVE_ADMIN_GROUP_ID:
+        return False
+    payload = {
+        "chat_id": ALCOVE_ADMIN_GROUP_ID,
+        "text": text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True,
+    }
+    if topic_id:
+        payload["message_thread_id"] = topic_id
+    try:
+        body = json.dumps(payload).encode("utf-8")
+        request = urllib.request.Request(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+            data=body,
+            method="POST",
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(request, timeout=15) as response:
+            return 200 <= response.status < 300
+    except Exception as exc:
+        print(f"[{now_iso()}] telegram admin notify error: {exc!r}", flush=True)
+        return False
+
+
+def apply_admin_pulse_question_action(entry: dict, action: str, edited_question: str | None = None) -> None:
+    action = (action or "").strip().lower()
+    if action == "amend":
+        text = (edited_question or "").strip()
+        if not text:
+            raise HTTPException(status_code=400, detail="Edited question text is required.")
+        entry["edited_question"] = text
+        entry["status"] = "pending_review"
+        entry["needs_admin_notify"] = True
+        entry["review_message_sent"] = False
+        return
+    if action == "reject":
+        entry["status"] = "rejected"
+        entry["reviewed_at"] = now_iso()
+        return
+    if action in {"today", "tomorrow", "reserve"}:
+        text = (edited_question or "").strip()
+        if text and text != (entry.get("question") or "").strip():
+            entry["edited_question"] = text
+        apply_pulse_suggestion_schedule(entry, action, approve=True)
+        entry["reviewed_at"] = now_iso()
+        entry["needs_admin_notify"] = False
+        return
+    raise HTTPException(status_code=400, detail="Unknown Pulse question action.")
+
+
+def verify_telegram_init_data(init_data: str) -> dict:
+    if not TELEGRAM_BOT_TOKEN:
+        raise HTTPException(status_code=503, detail="Telegram bot token is not configured")
+    if not init_data:
+        raise HTTPException(status_code=400, detail="Missing Telegram Mini App data")
+
+    params = dict(parse_qsl(init_data, keep_blank_values=True))
+    received_hash = params.pop("hash", None)
+    if not received_hash:
+        raise HTTPException(status_code=400, detail="Missing Telegram Mini App hash")
+
+    data_check_string = "\n".join(f"{key}={params[key]}" for key in sorted(params))
+    secret_key = hmac.new(b"WebAppData", TELEGRAM_BOT_TOKEN.encode("utf-8"), hashlib.sha256).digest()
+    expected_hash = hmac.new(secret_key, data_check_string.encode("utf-8"), hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(expected_hash, received_hash):
+        raise HTTPException(status_code=403, detail="Invalid Telegram Mini App signature")
+
+    try:
+        auth_date = int(params.get("auth_date") or 0)
+    except ValueError:
+        auth_date = 0
+    if auth_date and (datetime.datetime.utcnow().timestamp() - auth_date) > 86400:
+        raise HTTPException(status_code=403, detail="Telegram Mini App session expired")
+
+    try:
+        user = json.loads(params.get("user") or "{}")
+    except json.JSONDecodeError:
+        user = {}
+    if not isinstance(user, dict) or not user.get("id"):
+        raise HTTPException(status_code=400, detail="Telegram Mini App user was not provided")
+    return user
 
 
 def clipped_text(value, limit=500):
@@ -692,220 +1429,69 @@ def read_verification_flow_logs(limit=80, user_id=None, username=None, session_i
     return rows[-limit:]
 
 
-def iso_in_seconds(seconds: int) -> str:
-    return (datetime.datetime.utcnow() + datetime.timedelta(seconds=seconds)).isoformat()
+def miniapp_verification_payload(entry: dict) -> dict:
+    return {
+        "id": entry.get("id"),
+        "user_id": entry.get("user_id"),
+        "username": entry.get("username"),
+        "first_name": entry.get("first_name"),
+        "last_name": entry.get("last_name"),
+        "display_name": entry.get("display_name"),
+        "selected_pack": entry.get("selected_pack"),
+        "feedback": entry.get("feedback"),
+        "status": entry.get("status"),
+        "requested_at": entry.get("requested_at"),
+        "completed_at": entry.get("completed_at"),
+        "detail": entry.get("detail"),
+    }
 
 
-def pulse_notification_due_at() -> str:
-    return iso_in_seconds(random.randint(120, 180))
+def upsert_miniapp_verification(user: dict) -> dict:
+    now = now_iso()
+    user_id = int(user.get("id"))
+    display_name = " ".join(
+        part for part in [user.get("first_name"), user.get("last_name")] if part
+    ).strip() or user.get("username") or str(user_id)
 
-
-def iso_has_passed(value: str | None) -> bool:
-    if not value:
-        return True
-    try:
-        return datetime.datetime.fromisoformat(value) <= datetime.datetime.utcnow()
-    except ValueError:
-        return True
-
-
-def uk_now() -> datetime.datetime:
-    return datetime.datetime.now(UK_TZ)
-
-
-def pulse_day_key(at: datetime.datetime | None = None) -> str:
-    return (at or uk_now()).strftime("%Y-%m-%d")
-
-
-def pulse_day_label(day_key: str | None = None) -> str:
-    raw = day_key or pulse_day_key()
-    try:
-        parsed = datetime.date.fromisoformat(raw)
-    except ValueError:
-        return raw
-    return parsed.strftime("%d %B %Y")
-
-
-def normalized_pulse_reset_interval(value) -> int:
-    try:
-        parsed = int(value)
-    except (TypeError, ValueError):
-        return 12
-    return parsed if parsed in {1, 3, 6, 12} else 12
-
-
-def pulse_question_category(question: str | None, pulse_type: str | None = None) -> str:
-    question = (question or "").strip()
-    if question in PULSE_QUESTION_CATEGORIES:
-        return PULSE_QUESTION_CATEGORIES[question]
-    if (pulse_type or "").strip().lower() == "red":
-        return "General"
-    return "Mental health"
-
-
-def pulse_default_question_entries():
-    rows = []
-    for pool, questions in PULSE_QUESTIONS.items():
-        for question in questions:
-            rows.append({
-                "source": "default",
-                "pool": pool,
-                "category": pulse_question_category(question, pool),
-                "question": question,
-                "active": {"pool": pool, "question": question} not in pulse_disabled_questions,
-            })
-    return rows
-
-
-def pulse_approved_question_entries():
-    rows = []
-    for entry in pulse_question_suggestions:
-        if entry.get("status") != "approved":
-            continue
-        rows.append({
-            "source": "suggested",
-            "suggestion_id": entry.get("id"),
-            "pool": entry.get("pool") or "green",
-            "category": entry.get("category") or "General",
-            "question": entry.get("edited_question") or entry.get("question") or "",
-            "active": True,
+    existing = next(
+        (
+            entry for entry in miniapp_verifications
+            if int(entry.get("user_id") or 0) == user_id and entry.get("status") in {"pending", "completed"}
+        ),
+        None,
+    )
+    if existing:
+        existing.update({
+            "username": user.get("username"),
+            "first_name": user.get("first_name"),
+            "last_name": user.get("last_name"),
+            "display_name": display_name,
+            "last_seen_at": now,
         })
-    return rows
+        return existing
+
+    entry = {
+        "id": (max([int(item.get("id") or 0) for item in miniapp_verifications] or [0]) + 1),
+        "user_id": user_id,
+        "username": user.get("username"),
+        "first_name": user.get("first_name"),
+        "last_name": user.get("last_name"),
+        "display_name": display_name,
+        "status": "pending",
+        "requested_at": now,
+        "last_seen_at": now,
+        "completed_at": None,
+    }
+    miniapp_verifications.append(entry)
+    return entry
 
 
-def pulse_active_questions(pool: str):
-    active = []
-    for entry in pulse_default_question_entries() + pulse_approved_question_entries():
-        if entry.get("pool") != pool:
-            continue
-        if not entry.get("active", True):
-            continue
-        question = (entry.get("question") or "").strip()
-        if question:
-            active.append(question)
-    return active
-
-
-def pulse_question_answer_count(question: str, pool: str | None = None):
-    count = 0
-    for entry in pulse_entries:
-        if entry.get("status") != "completed":
-            continue
-        if (entry.get("question") or "").strip() != (question or "").strip():
-            continue
-        if pool and (entry.get("pulse_type") or "green") != pool:
-            continue
-        count += 1
-    return count
-
-
-def pulse_question_roster():
-    rows = []
-    current_id = 1
-    all_entries = pulse_default_question_entries() + pulse_approved_question_entries()
-    sort_key = {"Mental health": 0, "Physical health": 1, "General": 2}
-    all_entries.sort(key=lambda item: (item.get("pool") != "green", sort_key.get(item.get("category"), 99), item.get("question", "").lower()))
-    for entry in all_entries:
-        if not entry.get("active", True):
-            continue
-        rows.append({
-            "roster_id": current_id,
-            "source": entry.get("source"),
-            "suggestion_id": entry.get("suggestion_id"),
-            "pool": entry.get("pool"),
-            "category": entry.get("category"),
-            "question": entry.get("question"),
-            "answers_count": pulse_question_answer_count(entry.get("question"), entry.get("pool")),
-        })
-        current_id += 1
-    return rows
-
-
-def find_pulse_question_suggestion(suggestion_id: int):
-    for entry in pulse_question_suggestions:
-        if int(entry.get("id") or 0) == int(suggestion_id):
-            return entry
-    return None
-
-
-def prioritized_random_question(entries: list[dict], seed_value: str = "") -> dict | None:
-    if not entries:
-        return None
-    by_count = sorted(entries, key=lambda item: int(item.get("answers_count") or 0))
-    lowest_count = int(by_count[0].get("answers_count") or 0)
-    lowest_group = [item for item in by_count if int(item.get("answers_count") or 0) == lowest_count]
-    chooser = random.Random(seed_value or pulse_day_key())
-    return chooser.choice(lowest_group)
-
-
-def pulse_question_choices(pool: str, user_id=None, username=None):
-    roster = [row for row in pulse_question_roster() if row.get("pool") == pool]
-    if pool != "green":
-        return [row.get("question") for row in roster if row.get("question")]
-
-    chosen = []
-    categories = ("Mental health", "Physical health", "General")
-    identity_key = f"{pulse_day_key()}:{user_id or ''}:{(username or '').lower()}"
-    for category in categories:
-        candidate = prioritized_random_question([
-            row for row in roster
-            if row.get("category") == category and row.get("question") not in chosen
-        ], f"{identity_key}:{category}")
-        if candidate:
-            chosen.append(candidate.get("question"))
-
-    remaining = [
-        row for row in roster
-        if row.get("question") not in chosen
-    ]
-    while len(chosen) < 4 and remaining:
-        candidate = prioritized_random_question(remaining, f"{identity_key}:extra:{len(chosen)}")
-        if not candidate:
-            break
-        chosen.append(candidate.get("question"))
-        remaining = [row for row in remaining if row.get("question") != candidate.get("question")]
-
-    return [question for question in chosen if question]
-
-
-def seconds_until_next_uk_midnight() -> int:
-    current = uk_now()
-    tomorrow = (current + datetime.timedelta(days=1)).date()
-    reset_at = datetime.datetime.combine(tomorrow, datetime.time.min, tzinfo=UK_TZ)
-    return max(0, int((reset_at - current).total_seconds()))
-
-
-def pulse_reset_interval_hours() -> int:
-    return load_pulse_settings()["reset_interval_hours"]
-
-
-def next_pulse_unlock_at(now: datetime.datetime | None = None, interval_hours: int | None = None) -> datetime.datetime:
-    current = now or uk_now()
-    interval = normalized_pulse_reset_interval(interval_hours or pulse_reset_interval_hours())
-    midnight = datetime.datetime.combine(current.date(), datetime.time.min, tzinfo=UK_TZ)
-    elapsed_seconds = max(0, int((current - midnight).total_seconds()))
-    interval_seconds = interval * 3600
-    next_boundary_seconds = ((elapsed_seconds // interval_seconds) + 1) * interval_seconds
-    if next_boundary_seconds >= 24 * 3600:
-        return midnight + datetime.timedelta(days=1)
-    return midnight + datetime.timedelta(seconds=next_boundary_seconds)
-
-
-def seconds_until_next_pulse_unlock(now: datetime.datetime | None = None, interval_hours: int | None = None) -> int:
-    current = now or uk_now()
-    return max(0, int((next_pulse_unlock_at(current, interval_hours) - current).total_seconds()))
-
-
-def pulse_unlock_label(now: datetime.datetime | None = None, interval_hours: int | None = None) -> str:
-    unlock_at = next_pulse_unlock_at(now, interval_hours)
-    return unlock_at.astimezone(UK_TZ).strftime("%H:%M")
-
-
-def verify_bot_sync_secret(x_bot_sync_secret: str | None):
-    if not BOT_SYNC_SECRET:
-        raise HTTPException(status_code=503, detail="Bot sync secret is not configured")
-    if x_bot_sync_secret != BOT_SYNC_SECRET:
-        raise HTTPException(status_code=403, detail="Invalid bot sync secret")
+def update_miniapp_verification_details(entry: dict, payload: MiniappVerificationPayload) -> dict:
+    if payload.selected_pack:
+        entry["selected_pack"] = clipped_text(payload.selected_pack, 60)
+    if payload.feedback:
+        entry["feedback"] = clipped_text(payload.feedback, 1200)
+    return entry
 
 
 def merged_feature_flags(saved: dict | None = None) -> dict:
@@ -991,19 +1577,19 @@ def pulse_progress_payload(day_key: str | None = None) -> dict:
     threshold = pulse_heat_threshold()
     sent = pulse_sent_today_count(day_key)
     remaining = max(threshold - sent, 0)
-    interval_hours = pulse_reset_interval_hours()
+    green_interval_hours = pulse_green_unlock_interval_hours()
     return {
         "heat_threshold": threshold,
-        "reset_interval_hours": interval_hours,
+        "reset_interval_hours": green_interval_hours,
         "sent_today": sent,
         "remaining_today": remaining,
         "progress_percent": min(100, int((sent / max(threshold, 1)) * 100)),
         "red_unlocked": sent >= threshold,
         "day_key": day_key or pulse_day_key(),
         "day_label": pulse_day_label(day_key),
-        "next_unlock_at": next_pulse_unlock_at().isoformat(),
-        "next_unlock_label": pulse_unlock_label(),
-        "reset_seconds": seconds_until_next_pulse_unlock(),
+        "next_unlock_at": next_pulse_unlock_at(interval_hours=green_interval_hours).isoformat(),
+        "next_unlock_label": pulse_unlock_label(interval_hours=green_interval_hours),
+        "reset_seconds": seconds_until_next_pulse_unlock(interval_hours=green_interval_hours),
     }
 
 
@@ -1155,7 +1741,7 @@ def get_verified_alcove_users():
             COALESCE(t.tone_count, 0) AS tone_flags,
             COALESCE(s.active_strikes, 0) AS active_strikes
         FROM user_profiles p
-        JOIN verified_users v ON v.user_id = p.user_id
+        LEFT JOIN verified_users v ON v.user_id = p.user_id
         LEFT JOIN (
             SELECT user_id, COUNT(*) AS message_count
             FROM messages
@@ -1177,7 +1763,6 @@ def get_verified_alcove_users():
             WHERE active = 1
             GROUP BY user_id
         ) s ON s.user_id = p.user_id
-        WHERE COALESCE(p.verified_at, v.verified_at, '') != ''
         ORDER BY lower(COALESCE(p.username, p.display_name, CAST(p.user_id AS TEXT)))
         """
     )
@@ -1253,15 +1838,19 @@ def pulse_sent_today_count(day_key: str | None = None):
 
 def pulse_base_green_slots(now: datetime.datetime | None = None):
     current = now or uk_now()
-    interval = pulse_reset_interval_hours()
+    interval = pulse_green_unlock_interval_hours()
     midnight = datetime.datetime.combine(current.date(), datetime.time.min, tzinfo=UK_TZ)
     elapsed_seconds = max(0, int((current - midnight).total_seconds()))
     unlocked = 1 + (elapsed_seconds // (interval * 3600))
-    return max(1, min(4, unlocked))
+    return max(1, min(PULSE_MAX_GREEN_SLOTS, unlocked))
 
 
 def pulse_testing_unlimited() -> bool:
     return PULSE_TESTING_UNLIMITED
+
+
+def pulse_unlimited_question_submit() -> bool:
+    return PULSE_UNLIMITED_QUESTION_SUBMIT
 
 
 def pulse_heat_unlocked(day_key: str | None = None):
@@ -1361,7 +1950,7 @@ def pulse_slot_state(user_id=None, username=None, now: datetime.datetime | None 
     sent_today = pulse_sent_today_count(day)
     threshold = pulse_heat_threshold()
     testing = pulse_testing_unlimited()
-    interval_hours = pulse_reset_interval_hours()
+    green_interval_hours = pulse_green_unlock_interval_hours()
     unlocked_cycles = pulse_red_unlocked_cycles(day)
     activated_cycles = len(pulse_red_activations_for_user(user_id, username, day))
     red_ready = unlocked_cycles > activated_cycles
@@ -1376,6 +1965,7 @@ def pulse_slot_state(user_id=None, username=None, now: datetime.datetime | None 
         "day_key": day,
         "day_label": pulse_day_label(day),
         "green_total": green_total,
+        "green_max": PULSE_MAX_GREEN_SLOTS,
         "green_used": green_used,
         "green_available": green_available,
         "red_unlocked": red_unlocked,
@@ -1387,12 +1977,12 @@ def pulse_slot_state(user_id=None, username=None, now: datetime.datetime | None 
         "red_activated_cycles": activated_cycles,
         "sent_today": sent_today,
         "heat_threshold": threshold,
-        "reset_interval_hours": interval_hours,
+        "reset_interval_hours": green_interval_hours,
         "cycle_completed": min(cycle_completed, threshold),
         "remaining_today": remaining_today,
-        "next_green_unlock_at": pulse_unlock_label(current, interval_hours),
-        "next_unlock_at": next_pulse_unlock_at(current, interval_hours).isoformat(),
-        "reset_seconds": seconds_until_next_pulse_unlock(current, interval_hours),
+        "next_green_unlock_at": pulse_unlock_label(current, green_interval_hours),
+        "next_unlock_at": next_pulse_unlock_at(current, green_interval_hours).isoformat(),
+        "reset_seconds": seconds_until_next_pulse_unlock(current, green_interval_hours),
         "testing_unlimited": testing,
     }
 
@@ -1406,12 +1996,16 @@ def public_pulse_payload(entry):
         "category": entry.get("category") or pulse_question_category(entry.get("question"), entry.get("pulse_type")),
         "question": entry.get("question"),
         "sender_note": entry.get("sender_note") or entry.get("answer"),
-        "answer": entry.get("response_answer"),
+        "answer": entry.get("response_answer") or entry.get("sender_note") or entry.get("answer"),
         "status": entry.get("status"),
         "sent_at": entry.get("sent_at"),
         "delivered_at": entry.get("delivered_at"),
         "responded_at": entry.get("responded_at"),
         "day_key": entry.get("day_key"),
+        "delivery_mode": entry.get("delivery_mode") or "chain",
+        "question_owner_user_id": entry.get("question_owner_user_id"),
+        "question_owner_username": entry.get("question_owner_username"),
+        "question_owner_display_name": entry.get("question_owner_display_name"),
         "sender_user_id": entry.get("sender_user_id"),
         "sender_username": entry.get("sender_username"),
         "sender_display_name": entry.get("sender_display_name"),
@@ -1745,52 +2339,6 @@ def get_room_users():
     return sorted(users.values(), key=lambda u: (u["display_name"] or "").lower())
 
 
-def create_fox_manual_entry(video_title: str | None = None, note: str | None = None):
-    now = now_iso()
-    entry_data = {
-        "telegram_id": -9001,
-        "username": "F.O.X",
-        "display_name": "F.O.X",
-        "link": "fox://manual-entry",
-        "note": note or "F.O.X has entered the wheel.",
-        "video_title": video_title or "F.O.X wants in on the wheel",
-        "skin_id": "fox_green",
-        "video_longer_than_5_minutes": False,
-        "clip_start_seconds": None,
-        "clip_start_label": None,
-    }
-    new_entry = {
-        "id": len(wheel_entries) + len(archived_wheel_entries) + 1,
-        "round_id": state["current_round"],
-        "time": now,
-        "played": False,
-        "played_at": None,
-        "data": entry_data,
-        "submitted_url": entry_data["link"],
-        "source_domain": "fox",
-        "direct_media_url": None,
-        "download_status": "manual_ready",
-        "download_error": None,
-        "download_method": "fox-manual",
-        "local_filename": "fox-manual",
-        "local_path": "",
-        "download_started_at": None,
-        "download_completed_at": now,
-        "stream_candidate": None,
-        "download_candidate": None,
-        "processed_at": None,
-        "clip_start_seconds": None,
-        "clip_end_seconds": None,
-        "approval_status": "approved",
-        "approval_time": now,
-        "rejection_time": None,
-    }
-    wheel_entries.append(new_entry)
-    add_notification("fox", "F.O.X joined the wheel", True)
-    ws_broadcast_bundle()
-    return new_entry
-
-
 def wheel_user_key(user_id=None, username=None, display_name=None) -> str | None:
     if user_id is not None:
         return f"user:{int(user_id)}"
@@ -1957,7 +2505,6 @@ def get_ready_unplayed_entries(round_number: int):
 
 def reset_wheel_session_state() -> None:
     global current_winner, current_now_playing, current_wheel_reaction, latest_review_overlay
-    global synced_alcove_users, synced_alcove_analytics, last_bot_sync_at
 
     wheel_entries.clear()
     archived_wheel_entries.clear()
@@ -1972,9 +2519,6 @@ def reset_wheel_session_state() -> None:
     wheel_submission_limits.clear()
     muted_users.clear()
 
-    synced_alcove_users = []
-    synced_alcove_analytics = {}
-    last_bot_sync_at = None
     current_winner = None
     current_now_playing = None
     current_wheel_reaction = None
@@ -2139,21 +2683,170 @@ async def websocket_endpoint(websocket: WebSocket):
     except Exception:
         manager.disconnect(websocket)
 
+
+@app.websocket("/ws/cards")
+async def cards_websocket_endpoint(websocket: WebSocket):
+    if not cards_api_enabled():
+        await websocket.accept()
+        await websocket.close(code=1013, reason="Cards is temporarily disabled.")
+        return
+    user_id: int | None = None
+    room_code: str | None = None
+    try:
+        await websocket.accept()
+        auth_raw = await websocket.receive_text()
+        auth_payload = json.loads(auth_raw)
+        init_data = auth_payload.get("init_data") or ""
+        claimed_user_id = auth_payload.get("user_id")
+        claimed_username = auth_payload.get("username")
+        room_code = auth_payload.get("room_code")
+
+        if init_data:
+            try:
+                tg_user = verify_telegram_init_data(init_data)
+                user_id = int(tg_user.get("id"))
+                claimed_username = tg_user.get("username") or claimed_username
+            except HTTPException:
+                user_id = None
+
+        if user_id is None and claimed_user_id:
+            user_id = int(claimed_user_id)
+
+        if user_id is None:
+            await websocket.close(code=4401)
+            return
+
+        player, _is_verified = cards_resolve_player(user_id, claimed_username, find_verified_alcove_user)
+        if not player:
+            await websocket.send_text(json.dumps({
+                "event": "error",
+                "data": {"message": "Could not identify your Telegram account for Alcove Cards."},
+            }))
+            await websocket.close(code=4403)
+            return
+
+        if not room_code:
+            await websocket.send_text(json.dumps({
+                "event": "error",
+                "data": {"message": "room_code is required."},
+            }))
+            await websocket.close(code=4400)
+            return
+
+        cards_service = get_cards_service(find_verified_alcove_user)
+        cards_service.set_event_loop(asyncio.get_running_loop())
+        await cards_ws_manager.connect(room_code, user_id, websocket)
+        cards_service.attach_user(user_id, True)
+        resync = cards_service.resync_room(room_code, user_id)
+        if resync:
+            await websocket.send_text(json.dumps({"event": "resync", "data": resync}))
+
+        while True:
+            raw = await websocket.receive_text()
+            message = json.loads(raw)
+            action_payload = RoomActionPayload(
+                user_id=user_id,
+                action=message.get("action") or "",
+                payload=message.get("payload") or {},
+            )
+            result = cards_service.handle_action(room_code, action_payload)
+            await websocket.send_text(json.dumps({"event": "action_result", "data": result}))
+    except WebSocketDisconnect:
+        pass
+    except Exception:
+        pass
+    finally:
+        if user_id is not None:
+            await cards_ws_manager.disconnect(user_id)
+            if user_id:
+                get_cards_service(find_verified_alcove_user).attach_user(user_id, False)
+
+
+@app.on_event("startup")
+async def cards_startup_tasks():
+    if not cards_api_enabled():
+        print(f"[{now_iso()}] Cards API disabled; skipping cards cleanup loop.", flush=True)
+        return
+    loop = asyncio.get_running_loop()
+    service = get_cards_service(find_verified_alcove_user)
+    service.set_event_loop(loop)
+
+    async def cleanup_loop():
+        while True:
+            await asyncio.sleep(120)
+            try:
+                service.cleanup_stale()
+            except Exception:
+                pass
+
+    asyncio.create_task(cleanup_loop())
+
+
 @app.get("/")
 def root():
     return {"status": "Alcove API running"}
 
 
+def bot_sync_health() -> dict:
+    users = get_verified_alcove_users()
+    fox_db_exists = os.path.exists(FOX_LOGS_DB_PATH)
+    fox_db_count = 0
+    if fox_db_exists and not synced_alcove_users:
+        fox_db_count = len(users)
+
+    stale_days = None
+    if last_bot_sync_at:
+        try:
+            synced_at = datetime.datetime.fromisoformat(last_bot_sync_at.replace("Z", "+00:00"))
+            if synced_at.tzinfo is None:
+                synced_at = synced_at.replace(tzinfo=datetime.timezone.utc)
+            stale_days = max(0, (datetime.datetime.now(datetime.timezone.utc) - synced_at).days)
+        except ValueError:
+            stale_days = None
+
+    issues = []
+    if not BOT_SYNC_SECRET:
+        issues.append("BOT_SYNC_SECRET is not set on alcove-api.")
+    if not synced_alcove_users:
+        issues.append("No users in API memory; Spotlight reads from bot sync, not the API disk.")
+    if not fox_db_exists:
+        issues.append("fox_logs.db is missing on alcove-api (expected; F.O.X keeps the real DB on alcove-fox).")
+    if stale_days is not None and stale_days >= 1:
+        issues.append(f"Last successful bot sync was {stale_days} day(s) ago.")
+    if not issues:
+        issues.append("none")
+
+    return {
+        "bot_sync_secret_configured": bool(BOT_SYNC_SECRET),
+        "synced_users_in_memory": len(synced_alcove_users),
+        "active_user_count": len(users),
+        "fox_logs_db_on_api": fox_db_exists,
+        "fox_logs_fallback_count": fox_db_count,
+        "last_bot_sync_at": last_bot_sync_at,
+        "days_since_last_sync": stale_days,
+        "source": "bot_sync" if synced_alcove_users else "fox_logs",
+        "likely_issues": issues,
+        "fix_steps": [
+            "In Render, set the same BOT_SYNC_SECRET on both alcove-fox and alcove-api.",
+            "Confirm alcove-fox worker is Live (not crashed).",
+            "In Telegram run /syncusers then /syncapi.",
+            "Reload /api/alcove-users and expect source=bot_sync with count > 0.",
+        ],
+    }
+
+
 @app.get("/api/alcove-users")
 def alcove_users():
     users = get_verified_alcove_users()
+    health = bot_sync_health()
     return {
         "status": "ok",
         "count": len(users),
         "users": users,
-        "source": "bot_sync" if synced_alcove_users else "fox_logs",
+        "source": health["source"],
         "last_bot_sync_at": last_bot_sync_at,
         "db_available": os.path.exists(FOX_LOGS_DB_PATH),
+        "sync_health": health,
     }
 
 
@@ -2170,15 +2863,67 @@ def alcove_analytics():
     }
 
 
+@app.post("/api/verification/miniapp")
+def submit_miniapp_verification(payload: MiniappVerificationPayload):
+    if not payload.init_data:
+        raise HTTPException(status_code=400, detail="Missing Telegram Mini App data")
+    user = verify_telegram_init_data(payload.init_data)
+    entry = upsert_miniapp_verification(user)
+    update_miniapp_verification_details(entry, payload)
+    save_runtime_state()
+    return {"status": "ok", "verification": miniapp_verification_payload(entry)}
+
+
+@app.post("/api/verification/miniapp/status")
+def miniapp_verification_status(payload: MiniappVerificationPayload):
+    if not payload.init_data:
+        raise HTTPException(status_code=400, detail="Missing Telegram Mini App data")
+    user = verify_telegram_init_data(payload.init_data)
+    user_id = int(user.get("id") or 0)
+    entry = next(
+        (
+            item for item in reversed(miniapp_verifications)
+            if int(item.get("user_id") or 0) == user_id
+        ),
+        None,
+    )
+    if not entry:
+        raise HTTPException(status_code=404, detail="Mini App verification not found")
+    return {"status": "ok", "verification": miniapp_verification_payload(entry)}
+
+
+@app.post("/api/verification-log")
+def verification_log(payload: VerificationLogPayload):
+    entry = append_verification_flow_log(payload)
+    return {"status": "ok", "received_at": entry["received_at"]}
+
+
 @app.post("/api/bot-sync/alcove")
 def bot_sync_alcove(payload: BotSyncPayload, x_bot_sync_secret: str | None = Header(default=None)):
     global synced_alcove_users, synced_alcove_analytics, last_bot_sync_at
 
     verify_bot_sync_secret(x_bot_sync_secret)
 
-    synced_alcove_users = payload.users or []
-    synced_alcove_analytics = payload.analytics or {}
-    last_bot_sync_at = payload.synced_at or now_iso()
+    incoming = payload.users or []
+    users_changed = bool(incoming) and incoming != synced_alcove_users
+    analytics_changed = payload.analytics is not None and payload.analytics != synced_alcove_analytics
+    if incoming:
+        synced_alcove_users = incoming
+    elif not synced_alcove_users:
+        synced_alcove_users = []
+    else:
+        print(
+            f"[{now_iso()}] bot sync ignored empty user payload; "
+            f"keeping {len(synced_alcove_users)} synced residents",
+            flush=True,
+        )
+    if payload.analytics is not None:
+        synced_alcove_analytics = payload.analytics
+    else:
+        synced_alcove_analytics = synced_alcove_analytics or {}
+    if users_changed or analytics_changed:
+        last_bot_sync_at = payload.synced_at or now_iso()
+        save_runtime_state()
 
     return {
         "status": "ok",
@@ -2187,137 +2932,15 @@ def bot_sync_alcove(payload: BotSyncPayload, x_bot_sync_secret: str | None = Hea
     }
 
 
-def after_iso_window(value, since: datetime.datetime) -> bool:
-    if not value:
-        return False
-    try:
-        return datetime.datetime.fromisoformat(str(value)) >= since
-    except (TypeError, ValueError):
-        return False
-
-
-def activity_user_label(entry: dict, username_key="username", display_key="display_name", user_id_key="user_id") -> str:
-    username = (entry.get(username_key) or "").strip()
-    if username:
-        return f"@{username}"
-    display_name = (entry.get(display_key) or "").strip()
-    if display_name:
-        return display_name
-    user_id = entry.get(user_id_key)
-    return str(user_id or "Unknown")
-
-
-def count_by_label(entries, label_func):
-    counts = {}
-    for entry in entries:
-        label = label_func(entry)
-        counts[label] = counts.get(label, 0) + 1
-    return [
-        {"display_name": label, "count": count}
-        for label, count in sorted(counts.items(), key=lambda item: item[1], reverse=True)
-    ]
-
-
-@app.get("/api/bot-sync/activity-summary")
-def bot_activity_summary(hours: int = 3, x_bot_sync_secret: str | None = Header(default=None)):
+@app.get("/api/bot-sync/verification/pending")
+def bot_pending_miniapp_verifications(x_bot_sync_secret: str | None = Header(default=None)):
     verify_bot_sync_secret(x_bot_sync_secret)
-
-    hours = max(1, min(int(hours or 3), 24))
-    now = datetime.datetime.utcnow()
-    since = now - datetime.timedelta(hours=hours)
-
-    recent_comments = [
-        comment for comment in approved_comments
-        if after_iso_window(comment.get("time"), since)
+    entries = [
+        miniapp_verification_payload(entry)
+        for entry in miniapp_verifications
+        if entry.get("status") == "pending"
     ]
-    user_comments = [comment for comment in recent_comments if not comment.get("system")]
-    fox_comments = [comment for comment in recent_comments if comment.get("system")]
-    recent_spotlights = [
-        entry for entry in spotlight_entries
-        if after_iso_window(entry.get("time"), since)
-    ]
-    reviewed_spotlights = [
-        entry for entry in spotlight_entries
-        if after_iso_window(entry.get("reviewed_at"), since)
-    ]
-    recent_pulses = [
-        entry for entry in pulse_entries
-        if after_iso_window(entry.get("sent_at"), since)
-    ]
-    completed_pulses = [
-        entry for entry in pulse_entries
-        if after_iso_window(entry.get("responded_at"), since)
-    ]
-    recent_question_suggestions = [
-        entry for entry in pulse_question_suggestions
-        if after_iso_window(entry.get("submitted_at"), since)
-    ]
-    red_activations = [
-        entry for entry in pulse_red_activations
-        if after_iso_window(entry.get("activated_at"), since)
-    ]
-
-    return {
-        "status": "ok",
-        "window": {
-            "hours": hours,
-            "since": since.isoformat(),
-            "to": now.isoformat(),
-        },
-        "counts": {
-            "stream_comments": len(user_comments),
-            "fox_messages": len(fox_comments),
-            "spotlights_submitted": len(recent_spotlights),
-            "spotlights_approved": len([entry for entry in reviewed_spotlights if entry.get("status") == "approved"]),
-            "spotlights_rejected": len([entry for entry in reviewed_spotlights if entry.get("status") == "rejected"]),
-            "pulses_sent": len(recent_pulses),
-            "pulses_completed": len(completed_pulses),
-            "red_pulse_activations": len(red_activations),
-            "pulse_questions_submitted": len(recent_question_suggestions),
-        },
-        "top_commenters": count_by_label(
-            user_comments,
-            lambda entry: activity_user_label(entry),
-        )[:5],
-        "recent_spotlights": [
-            {
-                "id": entry.get("id"),
-                "nominator": activity_user_label(entry, "nominator_username", "nominator_display_name", "nominator_user_id"),
-                "nominee": activity_user_label(entry, "nominee_username", "nominee_display_name", "nominee_user_id"),
-                "style": entry.get("style"),
-                "status": entry.get("status"),
-                "time": entry.get("time"),
-            }
-            for entry in recent_spotlights[-5:]
-        ],
-        "recent_pulses": [
-            {
-                "id": entry.get("id"),
-                "sender": activity_user_label(entry, "sender_username", "sender_display_name", "sender_user_id"),
-                "pulse_type": entry.get("pulse_type"),
-                "status": entry.get("status"),
-                "sent_at": entry.get("sent_at"),
-            }
-            for entry in recent_pulses[-5:]
-        ],
-        "recent_pulse_questions": [
-            {
-                "id": entry.get("id"),
-                "sender": activity_user_label(entry),
-                "pool": entry.get("pool"),
-                "category": entry.get("category"),
-                "status": entry.get("status"),
-                "submitted_at": entry.get("submitted_at"),
-            }
-            for entry in recent_question_suggestions[-5:]
-        ],
-    }
-
-
-@app.post("/api/verification-log")
-def verification_log(payload: VerificationLogPayload):
-    entry = append_verification_flow_log(payload)
-    return {"status": "ok", "received_at": entry["received_at"]}
+    return {"status": "ok", "entries": entries}
 
 
 @app.get("/api/bot-sync/verification-logs")
@@ -2338,6 +2961,31 @@ def bot_verification_logs(
             session_id=session_id,
         ),
     }
+
+
+@app.post("/api/bot-sync/verification/{verification_id}")
+def bot_update_miniapp_verification(
+    verification_id: int,
+    payload: dict | None = None,
+    x_bot_sync_secret: str | None = Header(default=None),
+):
+    verify_bot_sync_secret(x_bot_sync_secret)
+    entry = next(
+        (item for item in miniapp_verifications if int(item.get("id") or 0) == int(verification_id)),
+        None,
+    )
+    if not entry:
+        return {"status": "error", "message": "Mini App verification not found."}
+    payload = payload or {}
+    status = payload.get("status")
+    if status not in {"pending", "completed", "failed"}:
+        return {"status": "error", "message": "Invalid Mini App verification status."}
+    entry["status"] = status
+    entry["completed_at"] = now_iso() if status in {"completed", "failed"} else None
+    if payload.get("detail"):
+        entry["detail"] = str(payload.get("detail"))[:500]
+    save_runtime_state()
+    return {"status": "ok", "verification": miniapp_verification_payload(entry)}
 
 
 @app.get("/api/app-state")
@@ -2441,7 +3089,7 @@ def lock_round():
 
 @app.post("/api/round/start-spin")
 def start_spin():
-    global current_winner, current_now_playing, current_video_intro
+    global current_winner, current_now_playing
     current_round = state["current_round"]
     pool = get_next_spin_pool(current_round)
 
@@ -2450,7 +3098,6 @@ def start_spin():
 
     state["round_status"] = "spinning"
     state["winner_intro_loaded"] = False
-    current_video_intro = None
     current_now_playing = None
     chosen = random.choice(pool)
     current_winner = {
@@ -2543,6 +3190,81 @@ def update_pulse_settings(payload: PulseSettingsUpdate, x_bot_sync_secret: str |
     return {"status": "ok", "settings": settings, "progress": pulse_progress_payload()}
 
 
+@app.get("/api/admin/review-queue")
+def admin_review_queue(admin_secret: str):
+    verify_admin_secret(admin_secret)
+    pending_questions = [
+        pulse_question_suggestion_admin_payload(entry)
+        for entry in pulse_question_suggestions
+        if entry.get("status") == "pending_review"
+    ]
+    reserved_questions = [
+        pulse_question_suggestion_admin_payload(entry)
+        for entry in pulse_question_suggestions
+        if entry.get("status") == "reserved"
+    ]
+    pending_spotlights = [
+        entry for entry in spotlight_entries
+        if entry.get("status") == "pending_review"
+    ]
+    today = pulse_day_key()
+    recent_answers = []
+    for entry in reversed(pulse_entries):
+        if entry.get("status") != "completed":
+            continue
+        if entry.get("day_key") != today:
+            continue
+        recent_answers.append(public_pulse_payload(entry))
+        if len(recent_answers) >= 40:
+            break
+    return {
+        "status": "ok",
+        "pulse_questions_pending": [entry for entry in pending_questions if entry],
+        "pulse_questions_reserved": [entry for entry in reserved_questions if entry],
+        "spotlights_pending": pending_spotlights,
+        "pulse_answers_today": recent_answers,
+    }
+
+
+@app.post("/api/admin/pulse-questions/{suggestion_id}")
+def admin_pulse_question_action(suggestion_id: int, payload: AdminPulseQuestionAction):
+    verify_admin_secret(payload.admin_secret)
+    entry = find_pulse_question_suggestion(suggestion_id)
+    if not entry:
+        return {"status": "error", "message": "Pulse question suggestion not found."}
+    apply_admin_pulse_question_action(entry, payload.action, payload.edited_question)
+    save_runtime_state()
+    return {"status": "ok", "entry": pulse_question_suggestion_admin_payload(entry)}
+
+
+@app.post("/api/admin/spotlights/{entry_id}")
+def admin_spotlight_action(entry_id: int, payload: AdminSpotlightAction):
+    verify_admin_secret(payload.admin_secret)
+    entry = get_spotlight_entry(entry_id)
+    if not entry:
+        return {"status": "error", "message": "Spotlight not found."}
+    action = (payload.action or "").strip().lower()
+    if action == "amend":
+        text = (payload.edited_reason or "").strip()
+        if not text:
+            raise HTTPException(status_code=400, detail="Edited Spotlight text is required.")
+        entry["edited_reason"] = text
+        entry["status"] = "pending_review"
+        entry["review_message_sent"] = False
+    elif action == "reject":
+        entry["status"] = "rejected"
+        entry["reviewed_at"] = now_iso()
+        entry["publish_pending"] = False
+    elif action == "approve":
+        entry["status"] = "approved"
+        entry["reviewed_at"] = now_iso()
+        entry["publish_pending"] = True
+    else:
+        raise HTTPException(status_code=400, detail="Unknown Spotlight action.")
+    save_runtime_state()
+    return {"status": "ok", "entry": entry}
+
+
 @app.get("/api/debug/domains")
 def debug_domains():
     return CONFIG["approved_video_domains"]
@@ -2620,8 +3342,6 @@ def submit_wheel(entry: WheelEntry):
 
     if not entry_data.get("video_title"):
         entry_data["video_title"] = derive_video_title_from_url(submitted_url)
-    if entry_data.get("skin_id"):
-        entry_data["skin_id"] = str(entry_data.get("skin_id")).strip()
 
     new_entry = {
         "id": len(wheel_entries) + len(archived_wheel_entries) + 1,
@@ -2717,7 +3437,6 @@ def current_round_ready_entries():
         {
             "entry_id": entry["id"],
             "entrant_name": entry["data"].get("display_name", "Unknown"),
-            "skin_id": entry["data"].get("skin_id"),
         }
         for entry in ready_entries
     ]
@@ -3062,7 +3781,7 @@ def retry_download(entry_id: int):
 
 @app.post("/api/spin-result")
 def set_spin_result(payload: dict):
-    global current_winner, current_video_intro
+    global current_winner
     entry_id = payload.get("entry_id")
     if entry_id is None:
         return {"status": "error", "message": "entry_id required"}
@@ -3075,7 +3794,6 @@ def set_spin_result(payload: dict):
         return {"status": "error", "message": "winner is not download-ready"}
 
     state["winner_intro_loaded"] = False
-    current_video_intro = None
     current_winner = {
         "entry_id": entry["id"],
         "entrant_name": entry["data"].get("display_name", "Unknown"),
@@ -3094,9 +3812,8 @@ def set_spin_result(payload: dict):
 
 @app.post("/api/winner/clear")
 def clear_winner():
-    global current_winner, current_video_intro
+    global current_winner
     current_winner = None
-    current_video_intro = None
     state["winner_intro_loaded"] = False
     return {"status": "ok"}
 
@@ -3104,48 +3821,6 @@ def clear_winner():
 @app.get("/api/current-winner")
 def get_current_winner():
     return current_winner
-
-
-def build_video_intro_state(payload: dict) -> dict:
-    prepared_at = int(datetime.datetime.now(datetime.timezone.utc).timestamp() * 1000)
-    entry_id = int(payload.get("entry_id") or 0) or None
-    video_title = str(payload.get("video_title") or payload.get("title") or "").strip() or "Untitled video"
-    display_name = str(payload.get("display_name") or payload.get("entrant_name") or "").strip() or "Unknown"
-    username = str(payload.get("username") or "").strip().lstrip("@")
-    intro_key = hashlib.sha1(f"{entry_id}-{video_title}-{display_name}-{username}-{prepared_at}".encode("utf-8")).hexdigest()[:12]
-    return {
-        "entry_id": entry_id,
-        "video_title": video_title,
-        "display_name": display_name,
-        "username": username,
-        "intro_key": intro_key,
-        "prepared_at": prepared_at,
-    }
-
-
-@app.get("/api/video-intro/current")
-def get_video_intro_current():
-    return {
-        "status": "ok",
-        "active": bool(current_video_intro),
-        "intro": current_video_intro,
-    }
-
-
-@app.post("/api/video-intro/current")
-def set_video_intro_current(payload: dict):
-    global current_video_intro
-    if payload.get("clear"):
-        current_video_intro = None
-        state["winner_intro_loaded"] = False
-        ws_broadcast_bundle()
-        return {"status": "ok", "active": False, "intro": None}
-    try:
-        current_video_intro = build_video_intro_state(payload)
-    except Exception as exc:
-        return {"status": "error", "message": str(exc)}
-    ws_broadcast_bundle()
-    return {"status": "ok", "active": True, "intro": current_video_intro}
 
 
 @app.post("/api/winner/intro-loaded/{entry_id}")
@@ -3358,7 +4033,6 @@ def submit_stream_comment(comment: StreamComment):
             "username": comment.username,
             "display_name": display_name,
             "text": text,
-            "skin_id": (comment.skin_id or "").strip() or None,
             "time": now_iso(),
             "approved": True,
         }
@@ -3366,40 +4040,6 @@ def submit_stream_comment(comment: StreamComment):
     add_notification("comment", f"{display_name}: {text}", False)
     ws_broadcast_bundle()
     return {"status": "ok", "message": "Message sent."}
-
-
-@app.post("/api/admin/fox-message")
-def post_fox_message(payload: FoxMessagePayload):
-    text = payload.text.strip()
-    if not text:
-        return {"status": "error", "message": "Message cannot be empty."}
-    if len(text) > 220:
-        return {"status": "error", "message": "F.O.X messages must be 220 characters or fewer."}
-    approved_comments.append(
-        {
-            "comment_id": get_next_comment_id(),
-            "user_id": -9001,
-            "username": "F.O.X",
-            "display_name": "F.O.X",
-            "text": text,
-            "skin_id": "fox_green",
-            "time": now_iso(),
-            "approved": True,
-            "system": True,
-        }
-    )
-    add_notification("fox", f"F.O.X: {text}", True)
-    ws_broadcast_bundle()
-    return {"status": "ok", "message": "F.O.X message posted."}
-
-
-@app.post("/api/admin/fox-wheel-entry")
-def post_fox_wheel_entry(payload: FoxWheelEntryPayload | None = None):
-    entry = create_fox_manual_entry(
-        video_title=payload.video_title if payload else None,
-        note=payload.note if payload else None,
-    )
-    return {"status": "ok", "entry_id": entry["id"], "entry": entry}
 
 
 @app.get("/api/comments/pending")
@@ -3621,7 +4261,7 @@ def submit_spotlight(entry: SpotlightEntry):
             f"nominee_user_id={entry.nominee_user_id} nominee_username={entry.nominee_username!r}",
             flush=True,
         )
-        return {"status": "error", "message": "That user is not a verified Alcove resident."}
+        return {"status": "error", "message": "That user is not in the Alcove member list."}
 
     if not entry.nominator_user_id and not entry.nominator_username:
         print(
@@ -3665,6 +4305,8 @@ def submit_spotlight(entry: SpotlightEntry):
     data["review_message_sent"] = False
     data["reviewed_by"] = None
     data["reviewed_at"] = None
+    data["publish_pending"] = False
+    data["published_at"] = None
     data["nominee_user_id"] = nominee.get("user_id")
     data["nominee_username"] = nominee.get("username")
     data["nominee_display_name"] = nominee.get("display_name") or nominee.get("label")
@@ -3681,6 +4323,19 @@ def submit_spotlight(entry: SpotlightEntry):
         )
     spotlight_entries.append(data)
     save_runtime_state()
+    telegram_admin_notify(
+        "\n".join([
+            "<b>New Spotlight submitted</b>",
+            f"ID: <code>{data['id']}</code>",
+            f"Nominee: <b>{escape(data.get('nominee_display_name') or data.get('nominee_username') or 'Unknown')}</b>",
+            f"Style: <b>{escape(data.get('style') or 'Spotlight')}</b>",
+            "",
+            f"<code>{escape((entry.reason or '').strip())}</code>",
+            "",
+            "Review in Feature Admin or wait for F.O.X review buttons.",
+        ]),
+        SPOTLIGHT_REVIEW_TOPIC_ID,
+    )
     print(
         f"[{now_iso()}] spotlight submit success spotlight_id={data['id']} "
         f"nominator_user_id={data.get('nominator_user_id')} nominee_user_id={data.get('nominee_user_id')} "
@@ -3721,6 +4376,16 @@ def bot_pending_spotlights(x_bot_sync_secret: str | None = Header(default=None))
     return {"status": "ok", "entries": entries}
 
 
+@app.get("/api/bot-sync/spotlights/publish-pending")
+def bot_publish_pending_spotlights(x_bot_sync_secret: str | None = Header(default=None)):
+    verify_bot_sync_secret(x_bot_sync_secret)
+    entries = [
+        entry for entry in spotlight_entries
+        if entry.get("status") == "approved" and entry.get("publish_pending") and not entry.get("published_at")
+    ]
+    return {"status": "ok", "entries": entries}
+
+
 @app.post("/api/bot-sync/spotlights/{entry_id}")
 def bot_update_spotlight(entry_id: int, payload: SpotlightReviewUpdate, x_bot_sync_secret: str | None = Header(default=None)):
     verify_bot_sync_secret(x_bot_sync_secret)
@@ -3738,6 +4403,12 @@ def bot_update_spotlight(entry_id: int, payload: SpotlightReviewUpdate, x_bot_sy
         entry["reviewed_by"] = payload.reviewed_by
     if payload.reviewed_at is not None:
         entry["reviewed_at"] = payload.reviewed_at
+    if payload.publish_pending is not None:
+        entry["publish_pending"] = bool(payload.publish_pending)
+    if payload.published_at is not None:
+        entry["published_at"] = payload.published_at
+    if payload.status == "approved" and not entry.get("published_at"):
+        entry["publish_pending"] = True
     save_runtime_state()
 
     return {"status": "ok", "entry": entry}
@@ -3767,6 +4438,28 @@ def submit_pulse_question_suggestion(payload: PulseQuestionSuggestion):
         print(f"[{now_iso()}] pulse question submit rejected: missing Telegram identity", flush=True)
         return {"status": "error", "message": "Could not identify your Telegram account. Please open the Mini App from Telegram and try again."}
 
+    today = pulse_day_key()
+    user_id = identity.get("user_id")
+    username = (identity.get("username") or "").lower()
+    if not pulse_unlimited_question_submit():
+        for existing in pulse_question_suggestions:
+            if existing.get("day_key") != today:
+                continue
+            if existing.get("status") == "rejected":
+                continue
+            same_user = user_id and int(existing.get("user_id") or 0) == int(user_id)
+            same_username = username and (existing.get("username") or "").lower() == username
+            if same_user or same_username:
+                print(
+                    f"[{now_iso()}] pulse question submit rejected: already submitted today "
+                    f"user_id={user_id} username={username!r}",
+                    flush=True,
+                )
+                return {
+                    "status": "error",
+                    "message": "You already submitted a Pulse for tomorrow today.",
+                }
+
     pool = (payload.pool or "green").strip().lower()
     category = (payload.category or "").strip()
     question = (payload.question or "").strip()
@@ -3780,8 +4473,9 @@ def submit_pulse_question_suggestion(payload: PulseQuestionSuggestion):
         return {"status": "error", "message": "Please choose a valid category."}
     if len(question) < 8:
         print(f"[{now_iso()}] pulse question submit rejected: question too short", flush=True)
-        return {"status": "error", "message": "Please add a little more detail before sending your question."}
+        return {"status": "error", "message": "Please add a little more detail before submitting your Pulse."}
 
+    schedule_mode = normalize_pulse_schedule_mode(payload.schedule_mode) if payload.schedule_mode else None
     entry = {
         "id": len(pulse_question_suggestions) + 1,
         "pool": pool,
@@ -3794,21 +4488,77 @@ def submit_pulse_question_suggestion(payload: PulseQuestionSuggestion):
         "username": identity.get("username"),
         "display_name": identity.get("display_name") or identity.get("label"),
         "status": "pending_review",
+        "schedule_mode": None,
+        "needs_admin_notify": True,
         "review_message_sent": False,
         "reviewed_at": None,
         "reviewed_by": None,
+        "active_from_day_key": None,
     }
     pulse_question_suggestions.append(entry)
     save_runtime_state()
+    submitter = entry.get("display_name") or entry.get("username") or entry.get("user_id")
+    telegram_admin_notify(
+        "\n".join([
+            "<b>New Pulse question submitted</b>",
+            f"ID: <code>{entry['id']}</code>",
+            f"Pool: <b>{escape(pool.title())}</b>",
+            f"Category: <b>{escape(category)}</b>",
+            f"From: <b>{escape(str(submitter))}</b>",
+            "",
+            f"<code>{escape(question)}</code>",
+            "",
+            "Review in Feature Admin or wait for F.O.X review buttons.",
+        ]),
+        PULSE_QUESTIONS_TOPIC_ID,
+    )
     print(
         f"[{now_iso()}] pulse question submit success suggestion_id={entry['id']} "
-        f"pool={pool} category={category!r} user_id={identity.get('user_id')} username={identity.get('username')!r}",
+        f"pool={pool} category={category!r} status={entry.get('status')} "
+        f"user_id={identity.get('user_id')} username={identity.get('username')!r}",
         flush=True,
     )
     return {
         "status": "ok",
-        "message": "Question saved for a future Pulse round.",
+        "message": "Pulse sent for admin review. If approved, it will go live on the roster.",
         "entry": entry,
+    }
+
+
+@app.get("/api/pulse-question-suggestions/status")
+def pulse_question_suggestion_status(user_id: int | None = None, username: str | None = None):
+    identity = pulse_user_identity(user_id, username)
+    if not identity:
+        return {"status": "error", "message": "Could not identify this Pulse user."}
+
+    today = pulse_day_key()
+    user_id = identity.get("user_id")
+    username = (identity.get("username") or "").lower()
+    for existing in pulse_question_suggestions:
+        if existing.get("day_key") != today:
+            continue
+        if existing.get("status") == "rejected":
+            continue
+        same_user = user_id and int(existing.get("user_id") or 0) == int(user_id)
+        same_username = username and (existing.get("username") or "").lower() == username
+        if not (same_user or same_username):
+            continue
+        return {
+            "status": "ok",
+            "submitted_today": True,
+            "review_status": existing.get("status"),
+            "message": (
+                "Your Pulse for tomorrow is already with F.O.X for review."
+                if existing.get("status") == "pending_review"
+                else "Your Pulse for tomorrow has already been approved."
+            ),
+            "entry": existing,
+        }
+
+    return {
+        "status": "ok",
+        "submitted_today": False,
+        "message": "You can submit one Pulse for tomorrow today.",
     }
 
 
@@ -3843,6 +4593,7 @@ def get_pulse_status(user_id: int | None = None, username: str | None = None):
         "received": receipts,
         "responded": responded,
         "sent": sent,
+        "my_pulses": pulse_my_pulses_payload(identity),
         "pending_queue": len([entry for entry in pulse_entries_for_day() if entry.get("status") == "queued"]),
     }
 
@@ -3850,6 +4601,12 @@ def get_pulse_status(user_id: int | None = None, username: str | None = None):
 @app.get("/api/pulse-question-roster")
 def get_pulse_question_roster():
     return {"status": "ok", "questions": pulse_question_roster()}
+
+
+@app.get("/api/pulse-daily-spread")
+def get_pulse_daily_spread(day: str | None = None):
+    day_key = (day or "").strip() or None
+    return {"status": "ok", **pulse_daily_spread_report(day_key)}
 
 
 @app.post("/api/pulse-red-activate")
@@ -3893,14 +4650,22 @@ def submit_pulse(entry: PulseEntry):
         print(f"[{now_iso()}] pulse submit rejected: unknown pulse type {pulse_type!r}", flush=True)
         return {"status": "error", "message": "Unknown Pulse type."}
 
-    sender_note = (entry.answer or "").strip()
+    answer_text = (entry.answer or "").strip()
     question = (entry.question or "").strip()
-    if len(sender_note) < 3:
+    if len(answer_text) < 3:
         print(f"[{now_iso()}] pulse submit rejected: answer too short", flush=True)
-        return {"status": "error", "message": "Please add your own anonymous answer before sending your Pulse."}
+        return {"status": "error", "message": "Please add your anonymous answer before submitting."}
     if question not in pulse_active_questions(pulse_type):
         print(f"[{now_iso()}] pulse submit rejected: question not active", flush=True)
-        return {"status": "error", "message": "Please choose one of the current Pulse questions."}
+        return {"status": "error", "message": "Please choose one of today's Pulses."}
+
+    owner = pulse_question_owner(question, pulse_type)
+    if owner and pulse_identities_match(identity, owner):
+        print(f"[{now_iso()}] pulse submit rejected: self-answer blocked", flush=True)
+        return {"status": "error", "message": "You can't answer your own Pulse."}
+    if pulse_user_answered_question_today(identity, question, pulse_type):
+        print(f"[{now_iso()}] pulse submit rejected: duplicate answer today", flush=True)
+        return {"status": "error", "message": "You already answered that Pulse today."}
 
     slots = pulse_slot_state(identity.get("user_id"), identity.get("username"))
     if pulse_type == "green" and slots["green_available"] <= 0:
@@ -3910,46 +4675,82 @@ def submit_pulse(entry: PulseEntry):
         print(f"[{now_iso()}] pulse submit rejected: no red slot available", flush=True)
         return {"status": "error", "message": "A red Pulse is not available right now."}
 
+    responded_at = now_iso()
     data = {
         "id": len(pulse_entries) + 1,
         "day_key": pulse_day_key(),
         "pulse_type": pulse_type,
         "category": pulse_question_category(question, pulse_type),
         "question": question,
-        "sender_note": sender_note,
-        "answer": sender_note,
+        "sender_note": answer_text,
+        "answer": answer_text,
         "sender_user_id": identity.get("user_id"),
         "sender_username": identity.get("username"),
         "sender_display_name": identity.get("display_name") or identity.get("label"),
-        "sent_at": now_iso(),
-        "status": "queued",
+        "sent_at": responded_at,
+        "status": "completed",
+        "delivery_mode": "question_answer",
+        "question_owner_user_id": owner.get("user_id") if owner else None,
+        "question_owner_username": owner.get("username") if owner else None,
+        "question_owner_display_name": owner.get("display_name") if owner else None,
         "delivered_to_user_id": None,
         "delivered_to_username": None,
         "delivered_to_display_name": None,
         "delivered_at": None,
         "assignment_notified_at": None,
         "assignment_notify_after": None,
-        "response_answer": None,
-        "responded_at": None,
+        "response_answer": answer_text,
+        "responded_at": responded_at,
+        "responder_user_id": identity.get("user_id"),
+        "responder_username": identity.get("username"),
+        "responder_display_name": identity.get("display_name") or identity.get("label"),
         "admin_posted_at": None,
     }
     pulse_entries.append(data)
+    receipt = None
+    if owner and not pulse_identities_match(identity, owner):
+        receipt = {
+            "id": len(pulse_receipts) + 1,
+            "pulse_id": data["id"],
+            "recipient_user_id": owner.get("user_id"),
+            "recipient_username": owner.get("username"),
+            "recipient_display_name": owner.get("display_name"),
+            "received_at": responded_at,
+            "acknowledged_at": None,
+            "notified_at": None,
+            "notify_after": pulse_notification_due_at(),
+        }
+        pulse_receipts.append(receipt)
     save_runtime_state()
-    assigned = pulse_match_next_receiver(identity, exclude_entry_id=data["id"])
+    telegram_admin_notify(
+        "\n".join([
+            "<b>New Pulse answer</b>",
+            f"Question: <code>{escape(question)}</code>",
+            f"Type: <b>{escape(pulse_type.title())}</b>",
+            f"Category: <b>{escape(data.get('category') or 'General')}</b>",
+        ]),
+        PULSE_REPORTS_TOPIC_ID,
+    )
     print(
         f"[{now_iso()}] pulse submit success pulse_id={data['id']} pulse_type={pulse_type} "
         f"sender_user_id={identity.get('user_id')} sender_username={identity.get('username')!r} "
-        f"assigned_to_user_id={assigned.get('delivered_to_user_id') if assigned else None} queued={assigned is None}",
+        f"owner_user_id={owner.get('user_id') if owner else None} receipt_id={receipt.get('id') if receipt else None}",
         flush=True,
     )
     updated_slots = pulse_slot_state(identity.get("user_id"), identity.get("username"))
     add_notification("pulse", "Anonymous Pulse submitted", False)
+    message = (
+        "You answered someone's Pulse. If they submitted that Pulse, they'll receive your anonymous answer."
+        if receipt
+        else "You answered a Pulse."
+    )
     return {
         "status": "ok",
+        "message": message,
         "pulse_id": data["id"],
         "slots": updated_slots,
-        "assigned": public_pulse_payload(assigned) if assigned else None,
-        "queued": assigned is None,
+        "delivered_to_owner": bool(receipt),
+        "receipt": pulse_receipt_payload(receipt) if receipt else None,
     }
 
 
@@ -4126,14 +4927,165 @@ def bot_export_pulses(x_bot_sync_secret: str | None = Header(default=None)):
     return {"status": "ok", "entries": entries}
 
 
+@app.get("/api/bot-sync/pulses/answers")
+def bot_pulse_answers(
+    q: str | None = None,
+    day: str | None = None,
+    suggestion_id: int | None = None,
+    limit: int = 20,
+    x_bot_sync_secret: str | None = Header(default=None),
+):
+    verify_bot_sync_secret(x_bot_sync_secret)
+    needle = (q or "").strip().lower()
+    day_key = (day or "").strip() or None
+    max_rows = max(1, min(int(limit or 20), 100))
+    rows = []
+    for entry in pulse_entries:
+        if entry.get("status") != "completed":
+            continue
+        if day_key and entry.get("day_key") != day_key:
+            continue
+        payload = public_pulse_payload(entry) or {}
+        question = (payload.get("question") or "").strip()
+        if suggestion_id:
+            suggestion = find_pulse_question_suggestion(suggestion_id)
+            if not suggestion:
+                continue
+            if pulse_suggestion_question(suggestion) != question:
+                continue
+        if needle and needle not in question.lower() and needle not in (payload.get("answer") or "").lower():
+            continue
+        rows.append(payload)
+    rows.sort(key=lambda item: item.get("responded_at") or item.get("sent_at") or "", reverse=True)
+    return {"status": "ok", "entries": rows[:max_rows], "total": len(rows)}
+
+
 @app.get("/api/bot-sync/pulse-questions/pending")
 def bot_pending_pulse_question_suggestions(x_bot_sync_secret: str | None = Header(default=None)):
     verify_bot_sync_secret(x_bot_sync_secret)
     entries = [
-        entry for entry in pulse_question_suggestions
+        pulse_question_suggestion_admin_payload(entry)
+        for entry in pulse_question_suggestions
         if entry.get("status") == "pending_review" and not entry.get("review_message_sent")
     ]
+    entries = [entry for entry in entries if entry]
+    entries.sort(key=lambda item: item.get("submitted_at") or "", reverse=True)
     return {"status": "ok", "entries": entries}
+
+
+@app.get("/api/bot-sync/pulse-questions/reserved-list")
+def bot_reserved_pulse_question_list(x_bot_sync_secret: str | None = Header(default=None)):
+    verify_bot_sync_secret(x_bot_sync_secret)
+    entries = [
+        pulse_question_suggestion_admin_payload(entry)
+        for entry in pulse_question_suggestions
+        if entry.get("status") == "reserved"
+    ]
+    entries = [entry for entry in entries if entry]
+    entries.sort(key=lambda item: item.get("submitted_at") or "", reverse=True)
+    return {"status": "ok", "entries": entries}
+
+
+@app.post("/api/bot-sync/pulse-questions/by-id/{suggestion_id}/schedule")
+def bot_schedule_reserved_pulse_question(
+    suggestion_id: int,
+    payload: dict | None = None,
+    x_bot_sync_secret: str | None = Header(default=None),
+):
+    verify_bot_sync_secret(x_bot_sync_secret)
+    entry = find_pulse_question_suggestion(suggestion_id)
+    if not entry:
+        return {"status": "error", "message": "Pulse question suggestion not found."}
+    payload = payload or {}
+    day_key = (payload.get("active_from_day_key") or payload.get("day") or "").strip()
+    if not day_key:
+        return {"status": "error", "message": "active_from_day_key is required."}
+    entry["status"] = "approved"
+    entry["schedule_mode"] = "reserve"
+    entry["active_from_day_key"] = day_key
+    if payload.get("reviewed_by") is not None:
+        entry["reviewed_by"] = payload.get("reviewed_by")
+    entry["reviewed_at"] = payload.get("reviewed_at") or now_iso()
+    save_runtime_state()
+    return {"status": "ok", "entry": pulse_question_suggestion_admin_payload(entry)}
+
+
+@app.get("/api/bot-sync/pulse-questions/pending-list")
+def bot_pending_pulse_question_list(x_bot_sync_secret: str | None = Header(default=None)):
+    verify_bot_sync_secret(x_bot_sync_secret)
+    entries = [
+        pulse_question_suggestion_admin_payload(entry)
+        for entry in pulse_question_suggestions
+        if entry.get("status") == "pending_review"
+    ]
+    entries = [entry for entry in entries if entry]
+    entries.sort(key=lambda item: item.get("submitted_at") or "", reverse=True)
+    return {"status": "ok", "entries": entries}
+
+
+@app.get("/api/bot-sync/pulse-questions/approved-list")
+def bot_approved_pulse_question_list(x_bot_sync_secret: str | None = Header(default=None)):
+    verify_bot_sync_secret(x_bot_sync_secret)
+    entries = [
+        pulse_question_suggestion_admin_payload(entry)
+        for entry in pulse_question_suggestions
+        if entry.get("status") == "approved"
+    ]
+    entries = [entry for entry in entries if entry]
+    entries.sort(key=lambda item: (item.get("active_from_day_key") or "", item.get("submitted_at") or ""), reverse=True)
+    return {"status": "ok", "entries": entries}
+
+
+@app.get("/api/bot-sync/pulse-questions/rejected-list")
+def bot_rejected_pulse_question_list(x_bot_sync_secret: str | None = Header(default=None)):
+    verify_bot_sync_secret(x_bot_sync_secret)
+    entries = [
+        pulse_question_suggestion_admin_payload(entry)
+        for entry in pulse_question_suggestions
+        if entry.get("status") == "rejected"
+    ]
+    entries = [entry for entry in entries if entry]
+    entries.sort(key=lambda item: item.get("submitted_at") or "", reverse=True)
+    return {"status": "ok", "entries": entries}
+
+
+@app.post("/api/bot-sync/pulse-questions/create")
+def bot_create_pulse_question(payload: dict | None = None, x_bot_sync_secret: str | None = Header(default=None)):
+    verify_bot_sync_secret(x_bot_sync_secret)
+    payload = payload or {}
+    pool = (payload.get("pool") or "green").strip().lower()
+    category = (payload.get("category") or "General").strip()
+    question = (payload.get("question") or "").strip()
+    allowed_categories = {"Mental health", "Physical health", "General"}
+    if pool not in {"green", "red"}:
+        return {"status": "error", "message": "Pool must be green or red."}
+    if category not in allowed_categories:
+        return {"status": "error", "message": "Category must be Mental health, Physical health, or General."}
+    if len(question) < 8:
+        return {"status": "error", "message": "Question is too short."}
+
+    active_from = (payload.get("active_from_day_key") or pulse_next_day_key()).strip()
+    entry = {
+        "id": len(pulse_question_suggestions) + 1,
+        "pool": pool,
+        "category": category,
+        "question": question,
+        "edited_question": None,
+        "submitted_at": now_iso(),
+        "day_key": pulse_day_key(),
+        "user_id": payload.get("created_by_user_id"),
+        "username": payload.get("created_by_username"),
+        "display_name": payload.get("created_by_display_name") or "F.O.X admin",
+        "status": "approved",
+        "review_message_sent": True,
+        "reviewed_at": now_iso(),
+        "reviewed_by": payload.get("reviewed_by"),
+        "active_from_day_key": active_from,
+        "source": "admin",
+    }
+    pulse_question_suggestions.append(entry)
+    save_runtime_state()
+    return {"status": "ok", "entry": pulse_question_suggestion_admin_payload(entry)}
 
 
 @app.get("/api/bot-sync/pulse-questions/roster")
@@ -4142,7 +5094,21 @@ def bot_pulse_question_roster(x_bot_sync_secret: str | None = Header(default=Non
     return {"status": "ok", "questions": pulse_question_roster()}
 
 
-@app.get("/api/bot-sync/pulse-questions/{suggestion_id}")
+@app.get("/api/bot-sync/pulses/daily-spread")
+def bot_pulse_daily_spread_alias(day: str | None = None, x_bot_sync_secret: str | None = Header(default=None)):
+    verify_bot_sync_secret(x_bot_sync_secret)
+    day_key = (day or "").strip() or None
+    return {"status": "ok", **pulse_daily_spread_report(day_key)}
+
+
+@app.get("/api/bot-sync/pulse-questions/daily-spread")
+def bot_pulse_daily_spread(day: str | None = None, x_bot_sync_secret: str | None = Header(default=None)):
+    verify_bot_sync_secret(x_bot_sync_secret)
+    day_key = (day or "").strip() or None
+    return {"status": "ok", **pulse_daily_spread_report(day_key)}
+
+
+@app.get("/api/bot-sync/pulse-questions/by-id/{suggestion_id}")
 def bot_pulse_question_suggestion(suggestion_id: int, x_bot_sync_secret: str | None = Header(default=None)):
     verify_bot_sync_secret(x_bot_sync_secret)
     entry = find_pulse_question_suggestion(suggestion_id)
@@ -4151,7 +5117,7 @@ def bot_pulse_question_suggestion(suggestion_id: int, x_bot_sync_secret: str | N
     return {"status": "ok", "entry": entry}
 
 
-@app.post("/api/bot-sync/pulse-questions/{suggestion_id}")
+@app.post("/api/bot-sync/pulse-questions/by-id/{suggestion_id}")
 def bot_update_pulse_question_suggestion(suggestion_id: int, payload: dict | None = None, x_bot_sync_secret: str | None = Header(default=None)):
     verify_bot_sync_secret(x_bot_sync_secret)
     entry = find_pulse_question_suggestion(suggestion_id)
@@ -4162,6 +5128,12 @@ def bot_update_pulse_question_suggestion(suggestion_id: int, payload: dict | Non
         entry["edited_question"] = (payload.get("edited_question") or "").strip() or None
     if "category" in payload:
         entry["category"] = payload.get("category") or entry.get("category")
+    if "schedule_mode" in payload:
+        entry["schedule_mode"] = normalize_pulse_schedule_mode(payload.get("schedule_mode"))
+    if "active_from_day_key" in payload:
+        entry["active_from_day_key"] = (payload.get("active_from_day_key") or "").strip() or None
+    if "needs_admin_notify" in payload:
+        entry["needs_admin_notify"] = bool(payload.get("needs_admin_notify"))
     if "status" in payload:
         entry["status"] = payload.get("status")
     if "review_message_sent" in payload:
@@ -4170,8 +5142,24 @@ def bot_update_pulse_question_suggestion(suggestion_id: int, payload: dict | Non
         entry["reviewed_by"] = payload.get("reviewed_by")
     if "reviewed_at" in payload:
         entry["reviewed_at"] = payload.get("reviewed_at")
+    if payload.get("approve"):
+        apply_pulse_suggestion_schedule(
+            entry,
+            payload.get("schedule_mode") or entry.get("schedule_mode"),
+            approve=True,
+        )
+    elif entry.get("status") == "approved" and not entry.get("active_from_day_key"):
+        apply_pulse_suggestion_schedule(entry, entry.get("schedule_mode"), approve=True)
     save_runtime_state()
     return {"status": "ok", "entry": entry}
+
+
+@app.post("/api/bot-sync/pulse-questions/roster/clear")
+def bot_clear_pulse_question_roster(payload: dict | None = None, x_bot_sync_secret: str | None = Header(default=None)):
+    verify_bot_sync_secret(x_bot_sync_secret)
+    payload = payload or {}
+    result = clear_pulse_question_roster(payload.get("reviewed_by"))
+    return {"status": "ok", **result}
 
 
 @app.post("/api/bot-sync/pulse-questions/roster/{roster_id}/delete")
@@ -4282,9 +5270,10 @@ def bot_pending_pulse_notifications(x_bot_sync_secret: str | None = Header(defau
         payload = pulse_receipt_payload(receipt)
         if not payload:
             continue
+        delivery_mode = payload.get("delivery_mode") or "chain"
         rows.append({
             "notification_id": f"receipt-{receipt.get('id')}",
-            "kind": "reply_received",
+            "kind": "question_answered" if delivery_mode == "question_answer" else "reply_received",
             "receipt_id": receipt.get("id"),
             "recipient_user_id": receipt.get("recipient_user_id"),
             "recipient_username": receipt.get("recipient_username"),
@@ -4343,3 +5332,138 @@ def submit_story(payload: dict):
 @app.get("/api/story-entries")
 def list_story():
     return story_entries
+
+
+@app.get("/api/membership/status")
+def membership_status(user_id: int | None = None, username: str | None = None):
+    user = find_verified_alcove_user(user_id, username) or pulse_user_identity(user_id, username)
+    if not user:
+        return {
+            "status": "error",
+            "verified": False,
+            "message": "Verified Alcove membership required.",
+        }
+    return {
+        "status": "ok",
+        "verified": True,
+        "user": {
+            "user_id": user.get("user_id"),
+            "username": user.get("username"),
+            "display_name": user.get("display_name") or user.get("label"),
+        },
+    }
+
+
+# ---------------------------------
+# Alcove Cards multiplayer
+# ---------------------------------
+
+@app.get("/api/cards/status")
+def cards_status(user_id: int | None = None, username: str | None = None):
+    if not cards_api_enabled():
+        user = find_verified_alcove_user(user_id, username)
+        if not user:
+            return {
+                "status": "error",
+                "verified": False,
+                "online_allowed": False,
+                "cards_disabled": True,
+                "message": "Verified Alcove membership required.",
+            }
+        return {
+            "status": "ok",
+            "verified": True,
+            "online_allowed": False,
+            "cards_disabled": True,
+            "user": {
+                "user_id": user.get("user_id"),
+                "username": user.get("username"),
+                "display_name": user.get("display_name") or user.get("label"),
+            },
+        }
+    return get_cards_service(find_verified_alcove_user).status(user_id, username)
+
+
+@app.get("/api/cards/rooms/{code}/sync")
+def cards_sync_room(code: str, user_id: int | None = None, username: str | None = None):
+    ensure_cards_api_enabled()
+    return get_cards_service(find_verified_alcove_user).sync_room(code, user_id, username)
+
+
+@app.get("/api/cards/profile")
+def cards_profile(user_id: int | None = None, username: str | None = None):
+    ensure_cards_api_enabled()
+    user = find_verified_alcove_user(user_id, username)
+    if not user:
+        return {"status": "error", "message": "Verified Alcove membership required."}
+    return {"status": "ok", "profile": profile_summary(int(user["user_id"]))}
+
+
+@app.get("/api/cards/challenges")
+def cards_challenges(user_id: int | None = None, username: str | None = None):
+    ensure_cards_api_enabled()
+    user = find_verified_alcove_user(user_id, username)
+    if not user:
+        return {"status": "error", "message": "Verified Alcove membership required."}
+    profile = profile_summary(int(user["user_id"]))
+    return {"status": "ok", "challenges": profile.get("challenges") or {}}
+
+
+@app.post("/api/cards/rooms")
+def cards_create_room(payload: CreateRoomPayload):
+    ensure_cards_api_enabled()
+    return get_cards_service(find_verified_alcove_user).create_room(payload)
+
+
+@app.post("/api/cards/rooms/{code}/join")
+def cards_join_room(code: str, payload: JoinRoomPayload):
+    ensure_cards_api_enabled()
+    return get_cards_service(find_verified_alcove_user).join_room(code, payload)
+
+
+@app.delete("/api/cards/rooms/{code}")
+def cards_leave_room(code: str, user_id: int):
+    ensure_cards_api_enabled()
+    return get_cards_service(find_verified_alcove_user).leave_room(user_id)
+
+
+@app.post("/api/cards/queue/join")
+def cards_join_queue(payload: QueuePayload):
+    ensure_cards_api_enabled()
+    return get_cards_service(find_verified_alcove_user).join_queue(payload)
+
+
+@app.post("/api/cards/queue/leave")
+def cards_leave_queue(payload: UserIdPayload):
+    ensure_cards_api_enabled()
+    return get_cards_service(find_verified_alcove_user).leave_queue(payload.user_id)
+
+
+@app.post("/api/cards/loadout")
+def cards_save_loadout(payload: LoadoutPayload):
+    ensure_cards_api_enabled()
+    return get_cards_service(find_verified_alcove_user).set_loadout(payload)
+
+
+@app.post("/api/cards/rooms/{code}/action")
+def cards_room_action(code: str, payload: RoomActionPayload):
+    ensure_cards_api_enabled()
+    return get_cards_service(find_verified_alcove_user).handle_action(code, payload)
+
+
+@app.get("/api/bot-sync/cards/rewards/pending")
+def bot_cards_pending_rewards(x_bot_sync_secret: str | None = Header(default=None)):
+    verify_bot_sync_secret(x_bot_sync_secret)
+    if not cards_api_enabled():
+        return {"status": "ok", "rewards": []}
+    return {"status": "ok", "rewards": fetch_pending_rewards()}
+
+
+@app.post("/api/bot-sync/cards/rewards/claim")
+def bot_cards_claim_rewards(payload: dict | None = None, x_bot_sync_secret: str | None = Header(default=None)):
+    verify_bot_sync_secret(x_bot_sync_secret)
+    if not cards_api_enabled():
+        return {"status": "ok", "claimed": 0}
+    reward_ids = (payload or {}).get("reward_ids") or []
+    mark_rewards_claimed([int(item) for item in reward_ids])
+    return {"status": "ok", "claimed": len(reward_ids)}

@@ -1,4 +1,4 @@
 #!/usr/bin/env bash
 set -e
 
-uvicorn api.main:app --host 0.0.0.0 --port $PORT
+uvicorn api.main:app --host 0.0.0.0 --port "$PORT" --ws websockets
