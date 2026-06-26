@@ -1059,13 +1059,20 @@ def pulse_question_option_entries(pool: str, user_id=None, username=None):
             "user_id": row.get("user_id"),
             "username": row.get("username"),
         }
+        owner_from_suggestion = pulse_question_owner(question, pool)
+        if owner_from_suggestion:
+            owner = owner_from_suggestion
         is_own = bool(
             (owner.get("user_id") or owner.get("username"))
             and pulse_identities_match(viewer, owner)
         )
+        answered_today = pulse_user_answered_question_today(viewer, question, pool)
+        if answered_today and not is_own:
+            continue
         entries.append({
             "question": question,
             "is_own": is_own,
+            "answered_today": answered_today,
             "suggestion_id": row.get("suggestion_id"),
             "category": row.get("category"),
         })
