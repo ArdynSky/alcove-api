@@ -545,6 +545,13 @@ PULSE_QUESTIONS = {
     "red": [],
 }
 
+PULSE_RED_DAILY_QUESTION_DEFAULT = (
+    "What is the one thing you'd confess to The Alcove if you knew no one could trace it back to you?"
+)
+
+if not PULSE_QUESTIONS["red"]:
+    PULSE_QUESTIONS["red"] = [PULSE_RED_DAILY_QUESTION_DEFAULT]
+
 PULSE_QUESTION_CATEGORIES = {
     "What’s been on your mind more than usual lately?": "Mental health",
     "What kind of day have you really been having?": "Mental health",
@@ -1035,16 +1042,41 @@ def prioritized_random_question(entries: list[dict], seed_value: str = "") -> di
 
 
 def pulse_question_choices(pool: str, user_id=None, username=None):
+    return [entry.get("question") for entry in pulse_question_option_entries(pool, user_id, username)]
+
+
+def pulse_question_option_entries(pool: str, user_id=None, username=None):
+    viewer = {"user_id": user_id, "username": username}
     roster = [row for row in pulse_question_roster() if row.get("pool") == pool]
-    questions = []
+    entries = []
     seen = set()
     for row in roster:
         question = (row.get("question") or "").strip()
         if not question or question in seen:
             continue
         seen.add(question)
-        questions.append(question)
-    return questions
+        owner = {
+            "user_id": row.get("user_id"),
+            "username": row.get("username"),
+        }
+        is_own = bool(
+            (owner.get("user_id") or owner.get("username"))
+            and pulse_identities_match(viewer, owner)
+        )
+        entries.append({
+            "question": question,
+            "is_own": is_own,
+            "suggestion_id": row.get("suggestion_id"),
+            "category": row.get("category"),
+        })
+    return entries
+
+
+def pulse_red_daily_question() -> str:
+    choices = pulse_active_questions("red")
+    if choices:
+        return choices[0]
+    return PULSE_RED_DAILY_QUESTION_DEFAULT
 
 
 def pulse_identities_match(left, right):
@@ -4498,6 +4530,11 @@ def get_pulse_questions(user_id: int | None = None, username: str | None = None)
             "green": pulse_question_choices("green", user_id, username),
             "red": pulse_question_choices("red", user_id, username),
         },
+        "question_options": {
+            "green": pulse_question_option_entries("green", user_id, username),
+            "red": pulse_question_option_entries("red", user_id, username),
+        },
+        "red_pulse_question": pulse_red_daily_question(),
         "heat_threshold": pulse_heat_threshold(),
     }
 
@@ -4665,6 +4702,7 @@ def get_pulse_status(user_id: int | None = None, username: str | None = None):
         "status": "ok",
         "user": identity,
         "slots": slots,
+        "red_pulse_question": pulse_red_daily_question(),
         "assigned": assignments,
         "received": receipts,
         "responded": responded,
@@ -4735,8 +4773,11 @@ def submit_pulse(entry: PulseEntry):
         print(f"[{now_iso()}] pulse submit rejected: answer too short", flush=True)
         return {"status": "error", "message": "Please add your anonymous answer before submitting."}
     if question not in pulse_active_questions(pulse_type):
-        print(f"[{now_iso()}] pulse submit rejected: question not active", flush=True)
-        return {"status": "error", "message": "Please choose one of today's Pulses."}
+        if pulse_type == "red" and (question or "").strip() == pulse_red_daily_question():
+            pass
+        else:
+            print(f"[{now_iso()}] pulse submit rejected: question not active", flush=True)
+            return {"status": "error", "message": "Please choose one of today's Pulses."}
 
     owner = pulse_question_owner(question, pulse_type)
     if owner and pulse_identities_match(identity, owner):
