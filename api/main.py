@@ -1583,6 +1583,24 @@ def find_pulse_question_suggestion(suggestion_id: int):
     return None
 
 
+def next_pulse_entry_id() -> int:
+    return max((int(entry.get("id") or 0) for entry in pulse_entries), default=0) + 1
+
+
+def find_pulse_entry(pulse_id: int, *, status: str | None = None):
+    matches = [
+        item for item in pulse_entries
+        if int(item.get("id") or 0) == int(pulse_id)
+    ]
+    if not matches:
+        return None
+    if status:
+        filtered = [item for item in matches if item.get("status") == status]
+        if filtered:
+            return filtered[-1]
+    return matches[-1]
+
+
 def prioritized_random_question(entries: list[dict], seed_value: str = "") -> dict | None:
     if not entries:
         return None
@@ -2020,7 +2038,7 @@ def drain_pulse_admin_telegram_backlog() -> None:
         save_runtime_state(force=True)
         print(
             f"[{stamped}] Drained pulse admin Telegram backlog "
-            "(marked review/completed items as handled without posting).",
+            f"({sum(1 for e in pulse_entries if e.get('status') == 'completed')} completed pulses checked).",
             flush=True,
         )
 
@@ -5680,7 +5698,7 @@ def submit_pulse(entry: PulseEntry):
     day = slots["day_key"]
     previous_cycles = pulse_red_unlocked_cycles(day)
     data = {
-        "id": len(pulse_entries) + 1,
+        "id": next_pulse_entry_id(),
         "day_key": pulse_day_key(),
         "pulse_type": pulse_type,
         "category": pulse_question_category(question, pulse_type),
@@ -5776,7 +5794,7 @@ def respond_to_pulse_assignment(pulse_id: int, payload: PulseAssignmentResponse)
         f"username={payload.username!r}",
         flush=True,
     )
-    entry = next((item for item in pulse_entries if int(item.get("id") or 0) == int(pulse_id)), None)
+    entry = find_pulse_entry(pulse_id, status="awaiting_response") or find_pulse_entry(pulse_id)
     if not entry:
         print(f"[{now_iso()}] pulse answer rejected: pulse not found", flush=True)
         return {"status": "error", "message": "Pulse assignment not found."}
@@ -5881,7 +5899,7 @@ def bot_respond_to_pulse(
 ):
     verify_bot_sync_secret(x_bot_sync_secret)
     payload = payload or {}
-    entry = next((item for item in pulse_entries if int(item.get("id") or 0) == int(pulse_id)), None)
+    entry = find_pulse_entry(pulse_id, status="awaiting_response") or find_pulse_entry(pulse_id)
     if not entry:
         return {"status": "error", "message": "Pulse assignment not found."}
     if entry.get("status") != "awaiting_response":
@@ -6214,10 +6232,24 @@ def bot_delete_pulse_question(roster_id: int, payload: dict | None = None, x_bot
     return {"status": "ok", "deleted": entry}
 
 
+@app.post("/api/bot-sync/pulses/completed/mark-all-posted")
+def mark_all_completed_pulses_posted(x_bot_sync_secret: str | None = Header(default=None)):
+    verify_bot_sync_secret(x_bot_sync_secret)
+    stamped = now_iso()
+    count = 0
+    for entry in pulse_entries:
+        if entry.get("status") == "completed" and not entry.get("admin_posted_at"):
+            entry["admin_posted_at"] = stamped
+            count += 1
+    if count:
+        save_runtime_state(force=True)
+    return {"status": "ok", "count": count}
+
+
 @app.post("/api/bot-sync/pulses/completed/{pulse_id}")
 def mark_completed_pulse_posted(pulse_id: int, x_bot_sync_secret: str | None = Header(default=None)):
     verify_bot_sync_secret(x_bot_sync_secret)
-    entry = next((item for item in pulse_entries if int(item.get("id") or 0) == int(pulse_id)), None)
+    entry = find_pulse_entry(pulse_id, status="completed") or find_pulse_entry(pulse_id)
     if not entry:
         return {"status": "error", "message": "Pulse not found."}
     entry["admin_posted_at"] = now_iso()
