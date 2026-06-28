@@ -3608,7 +3608,11 @@ async def cards_startup_tasks():
 
 @app.get("/")
 def root():
-    return {"status": "Alcove API running"}
+    return {
+        "status": "Alcove API running",
+        "lean_mode": LEAN_MODE,
+        "pulse_admin_notify_enabled": PULSE_ADMIN_NOTIFY_ENABLED,
+    }
 
 
 def bot_sync_health() -> dict:
