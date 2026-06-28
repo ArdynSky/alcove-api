@@ -1,5 +1,6 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import Response
 from pydantic import BaseModel
 import re
 from urllib.parse import parse_qsl, urlparse, unquote
@@ -11,6 +12,8 @@ import hmac
 import os
 import shutil
 import asyncio
+import csv
+import io
 import json
 import random
 import sqlite3
@@ -30,6 +33,20 @@ from .cards_game import (
 )
 from .cards_progress import fetch_pending_rewards, mark_rewards_claimed, profile_summary
 from .cards_ws_manager import cards_ws_manager
+
+try:
+    from dotenv import load_dotenv
+
+    _repo_root = Path(__file__).resolve().parents[1]
+    for _env_path in (
+        _repo_root / "Bot-Review" / "ALCOVE_FOX" / ".env",
+        _repo_root / ".env",
+    ):
+        if _env_path.exists():
+            load_dotenv(_env_path, override=False)
+            break
+except ImportError:
+    pass
 
 app = FastAPI()
 
@@ -229,6 +246,10 @@ PULSE_GREEN_UNLOCK_INTERVAL_HOURS = 4
 PULSE_MAX_GREEN_SLOTS = 6
 PULSE_TESTING_UNLIMITED = os.getenv("PULSE_TESTING_UNLIMITED", "0").strip().lower() in {"1", "true", "yes", "on"}
 LEAN_MODE = os.getenv("LEAN_MODE", "0").strip().lower() in {"1", "true", "yes", "on"}
+PULSE_ADMIN_NOTIFY_ENABLED = os.getenv(
+    "PULSE_ADMIN_NOTIFY_ENABLED",
+    "0",
+).strip().lower() in {"1", "true", "yes", "on"}
 PULSE_UNLIMITED_QUESTION_SUBMIT = os.getenv(
     "PULSE_UNLIMITED_QUESTION_SUBMIT",
     "0" if LEAN_MODE else "1",
@@ -379,6 +400,491 @@ def save_runtime_state_to_db(payload: dict) -> None:
         conn.commit()
 
 
+def ensure_pulse_archive_store() -> None:
+    ensure_state_store()
+    with sqlite3.connect(STATE_DB_PATH) as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS pulse_archive_meta (
+                meta_key TEXT PRIMARY KEY,
+                meta_value TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS pulse_archive_questions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                suggestion_id INTEGER UNIQUE,
+                pool TEXT NOT NULL,
+                question TEXT NOT NULL,
+                category TEXT,
+                status TEXT,
+                active_from_day_key TEXT,
+                submitted_at TEXT,
+                reviewed_at TEXT,
+                user_id INTEGER,
+                username TEXT,
+                display_name TEXT,
+                source TEXT,
+                archived_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS pulse_archive_answers (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                pulse_id INTEGER NOT NULL UNIQUE,
+                suggestion_id INTEGER,
+                day_key TEXT NOT NULL,
+                pool TEXT NOT NULL,
+                category TEXT,
+                question TEXT NOT NULL,
+                answer TEXT NOT NULL,
+                responded_at TEXT,
+                sent_at TEXT,
+                sender_user_id INTEGER,
+                sender_username TEXT,
+                sender_display_name TEXT,
+                question_owner_user_id INTEGER,
+                question_owner_username TEXT,
+                question_owner_display_name TEXT,
+                archived_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_pulse_archive_answers_day ON pulse_archive_answers(day_key)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_pulse_archive_answers_pool ON pulse_archive_answers(pool)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_pulse_archive_answers_responded ON pulse_archive_answers(responded_at)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_pulse_archive_questions_day ON pulse_archive_questions(active_from_day_key)"
+        )
+        conn.commit()
+
+
+def pulse_archive_meta_get(key: str) -> str | None:
+    ensure_pulse_archive_store()
+    with sqlite3.connect(STATE_DB_PATH) as conn:
+        row = conn.execute(
+            "SELECT meta_value FROM pulse_archive_meta WHERE meta_key = ?",
+            (key,),
+        ).fetchone()
+    return row[0] if row else None
+
+
+def pulse_archive_meta_set(key: str, value: str) -> None:
+    ensure_pulse_archive_store()
+    with sqlite3.connect(STATE_DB_PATH) as conn:
+        conn.execute(
+            """
+            INSERT INTO pulse_archive_meta (meta_key, meta_value)
+            VALUES (?, ?)
+            ON CONFLICT(meta_key) DO UPDATE SET meta_value = excluded.meta_value
+            """,
+            (key, value),
+        )
+        conn.commit()
+
+
+def pulse_suggestion_id_for_question(question: str, pool: str) -> int | None:
+    question = (question or "").strip()
+    pool = (pool or "green").strip().lower()
+    for entry in pulse_question_suggestions:
+        if (entry.get("pool") or "green") != pool:
+            continue
+        if pulse_suggestion_question(entry) == question:
+            suggestion_id = entry.get("id")
+            if suggestion_id is not None:
+                return int(suggestion_id)
+    return None
+
+
+def archive_pulse_question_from_suggestion(entry: dict) -> None:
+    if not entry:
+        return
+    suggestion_id = entry.get("id")
+    if suggestion_id is None:
+        return
+    question = pulse_suggestion_question(entry)
+    if not question:
+        return
+    ensure_pulse_archive_store()
+    archived_at = now_iso()
+    with sqlite3.connect(STATE_DB_PATH) as conn:
+        conn.execute(
+            """
+            INSERT INTO pulse_archive_questions (
+                suggestion_id, pool, question, category, status, active_from_day_key,
+                submitted_at, reviewed_at, user_id, username, display_name, source, archived_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(suggestion_id) DO UPDATE SET
+                pool = excluded.pool,
+                question = excluded.question,
+                category = excluded.category,
+                status = excluded.status,
+                active_from_day_key = excluded.active_from_day_key,
+                submitted_at = excluded.submitted_at,
+                reviewed_at = excluded.reviewed_at,
+                user_id = excluded.user_id,
+                username = excluded.username,
+                display_name = excluded.display_name,
+                source = excluded.source,
+                archived_at = excluded.archived_at
+            """,
+            (
+                int(suggestion_id),
+                (entry.get("pool") or "green").strip().lower(),
+                question,
+                entry.get("category") or "General",
+                entry.get("status"),
+                entry.get("active_from_day_key"),
+                entry.get("submitted_at"),
+                entry.get("reviewed_at"),
+                entry.get("user_id"),
+                entry.get("username"),
+                entry.get("display_name"),
+                entry.get("source"),
+                archived_at,
+            ),
+        )
+        conn.commit()
+
+
+def archive_completed_pulse_entry(entry: dict) -> None:
+    if not entry or entry.get("status") != "completed":
+        return
+    pulse_id = entry.get("id")
+    if pulse_id is None:
+        return
+    question = (entry.get("question") or "").strip()
+    answer = (entry.get("response_answer") or entry.get("sender_note") or entry.get("answer") or "").strip()
+    if not question or not answer:
+        return
+    pool = (entry.get("pulse_type") or "green").strip().lower()
+    suggestion_id = pulse_suggestion_id_for_question(question, pool)
+    ensure_pulse_archive_store()
+    archived_at = now_iso()
+    with sqlite3.connect(STATE_DB_PATH) as conn:
+        conn.execute(
+            """
+            INSERT INTO pulse_archive_answers (
+                pulse_id, suggestion_id, day_key, pool, category, question, answer,
+                responded_at, sent_at, sender_user_id, sender_username, sender_display_name,
+                question_owner_user_id, question_owner_username, question_owner_display_name,
+                archived_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(pulse_id) DO UPDATE SET
+                suggestion_id = excluded.suggestion_id,
+                day_key = excluded.day_key,
+                pool = excluded.pool,
+                category = excluded.category,
+                question = excluded.question,
+                answer = excluded.answer,
+                responded_at = excluded.responded_at,
+                sent_at = excluded.sent_at,
+                sender_user_id = excluded.sender_user_id,
+                sender_username = excluded.sender_username,
+                sender_display_name = excluded.sender_display_name,
+                question_owner_user_id = excluded.question_owner_user_id,
+                question_owner_username = excluded.question_owner_username,
+                question_owner_display_name = excluded.question_owner_display_name,
+                archived_at = excluded.archived_at
+            """,
+            (
+                int(pulse_id),
+                suggestion_id,
+                entry.get("day_key") or pulse_day_key(),
+                pool,
+                entry.get("category") or pulse_question_category(question, pool),
+                question,
+                answer,
+                entry.get("responded_at") or entry.get("sent_at"),
+                entry.get("sent_at"),
+                entry.get("sender_user_id") or entry.get("responder_user_id"),
+                entry.get("sender_username") or entry.get("responder_username"),
+                entry.get("sender_display_name") or entry.get("responder_display_name"),
+                entry.get("question_owner_user_id"),
+                entry.get("question_owner_username"),
+                entry.get("question_owner_display_name"),
+                archived_at,
+            ),
+        )
+        conn.commit()
+
+
+def pulse_archive_backfill() -> dict:
+    if pulse_archive_meta_get("backfill_v1") == "done":
+        return {"answers": 0, "questions": 0, "skipped": True}
+    answers = 0
+    questions = 0
+    for entry in pulse_entries:
+        if entry.get("status") != "completed":
+            continue
+        archive_completed_pulse_entry(entry)
+        answers += 1
+    for entry in pulse_question_suggestions:
+        if entry.get("status") in {"rejected", "deleted"}:
+            continue
+        archive_pulse_question_from_suggestion(entry)
+        questions += 1
+    pulse_archive_meta_set("backfill_v1", "done")
+    return {"answers": answers, "questions": questions, "skipped": False}
+
+
+def pulse_archive_answer_row_to_payload(row: tuple) -> dict:
+    keys = (
+        "archive_id", "pulse_id", "suggestion_id", "day_key", "pool", "category",
+        "question", "answer", "responded_at", "sent_at", "sender_user_id",
+        "sender_username", "sender_display_name", "question_owner_user_id",
+        "question_owner_username", "question_owner_display_name", "archived_at",
+    )
+    payload = dict(zip(keys, row))
+    payload["day_label"] = pulse_day_label(payload.get("day_key")) if payload.get("day_key") else None
+    return payload
+
+
+def pulse_archive_question_row_to_payload(row: tuple) -> dict:
+    keys = (
+        "archive_id", "suggestion_id", "pool", "question", "category", "status",
+        "active_from_day_key", "submitted_at", "reviewed_at", "user_id", "username",
+        "display_name", "source", "archived_at",
+    )
+    payload = dict(zip(keys, row))
+    payload["active_from_label"] = (
+        pulse_day_label(payload.get("active_from_day_key"))
+        if payload.get("active_from_day_key")
+        else None
+    )
+    payload["answers_count"] = pulse_archive_answer_count_for_question(
+        payload.get("question"),
+        payload.get("pool"),
+    )
+    return payload
+
+
+def pulse_archive_answer_count_for_question(question: str | None, pool: str | None = None) -> int:
+    question = (question or "").strip()
+    if not question:
+        return 0
+    ensure_pulse_archive_store()
+    query = "SELECT COUNT(*) FROM pulse_archive_answers WHERE question = ?"
+    params: list = [question]
+    if pool:
+        query += " AND pool = ?"
+        params.append((pool or "green").strip().lower())
+    with sqlite3.connect(STATE_DB_PATH) as conn:
+        row = conn.execute(query, params).fetchone()
+    return int(row[0] or 0) if row else 0
+
+
+def pulse_archive_stats_payload() -> dict:
+    ensure_pulse_archive_store()
+    with sqlite3.connect(STATE_DB_PATH) as conn:
+        answer_count = int(conn.execute("SELECT COUNT(*) FROM pulse_archive_answers").fetchone()[0] or 0)
+        question_count = int(conn.execute("SELECT COUNT(*) FROM pulse_archive_questions").fetchone()[0] or 0)
+        first_day = conn.execute(
+            "SELECT MIN(day_key) FROM pulse_archive_answers WHERE day_key != ''"
+        ).fetchone()[0]
+        last_day = conn.execute(
+            "SELECT MAX(day_key) FROM pulse_archive_answers WHERE day_key != ''"
+        ).fetchone()[0]
+    return {
+        "answer_count": answer_count,
+        "question_count": question_count,
+        "first_day_key": first_day,
+        "last_day_key": last_day,
+        "first_day_label": pulse_day_label(first_day) if first_day else None,
+        "last_day_label": pulse_day_label(last_day) if last_day else None,
+    }
+
+
+def query_pulse_archive_answers(
+    *,
+    day: str | None = None,
+    from_day: str | None = None,
+    to_day: str | None = None,
+    pool: str | None = None,
+    q: str | None = None,
+    username: str | None = None,
+    suggestion_id: int | None = None,
+    page: int = 1,
+    limit: int = 50,
+) -> dict:
+    ensure_pulse_archive_store()
+    clauses = ["1=1"]
+    params: list = []
+    if day:
+        clauses.append("day_key = ?")
+        params.append(day.strip())
+    if from_day:
+        clauses.append("day_key >= ?")
+        params.append(from_day.strip())
+    if to_day:
+        clauses.append("day_key <= ?")
+        params.append(to_day.strip())
+    if pool:
+        clauses.append("pool = ?")
+        params.append(pool.strip().lower())
+    if suggestion_id:
+        clauses.append("suggestion_id = ?")
+        params.append(int(suggestion_id))
+    needle = (q or "").strip().lower()
+    if needle:
+        clauses.append("(LOWER(question) LIKE ? OR LOWER(answer) LIKE ?)")
+        params.extend([f"%{needle}%", f"%{needle}%"])
+    uname = (username or "").strip().lower().lstrip("@")
+    if uname:
+        clauses.append("LOWER(COALESCE(sender_username, '')) LIKE ?")
+        params.append(f"%{uname}%")
+    where_sql = " AND ".join(clauses)
+    offset = max(0, (max(1, page) - 1) * max(1, min(limit, 200)))
+    row_limit = max(1, min(limit, 200))
+    with sqlite3.connect(STATE_DB_PATH) as conn:
+        total = int(conn.execute(
+            f"SELECT COUNT(*) FROM pulse_archive_answers WHERE {where_sql}",
+            params,
+        ).fetchone()[0] or 0)
+        rows = conn.execute(
+            f"""
+            SELECT id, pulse_id, suggestion_id, day_key, pool, category, question, answer,
+                   responded_at, sent_at, sender_user_id, sender_username, sender_display_name,
+                   question_owner_user_id, question_owner_username, question_owner_display_name,
+                   archived_at
+            FROM pulse_archive_answers
+            WHERE {where_sql}
+            ORDER BY COALESCE(responded_at, sent_at, archived_at) DESC, pulse_id DESC
+            LIMIT ? OFFSET ?
+            """,
+            [*params, row_limit, offset],
+        ).fetchall()
+    return {
+        "entries": [pulse_archive_answer_row_to_payload(row) for row in rows],
+        "total": total,
+        "page": max(1, page),
+        "limit": row_limit,
+        "pages": max(1, (total + row_limit - 1) // row_limit),
+    }
+
+
+def query_pulse_archive_questions(
+    *,
+    pool: str | None = None,
+    status: str | None = None,
+    q: str | None = None,
+    from_day: str | None = None,
+    to_day: str | None = None,
+    page: int = 1,
+    limit: int = 50,
+) -> dict:
+    ensure_pulse_archive_store()
+    clauses = ["1=1"]
+    params: list = []
+    if pool:
+        clauses.append("pool = ?")
+        params.append(pool.strip().lower())
+    if status:
+        clauses.append("status = ?")
+        params.append(status.strip())
+    needle = (q or "").strip().lower()
+    if needle:
+        clauses.append("LOWER(question) LIKE ?")
+        params.append(f"%{needle}%")
+    if from_day:
+        clauses.append("COALESCE(active_from_day_key, '') >= ?")
+        params.append(from_day.strip())
+    if to_day:
+        clauses.append("COALESCE(active_from_day_key, '') <= ?")
+        params.append(to_day.strip())
+    where_sql = " AND ".join(clauses)
+    offset = max(0, (max(1, page) - 1) * max(1, min(limit, 200)))
+    row_limit = max(1, min(limit, 200))
+    with sqlite3.connect(STATE_DB_PATH) as conn:
+        total = int(conn.execute(
+            f"SELECT COUNT(*) FROM pulse_archive_questions WHERE {where_sql}",
+            params,
+        ).fetchone()[0] or 0)
+        rows = conn.execute(
+            f"""
+            SELECT id, suggestion_id, pool, question, category, status, active_from_day_key,
+                   submitted_at, reviewed_at, user_id, username, display_name, source, archived_at
+            FROM pulse_archive_questions
+            WHERE {where_sql}
+            ORDER BY COALESCE(active_from_day_key, submitted_at, archived_at) DESC, suggestion_id DESC
+            LIMIT ? OFFSET ?
+            """,
+            [*params, row_limit, offset],
+        ).fetchall()
+    return {
+        "entries": [pulse_archive_question_row_to_payload(row) for row in rows],
+        "total": total,
+        "page": max(1, page),
+        "limit": row_limit,
+        "pages": max(1, (total + row_limit - 1) // row_limit),
+    }
+
+
+def pulse_archive_answers_csv(filters: dict) -> str:
+    result = query_pulse_archive_answers(
+        day=filters.get("day"),
+        from_day=filters.get("from_day"),
+        to_day=filters.get("to_day"),
+        pool=filters.get("pool"),
+        q=filters.get("q"),
+        username=filters.get("username"),
+        suggestion_id=filters.get("suggestion_id"),
+        page=1,
+        limit=200,
+    )
+    buffer = io.StringIO()
+    writer = csv.writer(buffer)
+    writer.writerow([
+        "day_key", "pool", "pulse_id", "suggestion_id", "question", "answer",
+        "responded_at", "sender_username", "sender_display_name", "sender_user_id",
+        "question_owner_username", "category",
+    ])
+    total = result["total"]
+    writer.writerows([
+        [
+            row.get("day_key"), row.get("pool"), row.get("pulse_id"), row.get("suggestion_id"),
+            row.get("question"), row.get("answer"), row.get("responded_at"),
+            row.get("sender_username"), row.get("sender_display_name"), row.get("sender_user_id"),
+            row.get("question_owner_username"), row.get("category"),
+        ]
+        for row in result["entries"]
+    ])
+    page = 2
+    while len(result["entries"]) and (page - 1) * 200 < total:
+        result = query_pulse_archive_answers(
+            day=filters.get("day"),
+            from_day=filters.get("from_day"),
+            to_day=filters.get("to_day"),
+            pool=filters.get("pool"),
+            q=filters.get("q"),
+            username=filters.get("username"),
+            suggestion_id=filters.get("suggestion_id"),
+            page=page,
+            limit=200,
+        )
+        writer.writerows([
+            [
+                row.get("day_key"), row.get("pool"), row.get("pulse_id"), row.get("suggestion_id"),
+                row.get("question"), row.get("answer"), row.get("responded_at"),
+                row.get("sender_username"), row.get("sender_display_name"), row.get("sender_user_id"),
+                row.get("question_owner_username"), row.get("category"),
+            ]
+            for row in result["entries"]
+        ])
+        page += 1
+    return buffer.getvalue()
+
+
 def runtime_entry_day(entry: dict) -> str:
     return (
         entry.get("day_key")
@@ -519,6 +1025,7 @@ if lean_mode_enabled():
     print(
         f"[{now_iso()}] LEAN_MODE enabled: retention={PULSE_RETENTION_DAYS}d, "
         f"unlimited_question_submit={PULSE_UNLIMITED_QUESTION_SUBMIT}, "
+        f"pulse_admin_notify={PULSE_ADMIN_NOTIFY_ENABLED}, "
         "wheel history omitted from runtime state.",
         flush=True,
     )
@@ -850,6 +1357,36 @@ def pulse_next_day_key(at: datetime.datetime | None = None) -> str:
     return (current + datetime.timedelta(days=1)).strftime("%Y-%m-%d")
 
 
+def pulse_day_before(day_key: str) -> str:
+    try:
+        parsed = datetime.date.fromisoformat(day_key)
+    except ValueError:
+        return day_key
+    return (parsed - datetime.timedelta(days=1)).strftime("%Y-%m-%d")
+
+
+def demote_other_red_from_day(day_key: str, except_id: int | None = None) -> None:
+    for entry in pulse_question_suggestions:
+        if entry.get("status") != "approved":
+            continue
+        if (entry.get("pool") or "green") != "red":
+            continue
+        if except_id is not None and int(entry.get("id") or 0) == int(except_id):
+            continue
+        if (entry.get("active_from_day_key") or "").strip() == day_key:
+            entry["active_from_day_key"] = pulse_day_before(day_key)
+
+
+def ensure_single_red_slot(entry: dict) -> None:
+    pool = (entry.get("pool") or "green").strip().lower()
+    if pool != "red" or entry.get("status") != "approved":
+        return
+    active_from = (entry.get("active_from_day_key") or "").strip()
+    if not active_from:
+        return
+    demote_other_red_from_day(active_from, except_id=entry.get("id"))
+
+
 def pulse_day_label(day_key: str | None = None) -> str:
     raw = day_key or pulse_day_key()
     try:
@@ -890,14 +1427,14 @@ def pulse_default_question_entries():
     return rows
 
 
-def pulse_approved_question_entries():
+def pulse_approved_question_entries(day_key: str | None = None):
     rows = []
-    today = pulse_day_key()
+    today = day_key or pulse_day_key()
     for entry in pulse_question_suggestions:
         if entry.get("status") != "approved":
             continue
         active_from = (entry.get("active_from_day_key") or "").strip()
-        if active_from and active_from > today:
+        if active_from != today:
             continue
         rows.append({
             "source": "suggested",
@@ -906,6 +1443,7 @@ def pulse_approved_question_entries():
             "category": entry.get("category") or "General",
             "question": entry.get("edited_question") or entry.get("question") or "",
             "active": True,
+            "active_from_day_key": active_from,
         })
     return rows
 
@@ -1088,9 +1626,17 @@ def pulse_question_option_entries(pool: str, user_id=None, username=None):
 
 
 def pulse_red_daily_question() -> str:
-    choices = pulse_active_questions("red")
-    if choices:
-        return choices[0]
+    today = pulse_day_key()
+    for entry in pulse_question_suggestions:
+        if entry.get("status") != "approved":
+            continue
+        if (entry.get("pool") or "green") != "red":
+            continue
+        if (entry.get("active_from_day_key") or "").strip() != today:
+            continue
+        question = pulse_suggestion_question(entry)
+        if question:
+            return question
     return PULSE_RED_DAILY_QUESTION_DEFAULT
 
 
@@ -1106,15 +1652,15 @@ def pulse_identities_match(left, right):
     return bool(left_username and right_username and left_username == right_username)
 
 
-def pulse_question_owner(question: str, pool: str):
+def pulse_question_owner(question: str, pool: str, day_key: str | None = None):
     question = (question or "").strip()
     pool = (pool or "green").strip().lower()
-    today = pulse_day_key()
+    today = day_key or pulse_day_key()
     for entry in pulse_question_suggestions:
         if entry.get("status") != "approved":
             continue
         active_from = (entry.get("active_from_day_key") or "").strip()
-        if active_from and active_from > today:
+        if active_from != today:
             continue
         if (entry.get("pool") or "green") != pool:
             continue
@@ -1149,20 +1695,37 @@ def pulse_suggestion_question(entry):
     return (entry.get("edited_question") or entry.get("question") or "").strip()
 
 
+try:
+    _archive_backfill_stats = pulse_archive_backfill()
+    if not _archive_backfill_stats.get("skipped"):
+        print(
+            f"[{now_iso()}] pulse archive backfill: "
+            f"{_archive_backfill_stats.get('answers', 0)} answers, "
+            f"{_archive_backfill_stats.get('questions', 0)} questions",
+            flush=True,
+        )
+except Exception as exc:
+    print(f"[{now_iso()}] pulse archive backfill error: {exc!r}", flush=True)
+
+
 def pulse_question_suggestion_admin_payload(entry):
     if not entry:
         return None
+    question = pulse_suggestion_question(entry)
+    pool = entry.get("pool") or "green"
+    active_from = (entry.get("active_from_day_key") or "").strip() or None
     return {
         "id": entry.get("id"),
-        "pool": entry.get("pool") or "green",
+        "pool": pool,
         "category": entry.get("category") or "General",
         "question": entry.get("question") or "",
         "edited_question": entry.get("edited_question"),
-        "display_question": pulse_suggestion_question(entry),
+        "display_question": question,
         "status": entry.get("status"),
         "submitted_at": entry.get("submitted_at"),
         "day_key": entry.get("day_key"),
-        "active_from_day_key": entry.get("active_from_day_key"),
+        "active_from_day_key": active_from,
+        "active_from_label": pulse_day_label(active_from) if active_from else None,
         "user_id": entry.get("user_id"),
         "username": entry.get("username"),
         "display_name": entry.get("display_name"),
@@ -1172,8 +1735,81 @@ def pulse_question_suggestion_admin_payload(entry):
         "schedule_mode": entry.get("schedule_mode") or "tomorrow",
         "needs_admin_notify": entry.get("needs_admin_notify"),
         "source": entry.get("source"),
-        "answers_count": pulse_question_answer_count(pulse_suggestion_question(entry), entry.get("pool")),
+        "answers_count": pulse_question_answer_count(question, pool),
+        "answers_today": pulse_question_answer_count_for_day(question, pool),
     }
+
+
+def pulse_answers_for_suggestion(suggestion_id: int):
+    entry = find_pulse_question_suggestion(suggestion_id)
+    if not entry:
+        return None, []
+    question = pulse_suggestion_question(entry)
+    pool = (entry.get("pool") or "green").strip().lower()
+    rows = []
+    for pulse_entry in pulse_entries:
+        if pulse_entry.get("status") != "completed":
+            continue
+        if (pulse_entry.get("question") or "").strip() != question:
+            continue
+        if (pulse_entry.get("pulse_type") or "green") != pool:
+            continue
+        payload = public_pulse_payload(pulse_entry)
+        if payload:
+            rows.append(payload)
+    rows.sort(key=lambda item: item.get("responded_at") or item.get("sent_at") or "", reverse=True)
+    return entry, rows
+
+
+def pulse_pool_schedule_payload(pool: str = "green"):
+    pool = (pool or "green").strip().lower()
+    today = pulse_day_key()
+    tomorrow = pulse_next_day_key()
+    today_rows = []
+    tomorrow_rows = []
+    archive_rows = []
+    for entry in pulse_question_suggestions:
+        if (entry.get("pool") or "green") != pool:
+            continue
+        if entry.get("status") != "approved":
+            continue
+        payload = pulse_question_suggestion_admin_payload(entry)
+        if not payload:
+            continue
+        active_from = (entry.get("active_from_day_key") or "").strip()
+        if active_from == today:
+            today_rows.append(payload)
+        elif active_from == tomorrow:
+            tomorrow_rows.append(payload)
+        elif active_from and active_from < today:
+            archive_rows.append(payload)
+    sort_newest = lambda row: row.get("active_from_day_key") or row.get("submitted_at") or ""
+    if pool == "red":
+        today_rows.sort(key=sort_newest, reverse=True)
+        tomorrow_rows.sort(key=sort_newest, reverse=True)
+    else:
+        today_rows.sort(key=lambda row: row.get("display_question") or "")
+        tomorrow_rows.sort(key=lambda row: row.get("display_question") or "")
+    archive_rows.sort(key=sort_newest, reverse=True)
+    pool_label = "Red" if pool == "red" else "Green"
+    return {
+        "pool": pool,
+        "day_key": today,
+        "day_label": pulse_day_label(today),
+        "tomorrow_key": tomorrow,
+        "tomorrow_label": pulse_day_label(tomorrow),
+        "rollover_note": (
+            f"At midnight UK time, the {pool_label} Pulse scheduled for Tomorrow becomes Today "
+            f"and Today moves to Archive."
+        ),
+        "today": today_rows,
+        "tomorrow": tomorrow_rows,
+        "archive": archive_rows,
+    }
+
+
+def pulse_green_schedule_payload():
+    return pulse_pool_schedule_payload("green")
 
 
 def pulse_question_suggestion_owner_fields(suggestion_id: int | None):
@@ -1352,6 +1988,12 @@ def telegram_admin_notify(text: str, topic_id: int | None = None) -> bool:
         return False
 
 
+def pulse_admin_notify(text: str, topic_id: int | None = None) -> bool:
+    if not PULSE_ADMIN_NOTIFY_ENABLED:
+        return False
+    return telegram_admin_notify(text, topic_id)
+
+
 def apply_admin_pulse_question_action(entry: dict, action: str, edited_question: str | None = None) -> None:
     action = (action or "").strip().lower()
     if action == "amend":
@@ -1368,12 +2010,20 @@ def apply_admin_pulse_question_action(entry: dict, action: str, edited_question:
         entry["reviewed_at"] = now_iso()
         return
     if action in {"today", "tomorrow", "reserve"}:
+        pool = (entry.get("pool") or "green").strip().lower()
+        if pool == "red" and action == "reserve":
+            raise HTTPException(
+                status_code=400,
+                detail="Red Pulse questions can only be scheduled for Today or Tomorrow.",
+            )
         text = (edited_question or "").strip()
         if text and text != (entry.get("question") or "").strip():
             entry["edited_question"] = text
         apply_pulse_suggestion_schedule(entry, action, approve=True)
+        ensure_single_red_slot(entry)
         entry["reviewed_at"] = now_iso()
         entry["needs_admin_notify"] = False
+        archive_pulse_question_from_suggestion(entry)
         return
     raise HTTPException(status_code=400, detail="Unknown Pulse question action.")
 
@@ -1388,24 +2038,22 @@ def create_admin_pulse_question(
     display_name: str = "Feature Admin",
 ) -> dict:
     pool = (pool or "green").strip().lower()
-    category = (category or "General").strip()
     question = (question or "").strip()
-    allowed_categories = {"Mental health", "Physical health", "General"}
     if pool not in {"green", "red"}:
         raise HTTPException(status_code=400, detail="Pool must be green or red.")
-    if category not in allowed_categories:
-        raise HTTPException(
-            status_code=400,
-            detail="Category must be Mental health, Physical health, or General.",
-        )
     if len(question) < 8:
         raise HTTPException(status_code=400, detail="Question must be at least 8 characters.")
 
     schedule = normalize_pulse_schedule_mode(schedule_mode)
+    if pool == "red" and schedule == "reserve":
+        raise HTTPException(
+            status_code=400,
+            detail="Red Pulse questions can only be scheduled for Today or Tomorrow.",
+        )
     entry = {
         "id": len(pulse_question_suggestions) + 1,
         "pool": pool,
-        "category": category,
+        "category": "General",
         "question": question,
         "edited_question": None,
         "submitted_at": now_iso(),
@@ -1423,8 +2071,10 @@ def create_admin_pulse_question(
         "source": source,
     }
     apply_pulse_suggestion_schedule(entry, schedule, approve=True)
+    ensure_single_red_slot(entry)
     entry["reviewed_at"] = now_iso()
     pulse_question_suggestions.append(entry)
+    archive_pulse_question_from_suggestion(entry)
     save_runtime_state()
     return entry
 
@@ -3364,6 +4014,120 @@ def update_pulse_settings(payload: PulseSettingsUpdate, x_bot_sync_secret: str |
     return {"status": "ok", "settings": settings, "progress": pulse_progress_payload()}
 
 
+@app.get("/api/admin/pulse-question-schedule")
+def admin_pulse_question_schedule(admin_secret: str):
+    verify_admin_secret(admin_secret)
+    green = pulse_pool_schedule_payload("green")
+    red = pulse_pool_schedule_payload("red")
+    return {"status": "ok", "green": green, "red": red, **green}
+
+
+@app.get("/api/admin/pulse-questions/{suggestion_id}/answers")
+def admin_pulse_question_answers(suggestion_id: int, admin_secret: str):
+    verify_admin_secret(admin_secret)
+    entry, answers = pulse_answers_for_suggestion(suggestion_id)
+    if not entry:
+        return {"status": "error", "message": "Pulse question not found."}
+    return {
+        "status": "ok",
+        "entry": pulse_question_suggestion_admin_payload(entry),
+        "answers": answers,
+    }
+
+
+@app.get("/api/admin/pulse-archive/stats")
+def admin_pulse_archive_stats(admin_secret: str):
+    verify_admin_secret(admin_secret)
+    return {"status": "ok", "stats": pulse_archive_stats_payload()}
+
+
+@app.get("/api/admin/pulse-archive/answers")
+def admin_pulse_archive_answers(
+    admin_secret: str,
+    day: str | None = None,
+    from_day: str | None = None,
+    to_day: str | None = None,
+    pool: str | None = None,
+    q: str | None = None,
+    username: str | None = None,
+    suggestion_id: int | None = None,
+    page: int = 1,
+    limit: int = 50,
+):
+    verify_admin_secret(admin_secret)
+    return {
+        "status": "ok",
+        **query_pulse_archive_answers(
+            day=day,
+            from_day=from_day,
+            to_day=to_day,
+            pool=pool,
+            q=q,
+            username=username,
+            suggestion_id=suggestion_id,
+            page=page,
+            limit=limit,
+        ),
+    }
+
+
+@app.get("/api/admin/pulse-archive/questions")
+def admin_pulse_archive_questions(
+    admin_secret: str,
+    pool: str | None = None,
+    status: str | None = None,
+    q: str | None = None,
+    from_day: str | None = None,
+    to_day: str | None = None,
+    page: int = 1,
+    limit: int = 50,
+):
+    verify_admin_secret(admin_secret)
+    return {
+        "status": "ok",
+        **query_pulse_archive_questions(
+            pool=pool,
+            status=status,
+            q=q,
+            from_day=from_day,
+            to_day=to_day,
+            page=page,
+            limit=limit,
+        ),
+    }
+
+
+@app.get("/api/admin/pulse-archive/export")
+def admin_pulse_archive_export(
+    admin_secret: str,
+    day: str | None = None,
+    from_day: str | None = None,
+    to_day: str | None = None,
+    pool: str | None = None,
+    q: str | None = None,
+    username: str | None = None,
+    suggestion_id: int | None = None,
+):
+    verify_admin_secret(admin_secret)
+    filters = {
+        "day": day,
+        "from_day": from_day,
+        "to_day": to_day,
+        "pool": pool,
+        "q": q,
+        "username": username,
+        "suggestion_id": suggestion_id,
+    }
+    csv_text = pulse_archive_answers_csv(filters)
+    stamp = day or from_day or pulse_day_key()
+    filename = f"pulse-archive-{stamp}.csv"
+    return Response(
+        content=csv_text,
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
 @app.get("/api/admin/review-queue")
 def admin_review_queue(admin_secret: str):
     verify_admin_secret(admin_secret)
@@ -4679,7 +5443,7 @@ def submit_pulse_question_suggestion(payload: PulseQuestionSuggestion):
         "username": identity.get("username"),
         "display_name": identity.get("display_name") or identity.get("label"),
         "status": "pending_review",
-        "schedule_mode": None,
+        "schedule_mode": "tomorrow",
         "needs_admin_notify": True,
         "review_message_sent": False,
         "reviewed_at": None,
@@ -4689,7 +5453,7 @@ def submit_pulse_question_suggestion(payload: PulseQuestionSuggestion):
     pulse_question_suggestions.append(entry)
     save_runtime_state()
     submitter = entry.get("display_name") or entry.get("username") or entry.get("user_id")
-    telegram_admin_notify(
+    pulse_admin_notify(
         "\n".join([
             "<b>New Pulse question submitted</b>",
             f"ID: <code>{entry['id']}</code>",
@@ -4711,7 +5475,7 @@ def submit_pulse_question_suggestion(payload: PulseQuestionSuggestion):
     )
     return {
         "status": "ok",
-        "message": "Pulse sent for admin review. If approved, it will go live on the roster.",
+        "message": "Pulse sent for admin review. If approved, it will join tomorrow's green Pulse roster.",
         "entry": entry,
     }
 
@@ -4910,6 +5674,7 @@ def submit_pulse(entry: PulseEntry):
         "admin_posted_at": responded_at if pulse_type == "red" else None,
     }
     pulse_entries.append(data)
+    archive_completed_pulse_entry(data)
     receipt = None
     if (
         pulse_type != "red"
@@ -4932,7 +5697,7 @@ def submit_pulse(entry: PulseEntry):
     maybe_queue_red_pulse_unlock_notifications(day, previous_cycles, new_cycles)
     save_runtime_state()
     if pulse_type != "red":
-        telegram_admin_notify(
+        pulse_admin_notify(
             "\n".join([
                 "<b>New Pulse answer</b>",
                 f"Question: <code>{escape(question)}</code>",
@@ -5019,6 +5784,7 @@ def respond_to_pulse_assignment(pulse_id: int, payload: PulseAssignmentResponse)
         "notify_after": pulse_notification_due_at(),
     }
     pulse_receipts.append(receipt)
+    archive_completed_pulse_entry(entry)
     new_cycles = pulse_red_unlocked_cycles(day)
     maybe_queue_red_pulse_unlock_notifications(day, previous_cycles, new_cycles)
     save_runtime_state()
@@ -5117,6 +5883,7 @@ def bot_respond_to_pulse(
         "notify_after": pulse_notification_due_at(),
     }
     pulse_receipts.append(receipt)
+    archive_completed_pulse_entry(entry)
     new_cycles = pulse_red_unlocked_cycles(day)
     maybe_queue_red_pulse_unlock_notifications(day, previous_cycles, new_cycles)
     save_runtime_state()
