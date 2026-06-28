@@ -250,6 +250,11 @@ PULSE_ADMIN_NOTIFY_ENABLED = os.getenv(
     "PULSE_ADMIN_NOTIFY_ENABLED",
     "0",
 ).strip().lower() in {"1", "true", "yes", "on"}
+# Hard-off pulse admin Telegram unless PULSE_ADMIN_TELEGRAM_FORCE=1 is set explicitly.
+PULSE_ADMIN_TELEGRAM_SUPPRESSED = os.getenv(
+    "PULSE_ADMIN_TELEGRAM_FORCE",
+    "",
+).strip().lower() not in {"1", "true", "yes", "on"}
 PULSE_UNLIMITED_QUESTION_SUBMIT = os.getenv(
     "PULSE_UNLIMITED_QUESTION_SUBMIT",
     "0" if LEAN_MODE else "1",
@@ -1021,6 +1026,7 @@ def load_runtime_state() -> None:
 load_runtime_state()
 prune_pulse_runtime_data(force=True)
 save_runtime_state(force=True)
+drain_pulse_admin_telegram_backlog()
 if lean_mode_enabled():
     print(
         f"[{now_iso()}] LEAN_MODE enabled: retention={PULSE_RETENTION_DAYS}d, "
@@ -1989,9 +1995,34 @@ def telegram_admin_notify(text: str, topic_id: int | None = None) -> bool:
 
 
 def pulse_admin_notify(text: str, topic_id: int | None = None) -> bool:
-    if not PULSE_ADMIN_NOTIFY_ENABLED:
-        return False
-    return telegram_admin_notify(text, topic_id)
+    return False
+
+
+def drain_pulse_admin_telegram_backlog() -> None:
+    if not PULSE_ADMIN_TELEGRAM_SUPPRESSED:
+        return
+    changed = False
+    stamped = now_iso()
+    for entry in pulse_question_suggestions:
+        if entry.get("status") == "pending_review" and not entry.get("review_message_sent"):
+            entry["review_message_sent"] = True
+            entry["needs_admin_notify"] = False
+            changed = True
+    for entry in pulse_entries:
+        if entry.get("status") == "completed" and not entry.get("admin_posted_at"):
+            entry["admin_posted_at"] = stamped
+            changed = True
+    for state in pulse_daily_summary_posts:
+        if not state.get("admin_posted_at"):
+            state["admin_posted_at"] = stamped
+            changed = True
+    if changed:
+        save_runtime_state(force=True)
+        print(
+            f"[{stamped}] Drained pulse admin Telegram backlog "
+            "(marked review/completed items as handled without posting).",
+            flush=True,
+        )
 
 
 def apply_admin_pulse_question_action(entry: dict, action: str, edited_question: str | None = None) -> None:
@@ -3612,6 +3643,7 @@ def root():
         "status": "Alcove API running",
         "lean_mode": LEAN_MODE,
         "pulse_admin_notify_enabled": PULSE_ADMIN_NOTIFY_ENABLED,
+        "pulse_admin_telegram_suppressed": PULSE_ADMIN_TELEGRAM_SUPPRESSED,
     }
 
 
@@ -5902,6 +5934,8 @@ def bot_respond_to_pulse(
 @app.get("/api/bot-sync/pulses/completed")
 def bot_completed_pulses(x_bot_sync_secret: str | None = Header(default=None)):
     verify_bot_sync_secret(x_bot_sync_secret)
+    if PULSE_ADMIN_TELEGRAM_SUPPRESSED:
+        return {"status": "ok", "entries": []}
     return {"status": "ok", "entries": pulse_completed_admin_entries()}
 
 
@@ -5956,6 +5990,8 @@ def bot_pulse_answers(
 @app.get("/api/bot-sync/pulse-questions/pending")
 def bot_pending_pulse_question_suggestions(x_bot_sync_secret: str | None = Header(default=None)):
     verify_bot_sync_secret(x_bot_sync_secret)
+    if PULSE_ADMIN_TELEGRAM_SUPPRESSED:
+        return {"status": "ok", "entries": []}
     entries = [
         pulse_question_suggestion_admin_payload(entry)
         for entry in pulse_question_suggestions
@@ -6203,6 +6239,8 @@ def bot_pulse_daily_summaries(x_bot_sync_secret: str | None = Header(default=Non
         for summary in pulse_daily_summary_payload(day_key):
             if not summary.get("admin_posted_at"):
                 summaries.append(summary)
+    if PULSE_ADMIN_TELEGRAM_SUPPRESSED:
+        return {"status": "ok", "summaries": []}
     return {"status": "ok", "summaries": summaries}
 
 
