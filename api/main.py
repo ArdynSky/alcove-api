@@ -18,6 +18,7 @@ import json
 import random
 import sqlite3
 import urllib.request
+import zipfile
 from html import escape
 from fastapi import Header, HTTPException, WebSocket, WebSocketDisconnect
 from .websocket_manager import manager
@@ -33,6 +34,7 @@ from .cards_game import (
 )
 from .cards_progress import fetch_pending_rewards, mark_rewards_claimed, profile_summary
 from .cards_ws_manager import cards_ws_manager
+from . import fox_messages as fox_messages_store
 
 try:
     from dotenv import load_dotenv
@@ -50,16 +52,32 @@ except ImportError:
 
 app = FastAPI()
 
+CORS_ALLOWED_ORIGINS = [
+    "null",
+    "http://127.0.0.1:5500",
+    "http://localhost:5500",
+    "http://127.0.0.1:8080",
+    "http://localhost:8080",
+    "http://127.0.0.1:8000",
+    "http://localhost:8000",
+    "http://127.0.0.1:5173",
+    "http://localhost:5173",
+    "https://euphonious-banoffee-1c8215.netlify.app",
+    "https://thealcove.netlify.app",
+    "https://ardyn-alcove.com",
+    "https://www.ardyn-alcove.com",
+]
+_extra_cors = os.getenv("CORS_ALLOWED_ORIGINS", "").strip()
+if _extra_cors:
+    CORS_ALLOWED_ORIGINS.extend(
+        origin.strip()
+        for origin in _extra_cors.split(",")
+        if origin.strip() and origin.strip() not in CORS_ALLOWED_ORIGINS
+    )
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://127.0.0.1:5500",
-        "http://localhost:5500",
-        "https://euphonious-banoffee-1c8215.netlify.app",
-        "https://thealcove.netlify.app",
-        "https://ardyn-alcove.com",
-        "https://www.ardyn-alcove.com",
-    ],
+    allow_origins=CORS_ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -94,6 +112,10 @@ FEATURE_FLAGS_PATH = os.getenv(
 PULSE_SETTINGS_PATH = os.getenv(
     "PULSE_SETTINGS_PATH",
     os.path.join(os.getcwd(), "pulse_settings.json"),
+)
+SAFETY_SETTINGS_PATH = os.getenv(
+    "SAFETY_SETTINGS_PATH",
+    os.path.join(os.getcwd(), "safety_settings.json"),
 )
 RUNTIME_STATE_PATH = os.getenv(
     "ALCOVE_RUNTIME_STATE_PATH",
@@ -1026,7 +1048,6 @@ def load_runtime_state() -> None:
 load_runtime_state()
 prune_pulse_runtime_data(force=True)
 save_runtime_state(force=True)
-drain_pulse_admin_telegram_backlog()
 if lean_mode_enabled():
     print(
         f"[{now_iso()}] LEAN_MODE enabled: retention={PULSE_RETENTION_DAYS}d, "
@@ -1036,22 +1057,95 @@ if lean_mode_enabled():
         flush=True,
     )
 
-DEFAULT_FEATURE_FLAGS = {
+FEATURE_FLAG_REGISTRY = {
     "pages": {
-        "video_chat": True,
-        "archive": True,
-        "info": True,
-        "wellbeing": True,
-        "pulse": False,
-        "connect": False,
-        "cards": False,
+        "title": "Home launcher buttons",
+        "flags": {
+            "video_chat": {
+                "label": "Video Chat",
+                "description": "Show or hide the Video Chat button on home.",
+                "path": "video-chat.html",
+                "default": True,
+            },
+            "archive": {
+                "label": "Archive",
+                "description": "Show or hide the Archive button on home.",
+                "path": "archive.html",
+                "default": True,
+            },
+            "info": {
+                "label": "Info",
+                "description": "Show or hide the Info button on home.",
+                "path": "info.html",
+                "default": True,
+            },
+            "wellbeing": {
+                "label": "Connect",
+                "description": "Show or hide the Connect hub on home.",
+                "path": "wellbeing-concept-open-stage.html",
+                "default": True,
+            },
+            "profile": {
+                "label": "Profile",
+                "description": "Show or hide the Profile loadout page on home.",
+                "path": "profile.html",
+                "default": True,
+            },
+            "cards": {
+                "label": "Alcove Cards",
+                "description": "Show or hide the Alcove Cards game on home.",
+                "path": "alcove-cards-demo.html",
+                "default": False,
+            },
+        },
     },
     "wellbeing": {
-        "daily_checkin": True,
-        "spotlight": True,
-        "pulse": True,
+        "title": "Connect sections",
+        "flags": {
+            "daily_checkin": {
+                "label": "Daily Check-in",
+                "description": "Show or hide Daily Check-in inside Connect.",
+                "path": "wellbeing-concept-open-stage.html#checkin",
+                "default": True,
+            },
+            "spotlight": {
+                "label": "Spotlight",
+                "description": "Show or hide Spotlight inside Connect.",
+                "path": "wellbeing-concept-open-stage.html#spotlight",
+                "default": True,
+            },
+            "pulse": {
+                "label": "Pulse",
+                "description": "Show or hide Pulse inside Connect.",
+                "path": "wellbeing-concept-open-stage.html#pulse",
+                "default": True,
+            },
+        },
     },
 }
+
+DEFAULT_FEATURE_FLAGS = {
+    group: {key: spec["default"] for key, spec in section["flags"].items()}
+    for group, section in FEATURE_FLAG_REGISTRY.items()
+}
+
+
+def feature_flag_schema_payload() -> dict:
+    return {
+        group: {
+            "title": section["title"],
+            "items": {
+                key: {
+                    "label": spec["label"],
+                    "description": spec.get("description", ""),
+                    "path": spec.get("path", ""),
+                    "default": bool(spec["default"]),
+                }
+                for key, spec in section["flags"].items()
+            },
+        }
+        for group, section in FEATURE_FLAG_REGISTRY.items()
+    }
 
 PULSE_QUESTIONS = {
     "green": [],
@@ -1292,6 +1386,51 @@ class AdminSpotlightAction(BaseModel):
     admin_secret: str
     action: str
     edited_reason: str | None = None
+
+
+class AdminSafetySettingsPayload(BaseModel):
+    admin_secret: str
+    flood_message_threshold: int | None = None
+    flood_window_seconds: int | None = None
+    daily_digest_enabled: bool | None = None
+    daily_digest_hour_utc: int | None = None
+    keywords: list[dict] | None = None
+
+
+class AdminFoxBuiltinSettingsPayload(BaseModel):
+    admin_secret: str
+    self_care: dict | None = None
+    templates: dict | None = None
+
+
+class FoxAuditBatchPayload(BaseModel):
+    entries: list[dict]
+
+
+class AdminFoxScheduledPostPayload(BaseModel):
+    admin_secret: str
+    title: str | None = None
+    enabled: bool | None = None
+    schedule_type: str | None = None
+    hour_utc: int | None = None
+    minute_utc: int | None = None
+    interval_hours: int | None = None
+    weekday_utc: int | None = None
+    run_at: str | None = None
+    target: str | None = None
+    topic_id: int | None = None
+    text: str | None = None
+    banner: str | None = None
+    link_url: str | None = None
+    link_label: str | None = None
+    replace_singleton: str | None = None
+
+
+class FoxMessageDeliveryPayload(BaseModel):
+    post_id: str
+    message_id: int | None = None
+    chat_id: int | None = None
+    error: str | None = None
 
 
 # ---------------------------------
@@ -2043,6 +2182,9 @@ def drain_pulse_admin_telegram_backlog() -> None:
         )
 
 
+drain_pulse_admin_telegram_backlog()
+
+
 def apply_admin_pulse_question_action(entry: dict, action: str, edited_question: str | None = None) -> None:
     action = (action or "").strip().lower()
     if action == "amend":
@@ -2319,13 +2461,17 @@ def merged_feature_flags(saved: dict | None = None) -> dict:
 
 
 def load_feature_flags() -> dict:
-    if not os.path.exists(FEATURE_FLAGS_PATH):
-        return merged_feature_flags()
-    try:
-        with open(FEATURE_FLAGS_PATH, "r", encoding="utf-8") as handle:
-            return merged_feature_flags(json.load(handle))
-    except (OSError, json.JSONDecodeError):
-        return merged_feature_flags()
+    saved = None
+    if os.path.exists(FEATURE_FLAGS_PATH):
+        try:
+            with open(FEATURE_FLAGS_PATH, "r", encoding="utf-8") as handle:
+                saved = json.load(handle)
+        except (OSError, json.JSONDecodeError):
+            saved = None
+    flags = merged_feature_flags(saved)
+    if flags != saved:
+        save_feature_flags(flags)
+    return flags
 
 
 def save_feature_flags(flags: dict) -> None:
@@ -2334,6 +2480,79 @@ def save_feature_flags(flags: dict) -> None:
         os.makedirs(directory, exist_ok=True)
     with open(FEATURE_FLAGS_PATH, "w", encoding="utf-8") as handle:
         json.dump(flags, handle, indent=2, sort_keys=True)
+
+
+DEFAULT_SAFETY_SETTINGS = {
+    "flood_message_threshold": 8,
+    "flood_window_seconds": 60,
+    "daily_digest_enabled": True,
+    "daily_digest_hour_utc": 8,
+    "keywords": [],
+}
+
+
+def normalized_safety_settings(raw: dict | None = None) -> dict:
+    settings = {
+        **DEFAULT_SAFETY_SETTINGS,
+        "keywords": [],
+    }
+    if not isinstance(raw, dict):
+        return settings
+    try:
+        settings["flood_message_threshold"] = max(3, min(int(raw.get("flood_message_threshold", 8)), 50))
+    except (TypeError, ValueError):
+        pass
+    try:
+        settings["flood_window_seconds"] = max(15, min(int(raw.get("flood_window_seconds", 60)), 600))
+    except (TypeError, ValueError):
+        pass
+    settings["daily_digest_enabled"] = bool(raw.get("daily_digest_enabled", True))
+    try:
+        settings["daily_digest_hour_utc"] = max(0, min(int(raw.get("daily_digest_hour_utc", 8)), 23))
+    except (TypeError, ValueError):
+        pass
+    keywords = []
+    for entry in raw.get("keywords") or []:
+        if not isinstance(entry, dict):
+            continue
+        term = str(entry.get("term") or "").strip().lower()
+        if not term:
+            continue
+        severity = str(entry.get("severity") or "medium").strip().lower()
+        if severity not in {"low", "medium", "high"}:
+            severity = "medium"
+        keywords.append(
+            {
+                "term": term,
+                "category": str(entry.get("category") or "custom").strip() or "custom",
+                "severity": severity,
+                "enabled": bool(entry.get("enabled", True)),
+                "added_at": entry.get("added_at") or now_iso(),
+                "added_by": entry.get("added_by") or "admin",
+            }
+        )
+    settings["keywords"] = keywords
+    return settings
+
+
+def load_safety_settings() -> dict:
+    if not os.path.exists(SAFETY_SETTINGS_PATH):
+        return normalized_safety_settings()
+    try:
+        with open(SAFETY_SETTINGS_PATH, "r", encoding="utf-8") as handle:
+            return normalized_safety_settings(json.load(handle))
+    except (OSError, json.JSONDecodeError):
+        return normalized_safety_settings()
+
+
+def save_safety_settings(settings: dict) -> dict:
+    normalized = normalized_safety_settings(settings)
+    directory = os.path.dirname(SAFETY_SETTINGS_PATH)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    with open(SAFETY_SETTINGS_PATH, "w", encoding="utf-8") as handle:
+        json.dump(normalized, handle, indent=2, sort_keys=True)
+    return normalized
 
 
 def normalized_pulse_threshold(value) -> int:
@@ -2499,6 +2718,60 @@ def ensure_fox_read_tables(conn):
             user_id INTEGER,
             attempt_time TEXT,
             success INTEGER
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS admin_actions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            admin_user_id INTEGER,
+            target_user_id INTEGER,
+            action_type TEXT,
+            delivery TEXT,
+            template_id INTEGER,
+            reason TEXT,
+            logged_at TEXT
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS member_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            username TEXT,
+            display_name TEXT,
+            event_type TEXT,
+            detail TEXT,
+            logged_at TEXT
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS flood_flags (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            username TEXT,
+            display_name TEXT,
+            message_count INTEGER,
+            window_seconds INTEGER,
+            message_excerpt TEXT,
+            logged_at TEXT
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS watchlist_keywords (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            term TEXT UNIQUE,
+            category TEXT DEFAULT 'custom',
+            severity TEXT DEFAULT 'medium',
+            enabled INTEGER DEFAULT 1,
+            added_at TEXT,
+            added_by TEXT
         )
         """
     )
@@ -3092,6 +3365,718 @@ def build_alcove_analytics(period: str):
         "storiesActed": len([entry for entry in story_entries if not since or entry.get("time", "") >= since]),
         "audioSessions": len([entry for entry in asmr_entries if not since or entry.get("time", "") >= since]),
     }
+
+
+def group_activity_period(period: str) -> str:
+    allowed = {"today", "week", "all", "allTime"}
+    normalized = (period or "today").strip()
+    if normalized == "allTime":
+        normalized = "all"
+    if normalized not in allowed:
+        raise HTTPException(status_code=400, detail="period must be today, week, or all")
+    return normalized
+
+
+def group_activity_since(period: str) -> str | None:
+    normalized = group_activity_period(period)
+    if normalized == "all":
+        return None
+    return period_start(normalized)
+
+
+def format_group_user_ref(user_id, username="", display_name=""):
+    username = (username or "").strip()
+    display_name = (display_name or "").strip()
+    if username:
+        label = f"@{username.lstrip('@')}"
+    elif display_name:
+        label = display_name
+    else:
+        label = str(user_id or "unknown")
+    return {
+        "user_id": user_id,
+        "username": username.lstrip("@") if username else "",
+        "display_name": display_name,
+        "label": label,
+    }
+
+
+def group_activity_count_rows(rows, label_key="label", count_key="count"):
+    formatted = []
+    for row in rows:
+        if isinstance(row, dict):
+            user = format_group_user_ref(
+                row.get("user_id"),
+                row.get("username"),
+                row.get("display_name"),
+            )
+            formatted.append({**user, "count": row.get(count_key) or 0})
+            continue
+        user_id, username, display_name, count = row
+        formatted.append({**format_group_user_ref(user_id, username, display_name), "count": count})
+    return formatted
+
+
+def build_group_activity_summary(period: str):
+    since = group_activity_since(period)
+    message_where, message_params = since_clause("timestamp", since)
+    verified_where, verified_params = since_clause("verified_at", since)
+    link_where, link_params = since_clause("logged_at", since)
+    tone_where, tone_params = since_clause("logged_at", since)
+    action_where, action_params = since_clause("logged_at", since)
+    captcha_where, captcha_params = since_clause("attempt_time", since)
+
+    tone_alert_where = tone_where + (" AND" if tone_where else " WHERE") + " severity IN ('medium', 'high')"
+    failed_captcha_where = captcha_where + (" AND" if captcha_where else " WHERE") + " success = 0"
+
+    top_posters = fox_db_rows(
+        f"""
+        SELECT m.user_id, COALESCE(p.username, ''), COALESCE(p.display_name, ''), COUNT(*) AS count
+        FROM messages m
+        LEFT JOIN user_profiles p ON p.user_id = m.user_id
+        {message_where}{' AND' if message_where else ' WHERE'} m.user_id IS NOT NULL
+        GROUP BY m.user_id, p.username, p.display_name
+        ORDER BY count DESC
+        LIMIT 8
+        """,
+        message_params,
+    )
+    top_tone = fox_db_rows(
+        f"""
+        SELECT user_id, COALESCE(username, ''), COALESCE(display_name, ''), COUNT(*) AS count
+        FROM tone_flags
+        {tone_where}
+        GROUP BY user_id, username, display_name
+        ORDER BY count DESC
+        LIMIT 8
+        """,
+        tone_params,
+    )
+    top_links = fox_db_rows(
+        f"""
+        SELECT user_id, COALESCE(username, ''), COALESCE(display_name, ''), COUNT(*) AS count
+        FROM link_violations
+        {link_where}
+        GROUP BY user_id, username, display_name
+        ORDER BY count DESC
+        LIMIT 8
+        """,
+        link_params,
+    )
+    users_needing_attention = fox_db_rows(
+        """
+        SELECT s.user_id, COALESCE(p.username, ''), COALESCE(p.display_name, ''), COUNT(*) AS count
+        FROM user_strikes s
+        LEFT JOIN user_profiles p ON p.user_id = s.user_id
+        WHERE s.active = 1
+        GROUP BY s.user_id, p.username, p.display_name
+        HAVING count >= 2
+        ORDER BY count DESC
+        LIMIT 12
+        """
+    )
+    action_breakdown = fox_db_rows(
+        f"""
+        SELECT action_type, COUNT(*) AS count
+        FROM admin_actions
+        {action_where}
+        GROUP BY action_type
+        ORDER BY count DESC
+        """,
+        action_params,
+    )
+
+    return {
+        "period": group_activity_period(period),
+        "since": since,
+        "generated_at": now_iso(),
+        "source": "bot_sync" if synced_alcove_analytics else "fox_logs",
+        "db_available": os.path.exists(FOX_LOGS_DB_PATH),
+        "last_bot_sync_at": last_bot_sync_at,
+        "overview": {
+            "newResidents": fox_db_value(f"SELECT COUNT(*) FROM verified_users{verified_where}", verified_params),
+            "totalResidents": len(get_verified_alcove_users()),
+            "messages": fox_db_value(f"SELECT COUNT(*) FROM messages{message_where}", message_params),
+            "activeUsers": fox_db_value(
+                f"SELECT COUNT(DISTINCT user_id) FROM messages{message_where}"
+                + (" AND" if message_where else " WHERE")
+                + " user_id IS NOT NULL",
+                message_params,
+            ),
+            "linkAttempts": fox_db_value(f"SELECT COUNT(*) FROM link_violations{link_where}", link_params),
+            "toneFlags": fox_db_value(f"SELECT COUNT(*) FROM tone_flags{tone_where}", tone_params),
+            "toneAlerts": fox_db_value(tone_alert_where, tone_params),
+            "failedCaptcha": fox_db_value(failed_captcha_where, captcha_params),
+            "floodAlerts": fox_db_value(f"SELECT COUNT(*) FROM flood_flags{link_where}", link_params),
+            "memberEvents": fox_db_value(f"SELECT COUNT(*) FROM member_events{link_where}", link_params),
+            "warnings": fox_db_value(
+                f"SELECT COUNT(*) FROM admin_actions{action_where}"
+                + (" AND" if action_where else " WHERE")
+                + " action_type = 'warning'",
+                action_params,
+            ),
+            "mutes": fox_db_value(
+                f"SELECT COUNT(*) FROM admin_actions{action_where}"
+                + (" AND" if action_where else " WHERE")
+                + " action_type = 'mute'",
+                action_params,
+            ),
+            "strikesAdded": fox_db_value(
+                f"SELECT COUNT(*) FROM admin_actions{action_where}"
+                + (" AND" if action_where else " WHERE")
+                + " action_type = 'strike_add'",
+                action_params,
+            ),
+            "strikesRemoved": fox_db_value(
+                f"SELECT COUNT(*) FROM admin_actions{action_where}"
+                + (" AND" if action_where else " WHERE")
+                + " action_type = 'strike_remove'",
+                action_params,
+            ),
+            "bansApproved": fox_db_value(
+                f"SELECT COUNT(*) FROM admin_actions{action_where}"
+                + (" AND" if action_where else " WHERE")
+                + " action_type = 'ban_approved'",
+                action_params,
+            ),
+            "bansRejected": fox_db_value(
+                f"SELECT COUNT(*) FROM admin_actions{action_where}"
+                + (" AND" if action_where else " WHERE")
+                + " action_type = 'ban_rejected'",
+                action_params,
+            ),
+        },
+        "topPosters": group_activity_count_rows(top_posters),
+        "topToneFlags": group_activity_count_rows(top_tone),
+        "topLinkAttempts": group_activity_count_rows(top_links),
+        "usersNeedingAttention": group_activity_count_rows(users_needing_attention),
+        "actionBreakdown": [
+            {"action_type": row.get("action_type") or "unknown", "count": row.get("count") or 0}
+            for row in action_breakdown
+        ],
+    }
+
+
+def build_group_activity_users(period: str, sort: str = "risk", limit: int = 50):
+    since = group_activity_since(period)
+    limit = max(1, min(int(limit or 50), 200))
+    users = get_verified_alcove_users()
+
+    message_counts = {
+        row["user_id"]: row.get("count") or 0
+        for row in fox_db_rows(
+            f"""
+            SELECT user_id, COUNT(*) AS count
+            FROM messages
+            {since_clause("timestamp", since)[0]}
+            GROUP BY user_id
+            """,
+            since_clause("timestamp", since)[1],
+        )
+    }
+    link_counts = {
+        row["user_id"]: row.get("count") or 0
+        for row in fox_db_rows(
+            f"""
+            SELECT user_id, COUNT(*) AS count
+            FROM link_violations
+            {since_clause("logged_at", since)[0]}
+            GROUP BY user_id
+            """,
+            since_clause("logged_at", since)[1],
+        )
+    }
+    tone_counts = {
+        row["user_id"]: row.get("count") or 0
+        for row in fox_db_rows(
+            f"""
+            SELECT user_id, COUNT(*) AS count
+            FROM tone_flags
+            {since_clause("logged_at", since)[0]}
+            GROUP BY user_id
+            """,
+            since_clause("logged_at", since)[1],
+        )
+    }
+
+    enriched = []
+    for user in users:
+        user_id = user.get("user_id")
+        period_messages = message_counts.get(user_id, 0)
+        period_links = link_counts.get(user_id, 0)
+        period_tone = tone_counts.get(user_id, 0)
+        active_strikes = user.get("active_strikes") or 0
+        risk_score = (active_strikes * 5) + (period_links * 2) + period_tone
+        enriched.append(
+            {
+                **user,
+                "period_messages": period_messages,
+                "period_link_attempts": period_links,
+                "period_tone_flags": period_tone,
+                "risk_score": risk_score,
+                "needs_attention": active_strikes >= 2 or period_links >= 3 or period_tone >= 3,
+            }
+        )
+
+    sort_key = (sort or "risk").strip().lower()
+    sort_map = {
+        "risk": lambda item: (item["risk_score"], item["period_messages"]),
+        "messages": lambda item: item["period_messages"],
+        "links": lambda item: item["period_link_attempts"],
+        "tone": lambda item: item["period_tone_flags"],
+        "strikes": lambda item: item["active_strikes"],
+    }
+    enriched.sort(key=sort_map.get(sort_key, sort_map["risk"]), reverse=True)
+    return {
+        "period": group_activity_period(period),
+        "since": since,
+        "sort": sort_key,
+        "users": enriched[:limit],
+    }
+
+
+def build_group_activity_violations(violation_type: str, period: str, limit: int = 40):
+    since = group_activity_since(period)
+    limit = max(1, min(int(limit or 40), 200))
+    where, params = since_clause("logged_at", since)
+
+    if violation_type == "links":
+        rows = fox_db_rows(
+            f"""
+            SELECT id, message_id, user_id, username, display_name, message_excerpt, link_samples, logged_at
+            FROM link_violations
+            {where}
+            ORDER BY logged_at DESC
+            LIMIT ?
+            """,
+            params + (limit,),
+        )
+    elif violation_type == "tone":
+        rows = fox_db_rows(
+            f"""
+            SELECT id, message_id, user_id, username, display_name, categories, severity, score,
+                   matched_terms, message_excerpt, logged_at
+            FROM tone_flags
+            {where}
+            ORDER BY logged_at DESC
+            LIMIT ?
+            """,
+            params + (limit,),
+        )
+    else:
+        raise HTTPException(status_code=400, detail="type must be links or tone")
+
+    for row in rows:
+        user = format_group_user_ref(row.get("user_id"), row.get("username"), row.get("display_name"))
+        row.update(user)
+    return {
+        "period": group_activity_period(period),
+        "since": since,
+        "type": violation_type,
+        "items": rows,
+    }
+
+
+def build_group_activity_actions(period: str, limit: int = 40):
+    since = group_activity_since(period)
+    limit = max(1, min(int(limit or 40), 200))
+    where, params = since_clause("logged_at", since)
+    rows = fox_db_rows(
+        f"""
+        SELECT id, admin_user_id, target_user_id, action_type, delivery, template_id, reason, logged_at
+        FROM admin_actions
+        {where}
+        ORDER BY logged_at DESC
+        LIMIT ?
+        """,
+        params + (limit,),
+    )
+    return {
+        "period": group_activity_period(period),
+        "since": since,
+        "items": rows,
+    }
+
+
+def build_group_activity_user_detail(user_id: int):
+    profile_rows = fox_db_rows(
+        """
+        SELECT user_id, username, first_name, last_name, display_name, first_seen, last_seen, verified_at, source
+        FROM user_profiles
+        WHERE user_id = ?
+        LIMIT 1
+        """,
+        (user_id,),
+    )
+    profile = profile_rows[0] if profile_rows else {"user_id": user_id}
+    user = format_group_user_ref(
+        profile.get("user_id", user_id),
+        profile.get("username"),
+        profile.get("display_name"),
+    )
+
+    return {
+        **user,
+        "first_seen": profile.get("first_seen"),
+        "last_seen": profile.get("last_seen"),
+        "verified_at": profile.get("verified_at"),
+        "source": profile.get("source"),
+        "message_count": fox_db_value("SELECT COUNT(*) FROM messages WHERE user_id = ?", (user_id,)),
+        "link_attempts": fox_db_value("SELECT COUNT(*) FROM link_violations WHERE user_id = ?", (user_id,)),
+        "tone_flags": fox_db_value("SELECT COUNT(*) FROM tone_flags WHERE user_id = ?", (user_id,)),
+        "high_tone_flags": fox_db_value(
+            "SELECT COUNT(*) FROM tone_flags WHERE user_id = ? AND severity = 'high'",
+            (user_id,),
+        ),
+        "active_strikes": fox_db_value(
+            "SELECT COUNT(*) FROM user_strikes WHERE user_id = ? AND active = 1",
+            (user_id,),
+        ),
+        "total_strikes": fox_db_value("SELECT COUNT(*) FROM user_strikes WHERE user_id = ?", (user_id,)),
+        "recent_strikes": fox_db_rows(
+            """
+            SELECT active, reason, created_at, admin_user_id, removed_at, removed_by
+            FROM user_strikes
+            WHERE user_id = ?
+            ORDER BY created_at DESC
+            LIMIT 8
+            """,
+            (user_id,),
+        ),
+        "recent_tone_flags": fox_db_rows(
+            """
+            SELECT categories, severity, score, matched_terms, message_excerpt, logged_at
+            FROM tone_flags
+            WHERE user_id = ?
+            ORDER BY logged_at DESC
+            LIMIT 6
+            """,
+            (user_id,),
+        ),
+        "recent_link_attempts": fox_db_rows(
+            """
+            SELECT link_samples, message_excerpt, logged_at
+            FROM link_violations
+            WHERE user_id = ?
+            ORDER BY logged_at DESC
+            LIMIT 6
+            """,
+            (user_id,),
+        ),
+        "recent_admin_actions": fox_db_rows(
+            """
+            SELECT admin_user_id, action_type, delivery, reason, logged_at
+            FROM admin_actions
+            WHERE target_user_id = ?
+            ORDER BY logged_at DESC
+            LIMIT 8
+            """,
+            (user_id,),
+        ),
+    }
+
+
+def build_group_activity_sheets_feed(period: str):
+    summary = build_group_activity_summary(period)
+    users = build_group_activity_users(period, sort="risk", limit=500)
+    links = build_group_activity_violations("links", period, limit=2000)
+    tone = build_group_activity_violations("tone", period, limit=2000)
+    actions = build_group_activity_actions(period, limit=2000)
+    return {
+        "generated_at": now_iso(),
+        "period": summary.get("period"),
+        "since": summary.get("since"),
+        "source": summary.get("source"),
+        "db_available": summary.get("db_available"),
+        "last_bot_sync_at": summary.get("last_bot_sync_at"),
+        "overview": summary.get("overview") or {},
+        "top_posters": summary.get("topPosters") or [],
+        "top_tone_flags": summary.get("topToneFlags") or [],
+        "top_link_attempts": summary.get("topLinkAttempts") or [],
+        "users_needing_attention": summary.get("usersNeedingAttention") or [],
+        "action_breakdown": summary.get("actionBreakdown") or [],
+        "users": users.get("users") or [],
+        "link_alerts": links.get("items") or [],
+        "tone_flags": tone.get("items") or [],
+        "admin_actions": actions.get("items") or [],
+        "member_events": build_group_activity_member_events(period, limit=200).get("items") or [],
+        "flood_flags": build_group_activity_flood_flags(period, limit=200).get("items") or [],
+    }
+
+
+def _csv_from_rows(fieldnames: list[str], rows: list[dict]) -> str:
+    buffer = io.StringIO()
+    writer = csv.DictWriter(buffer, fieldnames=fieldnames, extrasaction="ignore")
+    writer.writeheader()
+    for row in rows:
+        writer.writerow({key: row.get(key, "") for key in fieldnames})
+    return buffer.getvalue()
+
+
+def build_group_activity_csv_files(period: str) -> dict[str, str]:
+    feed = build_group_activity_sheets_feed(period)
+    overview = feed.get("overview") or {}
+    overview_rows = [
+        {"metric": key, "value": value}
+        for key, value in overview.items()
+    ]
+    overview_rows.extend([
+        {"metric": "generated_at", "value": feed.get("generated_at")},
+        {"metric": "period", "value": feed.get("period")},
+        {"metric": "since", "value": feed.get("since")},
+        {"metric": "source", "value": feed.get("source")},
+        {"metric": "last_bot_sync_at", "value": feed.get("last_bot_sync_at")},
+    ])
+
+    user_rows = [
+        {
+            "user_id": row.get("user_id"),
+            "username": row.get("username"),
+            "display_name": row.get("display_name"),
+            "label": row.get("label"),
+            "period_messages": row.get("period_messages"),
+            "period_link_attempts": row.get("period_link_attempts"),
+            "period_tone_flags": row.get("period_tone_flags"),
+            "active_strikes": row.get("active_strikes"),
+            "message_count": row.get("message_count"),
+            "link_attempts": row.get("link_attempts"),
+            "tone_flags": row.get("tone_flags"),
+            "risk_score": row.get("risk_score"),
+            "needs_attention": row.get("needs_attention"),
+            "first_seen": row.get("first_seen"),
+            "last_seen": row.get("last_seen"),
+            "verified_at": row.get("verified_at"),
+        }
+        for row in feed.get("users") or []
+    ]
+
+    link_rows = [
+        {
+            "logged_at": row.get("logged_at"),
+            "user_id": row.get("user_id"),
+            "username": row.get("username"),
+            "display_name": row.get("display_name"),
+            "label": row.get("label"),
+            "link_samples": row.get("link_samples"),
+            "message_excerpt": row.get("message_excerpt"),
+            "message_id": row.get("message_id"),
+        }
+        for row in feed.get("link_alerts") or []
+    ]
+
+    tone_rows = [
+        {
+            "logged_at": row.get("logged_at"),
+            "user_id": row.get("user_id"),
+            "username": row.get("username"),
+            "display_name": row.get("display_name"),
+            "label": row.get("label"),
+            "severity": row.get("severity"),
+            "score": row.get("score"),
+            "categories": row.get("categories"),
+            "matched_terms": row.get("matched_terms"),
+            "message_excerpt": row.get("message_excerpt"),
+            "message_id": row.get("message_id"),
+        }
+        for row in feed.get("tone_flags") or []
+    ]
+
+    action_rows = [
+        {
+            "logged_at": row.get("logged_at"),
+            "action_type": row.get("action_type"),
+            "target_user_id": row.get("target_user_id"),
+            "admin_user_id": row.get("admin_user_id"),
+            "delivery": row.get("delivery"),
+            "reason": row.get("reason"),
+            "template_id": row.get("template_id"),
+        }
+        for row in feed.get("admin_actions") or []
+    ]
+
+    rank_rows = []
+    for section, rows in (
+        ("top_posters", feed.get("top_posters") or []),
+        ("top_tone_flags", feed.get("top_tone_flags") or []),
+        ("top_link_attempts", feed.get("top_link_attempts") or []),
+        ("users_needing_attention", feed.get("users_needing_attention") or []),
+    ):
+        for row in rows:
+            rank_rows.append(
+                {
+                    "section": section,
+                    "user_id": row.get("user_id"),
+                    "username": row.get("username"),
+                    "display_name": row.get("display_name"),
+                    "label": row.get("label"),
+                    "count": row.get("count"),
+                }
+            )
+
+    return {
+        "overview.csv": _csv_from_rows(["metric", "value"], overview_rows),
+        "users.csv": _csv_from_rows(
+            [
+                "user_id", "username", "display_name", "label", "risk_score", "needs_attention",
+                "period_messages", "period_link_attempts", "period_tone_flags", "active_strikes",
+                "message_count", "link_attempts", "tone_flags", "first_seen", "last_seen", "verified_at",
+            ],
+            user_rows,
+        ),
+        "link_alerts.csv": _csv_from_rows(
+            ["logged_at", "user_id", "username", "display_name", "label", "link_samples", "message_excerpt", "message_id"],
+            link_rows,
+        ),
+        "tone_flags.csv": _csv_from_rows(
+            [
+                "logged_at", "user_id", "username", "display_name", "label", "severity", "score",
+                "categories", "matched_terms", "message_excerpt", "message_id",
+            ],
+            tone_rows,
+        ),
+        "admin_actions.csv": _csv_from_rows(
+            ["logged_at", "action_type", "target_user_id", "admin_user_id", "delivery", "reason", "template_id"],
+            action_rows,
+        ),
+        "rankings.csv": _csv_from_rows(
+            ["section", "user_id", "username", "display_name", "label", "count"],
+            rank_rows,
+        ),
+    }
+
+
+def build_group_activity_csv(period: str, view: str = "users") -> str:
+    files = build_group_activity_csv_files(period)
+    view_map = {
+        "overview": "overview.csv",
+        "users": "users.csv",
+        "links": "link_alerts.csv",
+        "tone": "tone_flags.csv",
+        "actions": "admin_actions.csv",
+        "rankings": "rankings.csv",
+    }
+    filename = view_map.get((view or "users").strip().lower())
+    if not filename:
+        raise HTTPException(status_code=400, detail="view must be overview, users, links, tone, actions, rankings, or full")
+    return files[filename]
+
+
+def build_group_activity_export_zip(period: str) -> bytes:
+    files = build_group_activity_csv_files(period)
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+        for name, content in files.items():
+            archive.writestr(name, content)
+    return buffer.getvalue()
+
+
+def build_safety_action_queue(period: str = "today"):
+    since = group_activity_since(period)
+    summary = build_group_activity_summary(period)
+    overview = summary.get("overview") or {}
+    items = []
+
+    def add_item(kind, title, count, severity, hint=""):
+        if not count:
+            return
+        items.append(
+            {
+                "kind": kind,
+                "title": title,
+                "count": count,
+                "severity": severity,
+                "hint": hint,
+            }
+        )
+
+    add_item("flood", "Flood alerts", overview.get("floodAlerts", 0), "high", "Users posting too fast")
+    add_item("links", "Link violations", overview.get("linkAttempts", 0), "high", "Review link alerts tab")
+    add_item("tone", "Tone alerts", overview.get("toneAlerts", 0), "medium", "Review tone flags tab")
+    add_item("strikes", "Users at 2+ strikes", len(summary.get("usersNeedingAttention") or []), "high", "Review user profiles")
+    add_item("captcha", "Failed verifications", overview.get("failedCaptcha", 0), "medium", "Check join verification flow")
+
+    link_where, link_params = since_clause("logged_at", since)
+    recent_flood = fox_db_rows(
+        f"""
+        SELECT user_id, username, display_name, message_count, window_seconds, message_excerpt, logged_at
+        FROM flood_flags
+        {link_where}
+        ORDER BY logged_at DESC
+        LIMIT 5
+        """,
+        link_params,
+    )
+    member_where, member_params = since_clause("logged_at", since)
+    recent_joins = fox_db_rows(
+        f"""
+        SELECT user_id, username, display_name, event_type, detail, logged_at
+        FROM member_events
+        {member_where}
+        ORDER BY logged_at DESC
+        LIMIT 8
+        """,
+        member_params,
+    )
+
+    pending_pulse = len([
+        entry for entry in pulse_question_suggestions
+        if entry.get("status") == "pending_review"
+    ])
+    pending_spotlight = len([
+        entry for entry in spotlight_entries
+        if entry.get("status") == "pending_review"
+    ])
+    add_item("pulse", "Pulse questions awaiting review", pending_pulse, "medium", "Open Pulse admin tab")
+    add_item("spotlight", "Spotlights awaiting review", pending_spotlight, "medium", "Open Pulse admin tab")
+
+    items.sort(key=lambda row: {"high": 0, "medium": 1, "low": 2}.get(row["severity"], 3))
+    return {
+        "period": group_activity_period(period),
+        "since": since,
+        "generated_at": now_iso(),
+        "items": items,
+        "recent_flood": recent_flood,
+        "recent_member_events": recent_joins,
+        "settings": load_safety_settings(),
+    }
+
+
+def build_group_activity_member_events(period: str, limit: int = 60):
+    since = group_activity_since(period)
+    limit = max(1, min(int(limit or 60), 300))
+    where, params = since_clause("logged_at", since)
+    rows = fox_db_rows(
+        f"""
+        SELECT id, user_id, username, display_name, event_type, detail, logged_at
+        FROM member_events
+        {where}
+        ORDER BY logged_at DESC
+        LIMIT ?
+        """,
+        params + (limit,),
+    )
+    for row in rows:
+        row.update(format_group_user_ref(row.get("user_id"), row.get("username"), row.get("display_name")))
+    return {"period": group_activity_period(period), "since": since, "items": rows}
+
+
+def build_group_activity_flood_flags(period: str, limit: int = 60):
+    since = group_activity_since(period)
+    limit = max(1, min(int(limit or 60), 300))
+    where, params = since_clause("logged_at", since)
+    rows = fox_db_rows(
+        f"""
+        SELECT id, user_id, username, display_name, message_count, window_seconds, message_excerpt, logged_at
+        FROM flood_flags
+        {where}
+        ORDER BY logged_at DESC
+        LIMIT ?
+        """,
+        params + (limit,),
+    )
+    for row in rows:
+        row.update(format_group_user_ref(row.get("user_id"), row.get("username"), row.get("display_name")))
+    return {"period": group_activity_period(period), "since": since, "items": rows}
 
 
 def add_notification(kind: str, text: str, public: bool = True):
@@ -4033,7 +5018,11 @@ def update_modules(payload: ModuleStateUpdate):
 
 @app.get("/api/feature-flags")
 def get_feature_flags():
-    return {"status": "ok", "features": load_feature_flags()}
+    return {
+        "status": "ok",
+        "features": load_feature_flags(),
+        "schema": feature_flag_schema_payload(),
+    }
 
 
 @app.post("/api/feature-flags")
@@ -4042,13 +5031,17 @@ def update_feature_flags(payload: FeatureFlagsUpdate, x_bot_sync_secret: str | N
     flags = load_feature_flags()
     incoming = payload.dict(exclude_none=True)
     for group, values in incoming.items():
-        if group not in flags or not isinstance(values, dict):
+        if group == "admin_secret" or group not in flags or not isinstance(values, dict):
             continue
         for key, value in values.items():
             if key in flags[group]:
                 flags[group][key] = bool(value)
     save_feature_flags(flags)
-    return {"status": "ok", "features": flags}
+    return {
+        "status": "ok",
+        "features": flags,
+        "schema": feature_flag_schema_payload(),
+    }
 
 
 @app.get("/api/pulse-settings")
@@ -4175,6 +5168,254 @@ def admin_pulse_archive_export(
     csv_text = pulse_archive_answers_csv(filters)
     stamp = day or from_day or pulse_day_key()
     filename = f"pulse-archive-{stamp}.csv"
+    return Response(
+        content=csv_text,
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@app.get("/api/admin/group-activity/summary")
+def admin_group_activity_summary(admin_secret: str, period: str = "today"):
+    verify_admin_secret(admin_secret)
+    return {"status": "ok", **build_group_activity_summary(period)}
+
+
+@app.get("/api/admin/group-activity/users")
+def admin_group_activity_users(
+    admin_secret: str,
+    period: str = "week",
+    sort: str = "risk",
+    limit: int = 50,
+):
+    verify_admin_secret(admin_secret)
+    return {"status": "ok", **build_group_activity_users(period, sort=sort, limit=limit)}
+
+
+@app.get("/api/admin/group-activity/violations")
+def admin_group_activity_violations(
+    admin_secret: str,
+    type: str = "links",
+    period: str = "week",
+    limit: int = 40,
+):
+    verify_admin_secret(admin_secret)
+    return {"status": "ok", **build_group_activity_violations(type, period, limit=limit)}
+
+
+@app.get("/api/admin/group-activity/actions")
+def admin_group_activity_actions(admin_secret: str, period: str = "week", limit: int = 40):
+    verify_admin_secret(admin_secret)
+    return {"status": "ok", **build_group_activity_actions(period, limit=limit)}
+
+
+@app.get("/api/admin/group-activity/user/{user_id}")
+def admin_group_activity_user_detail(user_id: int, admin_secret: str):
+    verify_admin_secret(admin_secret)
+    return {"status": "ok", "user": build_group_activity_user_detail(user_id)}
+
+
+@app.get("/api/admin/safety/action-queue")
+def admin_safety_action_queue(admin_secret: str, period: str = "today"):
+    verify_admin_secret(admin_secret)
+    return {"status": "ok", **build_safety_action_queue(period)}
+
+
+@app.get("/api/admin/safety/settings")
+def admin_safety_settings_get(admin_secret: str):
+    verify_admin_secret(admin_secret)
+    return {"status": "ok", "settings": load_safety_settings()}
+
+
+@app.post("/api/admin/safety/settings")
+def admin_safety_settings_save(payload: AdminSafetySettingsPayload):
+    verify_admin_secret(payload.admin_secret)
+    current = load_safety_settings()
+    if payload.flood_message_threshold is not None:
+        current["flood_message_threshold"] = payload.flood_message_threshold
+    if payload.flood_window_seconds is not None:
+        current["flood_window_seconds"] = payload.flood_window_seconds
+    if payload.daily_digest_enabled is not None:
+        current["daily_digest_enabled"] = payload.daily_digest_enabled
+    if payload.daily_digest_hour_utc is not None:
+        current["daily_digest_hour_utc"] = payload.daily_digest_hour_utc
+    if payload.keywords is not None:
+        current["keywords"] = payload.keywords
+    saved = save_safety_settings(current)
+    return {"status": "ok", "settings": saved}
+
+
+@app.get("/api/admin/safety/member-events")
+def admin_safety_member_events(admin_secret: str, period: str = "week", limit: int = 60):
+    verify_admin_secret(admin_secret)
+    return {"status": "ok", **build_group_activity_member_events(period, limit=limit)}
+
+
+@app.get("/api/admin/safety/flood-flags")
+def admin_safety_flood_flags(admin_secret: str, period: str = "week", limit: int = 60):
+    verify_admin_secret(admin_secret)
+    return {"status": "ok", **build_group_activity_flood_flags(period, limit=limit)}
+
+
+@app.get("/api/bot-sync/safety-settings")
+def bot_sync_safety_settings(x_bot_sync_secret: str | None = Header(default=None)):
+    verify_bot_sync_secret(x_bot_sync_secret)
+    return {"status": "ok", "settings": load_safety_settings()}
+
+
+@app.get("/api/admin/fox-messages")
+def admin_fox_messages(admin_secret: str):
+    verify_admin_secret(admin_secret)
+    state = fox_messages_store.load_fox_messages_state()
+    return {"status": "ok", **fox_messages_store.admin_payload(state)}
+
+
+@app.post("/api/admin/fox-messages/builtin")
+def admin_fox_messages_builtin(payload: AdminFoxBuiltinSettingsPayload):
+    verify_admin_secret(payload.admin_secret)
+    state = fox_messages_store.load_fox_messages_state()
+    builtin = state.setdefault("builtin_settings", {})
+    if isinstance(payload.self_care, dict):
+        current = builtin.setdefault("self_care", {})
+        if "enabled" in payload.self_care:
+            current["enabled"] = bool(payload.self_care["enabled"])
+        if payload.self_care.get("interval_min_hours") is not None:
+            current["interval_min_hours"] = max(1, min(int(payload.self_care["interval_min_hours"]), 168))
+        if payload.self_care.get("interval_max_hours") is not None:
+            current["interval_max_hours"] = max(1, min(int(payload.self_care["interval_max_hours"]), 168))
+        if payload.self_care.get("banner") is not None:
+            current["banner"] = str(payload.self_care["banner"]).strip()
+        if isinstance(payload.self_care.get("messages"), list):
+            messages = [str(line).strip() for line in payload.self_care["messages"] if str(line).strip()]
+            if messages:
+                current["messages"] = messages[:40]
+        if current.get("interval_min_hours", 8) > current.get("interval_max_hours", 12):
+            current["interval_max_hours"] = current["interval_min_hours"]
+        builtin["self_care"] = current
+    if isinstance(payload.templates, dict):
+        current_templates = fox_messages_store.normalize_templates(builtin.get("templates"))
+        for template_id, patch in payload.templates.items():
+            if isinstance(patch, dict):
+                current_templates = fox_messages_store.merge_template_update(current_templates, str(template_id), patch)
+        builtin["templates"] = current_templates
+    fox_messages_store.save_fox_messages_state(state)
+    return {"status": "ok", **fox_messages_store.admin_payload(state)}
+
+
+@app.post("/api/admin/fox-messages/scheduled")
+def admin_fox_messages_scheduled_create(payload: AdminFoxScheduledPostPayload):
+    verify_admin_secret(payload.admin_secret)
+    state = fox_messages_store.load_fox_messages_state()
+    post = fox_messages_store.upsert_scheduled_post(state, payload.model_dump(exclude={"admin_secret"}))
+    fox_messages_store.save_fox_messages_state(state)
+    return {"status": "ok", "post": post}
+
+
+@app.put("/api/admin/fox-messages/scheduled/{post_id}")
+def admin_fox_messages_scheduled_update(post_id: str, payload: AdminFoxScheduledPostPayload):
+    verify_admin_secret(payload.admin_secret)
+    state = fox_messages_store.load_fox_messages_state()
+    try:
+        post = fox_messages_store.upsert_scheduled_post(
+            state,
+            payload.model_dump(exclude={"admin_secret"}, exclude_none=True),
+            post_id=post_id,
+        )
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Scheduled post not found")
+    fox_messages_store.save_fox_messages_state(state)
+    return {"status": "ok", "post": post}
+
+
+@app.delete("/api/admin/fox-messages/scheduled/{post_id}")
+def admin_fox_messages_scheduled_delete(post_id: str, admin_secret: str):
+    verify_admin_secret(admin_secret)
+    state = fox_messages_store.load_fox_messages_state()
+    if not fox_messages_store.delete_scheduled_post(state, post_id):
+        raise HTTPException(status_code=404, detail="Scheduled post not found")
+    fox_messages_store.save_fox_messages_state(state)
+    return {"status": "ok", "deleted": post_id}
+
+
+@app.post("/api/admin/fox-messages/scheduled/{post_id}/test")
+def admin_fox_messages_scheduled_test(post_id: str, admin_secret: str):
+    verify_admin_secret(admin_secret)
+    state = fox_messages_store.load_fox_messages_state()
+    post = fox_messages_store.queue_test_send(state, post_id)
+    if not post:
+        raise HTTPException(status_code=404, detail="Scheduled post not found")
+    fox_messages_store.save_fox_messages_state(state)
+    return {"status": "ok", "post": post, "message": "Queued — F.O.X will send on the next poll (about 60 seconds)."}
+
+
+@app.get("/api/bot-sync/fox-messages")
+def bot_sync_fox_messages(x_bot_sync_secret: str | None = Header(default=None)):
+    verify_bot_sync_secret(x_bot_sync_secret)
+    state = fox_messages_store.load_fox_messages_state()
+    due = fox_messages_store.posts_due_now(state)
+    return {
+        "status": "ok",
+        "builtin_settings": state.get("builtin_settings") or {},
+        "due_posts": due,
+    }
+
+
+@app.post("/api/bot-sync/fox-messages/delivery")
+def bot_sync_fox_messages_delivery(
+    payload: FoxMessageDeliveryPayload,
+    x_bot_sync_secret: str | None = Header(default=None),
+):
+    verify_bot_sync_secret(x_bot_sync_secret)
+    state = fox_messages_store.load_fox_messages_state()
+    fox_messages_store.mark_post_sent(
+        state,
+        payload.post_id,
+        message_id=payload.message_id,
+        chat_id=payload.chat_id,
+        error=payload.error,
+    )
+    fox_messages_store.save_fox_messages_state(state)
+    return {"status": "ok"}
+
+
+@app.post("/api/bot-sync/fox-messages/audit")
+def bot_sync_fox_messages_audit(
+    payload: FoxAuditBatchPayload,
+    x_bot_sync_secret: str | None = Header(default=None),
+):
+    verify_bot_sync_secret(x_bot_sync_secret)
+    state = fox_messages_store.load_fox_messages_state()
+    added = fox_messages_store.append_audit_log(state, payload.entries or [])
+    if added:
+        fox_messages_store.save_fox_messages_state(state)
+    return {"status": "ok", "added": added, "audit_total": len(state.get("audit_log") or [])}
+
+
+@app.get("/api/admin/group-activity/sheets-feed")
+def admin_group_activity_sheets_feed(admin_secret: str, period: str = "week"):
+    verify_admin_secret(admin_secret)
+    return {"status": "ok", **build_group_activity_sheets_feed(period)}
+
+
+@app.get("/api/admin/group-activity/export")
+def admin_group_activity_export(
+    admin_secret: str,
+    period: str = "week",
+    view: str = "full",
+):
+    verify_admin_secret(admin_secret)
+    normalized_period = group_activity_period(period)
+    stamp = datetime.datetime.utcnow().strftime("%Y%m%d")
+    if (view or "full").strip().lower() == "full":
+        zip_bytes = build_group_activity_export_zip(normalized_period)
+        filename = f"alcove-group-activity-{normalized_period}-{stamp}.zip"
+        return Response(
+            content=zip_bytes,
+            media_type="application/zip",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
+    csv_text = build_group_activity_csv(normalized_period, view=view)
+    filename = f"alcove-group-activity-{normalized_period}-{view.strip().lower()}-{stamp}.csv"
     return Response(
         content=csv_text,
         media_type="text/csv; charset=utf-8",
