@@ -316,6 +316,10 @@ def lean_mode_enabled() -> bool:
     return LEAN_MODE
 
 
+def now_iso() -> str:
+    return datetime.datetime.utcnow().isoformat()
+
+
 def runtime_state_payload() -> dict:
     payload = {
         "spotlight_entries": spotlight_entries,
@@ -1436,10 +1440,6 @@ class FoxMessageDeliveryPayload(BaseModel):
 # ---------------------------------
 # Helpers
 # ---------------------------------
-
-def now_iso() -> str:
-    return datetime.datetime.utcnow().isoformat()
-
 
 def iso_in_seconds(seconds: int) -> str:
     return (datetime.datetime.utcnow() + datetime.timedelta(seconds=seconds)).isoformat()
