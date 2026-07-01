@@ -1,6 +1,6 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import Response
+from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel
 import re
 from urllib.parse import parse_qsl, urlparse, unquote
@@ -20,7 +20,7 @@ import sqlite3
 import urllib.request
 import zipfile
 from html import escape
-from fastapi import Header, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import Header, HTTPException, WebSocket, WebSocketDisconnect, File, UploadFile, Form
 from .websocket_manager import manager
 from .cards_game import (
     CreateRoomPayload,
@@ -2411,6 +2411,11 @@ def upsert_miniapp_verification(user: dict) -> dict:
         None,
     )
     if existing:
+        if existing.get("status") in {"completed", "failed"}:
+            existing["status"] = "pending"
+            existing["requested_at"] = now
+            existing["completed_at"] = None
+            existing.pop("detail", None)
         existing.update({
             "username": user.get("username"),
             "first_name": user.get("first_name"),
@@ -5357,7 +5362,68 @@ def bot_sync_fox_messages(x_bot_sync_secret: str | None = Header(default=None)):
         "status": "ok",
         "builtin_settings": state.get("builtin_settings") or {},
         "due_posts": due,
+        "uploaded_banners": fox_messages_store.banner_manifest(state),
     }
+
+
+@app.post("/api/admin/fox-messages/banners/upload")
+async def admin_fox_banner_upload(
+    admin_secret: str = Form(...),
+    file: UploadFile = File(...),
+    label: str = Form(""),
+):
+    verify_admin_secret(admin_secret)
+    content = await file.read()
+    state = fox_messages_store.load_fox_messages_state()
+    try:
+        entry = fox_messages_store.save_banner_upload(
+            content,
+            file.filename or "banner.png",
+            label,
+            state,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    fox_messages_store.save_fox_messages_state(state)
+    return {"status": "ok", "banner": entry, **fox_messages_store.admin_payload(state)}
+
+
+@app.get("/api/admin/fox-messages/banners/{filename}")
+def admin_fox_banner_file(filename: str, admin_secret: str):
+    verify_admin_secret(admin_secret)
+    try:
+        file_path = fox_messages_store.resolve_uploaded_banner_file(filename)
+    except (ValueError, FileNotFoundError):
+        raise HTTPException(status_code=404, detail="Banner not found")
+    media_type = "image/png"
+    lower = filename.lower()
+    if lower.endswith((".jpg", ".jpeg")):
+        media_type = "image/jpeg"
+    elif lower.endswith(".webp"):
+        media_type = "image/webp"
+    elif lower.endswith(".gif"):
+        media_type = "image/gif"
+    return FileResponse(file_path, media_type=media_type)
+
+
+@app.delete("/api/admin/fox-messages/banners/{banner_id}")
+def admin_fox_banner_delete(banner_id: str, admin_secret: str):
+    verify_admin_secret(admin_secret)
+    state = fox_messages_store.load_fox_messages_state()
+    if not fox_messages_store.delete_custom_banner(state, banner_id):
+        raise HTTPException(status_code=404, detail="Banner not found")
+    fox_messages_store.save_fox_messages_state(state)
+    return {"status": "ok", **fox_messages_store.admin_payload(state)}
+
+
+@app.get("/api/bot-sync/fox-banners/{filename}")
+def bot_sync_fox_banner_file(filename: str, x_bot_sync_secret: str | None = Header(default=None)):
+    verify_bot_sync_secret(x_bot_sync_secret)
+    try:
+        file_path = fox_messages_store.resolve_uploaded_banner_file(filename)
+    except (ValueError, FileNotFoundError):
+        raise HTTPException(status_code=404, detail="Banner not found")
+    return FileResponse(file_path)
 
 
 @app.post("/api/bot-sync/fox-messages/delivery")
