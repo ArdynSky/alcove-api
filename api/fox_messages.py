@@ -9,6 +9,10 @@ FOX_MESSAGES_PATH = os.getenv(
     os.path.join(os.getcwd(), "fox_messages.json"),
 )
 
+UPLOADED_BANNER_PREFIX = "fox-banners/"
+MAX_BANNER_BYTES = 5 * 1024 * 1024
+ALLOWED_BANNER_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
+
 DEFAULT_LINK_WARNING_MESSAGES = [
     "Hey there {name}. Sorry (not sorry) but links aren't allowed here, so I had to remove it.",
     "Looks like your message included a hyperlink. I've removed it to keep The Alcove tidy.",
@@ -409,7 +413,25 @@ def default_fox_messages_state() -> dict:
         "scheduled_posts": [],
         "delivery_log": [],
         "audit_log": [],
+        "custom_banners": [],
     }
+
+
+def _coerce_bounded_int(value, default: int, minimum: int, maximum: int) -> int:
+    try:
+        if value is None or value == "":
+            raise ValueError
+        parsed = int(value)
+    except (TypeError, ValueError):
+        parsed = default
+    return max(minimum, min(parsed, maximum))
+
+
+def _field_int(raw: dict, base: dict, key: str, default: int, minimum: int, maximum: int) -> int:
+    value = raw.get(key)
+    if value is None or value == "":
+        value = base.get(key, default)
+    return _coerce_bounded_int(value, default, minimum, maximum)
 
 
 def normalize_scheduled_post(raw: dict, existing: dict | None = None) -> dict:
@@ -426,10 +448,10 @@ def normalize_scheduled_post(raw: dict, existing: dict | None = None) -> dict:
         "title": str(raw.get("title") or base.get("title") or "Untitled F.O.X post").strip()[:120],
         "enabled": bool(raw.get("enabled", base.get("enabled", True))),
         "schedule_type": schedule_type,
-        "hour_utc": max(0, min(int(raw.get("hour_utc", base.get("hour_utc", 12))), 23)),
-        "minute_utc": max(0, min(int(raw.get("minute_utc", base.get("minute_utc", 0))), 59)),
-        "interval_hours": max(1, min(int(raw.get("interval_hours", base.get("interval_hours", 12))), 168)),
-        "weekday_utc": max(0, min(int(raw.get("weekday_utc", base.get("weekday_utc", 0))), 6)),
+        "hour_utc": _field_int(raw, base, "hour_utc", 12, 0, 23),
+        "minute_utc": _field_int(raw, base, "minute_utc", 0, 0, 59),
+        "interval_hours": _field_int(raw, base, "interval_hours", 12, 1, 168),
+        "weekday_utc": _field_int(raw, base, "weekday_utc", 0, 0, 6),
         "run_at": str(raw.get("run_at") or base.get("run_at") or "").strip(),
         "target": target,
         "topic_id": raw.get("topic_id", base.get("topic_id")),
@@ -454,6 +476,8 @@ def load_fox_messages_state() -> dict:
             raw = json.load(handle)
     except (OSError, json.JSONDecodeError):
         return default_fox_messages_state()
+    if not isinstance(raw, dict):
+        return default_fox_messages_state()
     state = default_fox_messages_state()
     if isinstance(raw.get("builtin_settings"), dict):
         state["builtin_settings"].update(raw["builtin_settings"])
@@ -471,6 +495,10 @@ def load_fox_messages_state() -> dict:
         state["delivery_log"] = raw["delivery_log"][-200:]
     if isinstance(raw.get("audit_log"), list):
         state["audit_log"] = raw["audit_log"][-500:]
+    if isinstance(raw.get("custom_banners"), list):
+        state["custom_banners"] = [
+            entry for entry in raw["custom_banners"] if isinstance(entry, dict) and entry.get("path")
+        ]
     return state
 
 
@@ -591,6 +619,114 @@ def mark_post_sent(state: dict, post_id: str, *, message_id=None, chat_id=None, 
     )
 
 
+def fox_banners_dir() -> str:
+    default_dir = os.path.join(os.path.dirname(os.path.abspath(FOX_MESSAGES_PATH)), "fox-banners")
+    directory = os.getenv("FOX_BANNERS_DIR", default_dir)
+    os.makedirs(directory, exist_ok=True)
+    return directory
+
+
+def sanitize_banner_stem(name: str) -> str:
+    stem = os.path.splitext(os.path.basename(name or "banner"))[0].lower()
+    stem = re.sub(r"[^a-z0-9_-]+", "-", stem).strip("-_")
+    return stem[:48] or "banner"
+
+
+def normalize_banner_filename(filename: str) -> str:
+    base = os.path.basename(str(filename or "").strip())
+    if not base or base in {".", ".."} or "/" in base or "\\" in base:
+        raise ValueError("Invalid banner filename")
+    ext = os.path.splitext(base)[1].lower()
+    if ext not in ALLOWED_BANNER_EXTENSIONS:
+        raise ValueError("Banner must be PNG, JPEG, WebP, or GIF")
+    return base
+
+
+def list_banner_paths(state: dict) -> list[str]:
+    custom = []
+    for entry in state.get("custom_banners") or []:
+        path = str(entry.get("path") or "").strip()
+        if path:
+            custom.append(path)
+    return list(KNOWN_BANNERS) + custom
+
+
+def banner_manifest(state: dict) -> list[dict]:
+    manifest = []
+    for entry in state.get("custom_banners") or []:
+        filename = str(entry.get("filename") or "").strip()
+        if not filename:
+            continue
+        file_path = os.path.join(fox_banners_dir(), filename)
+        if not os.path.isfile(file_path):
+            continue
+        manifest.append(
+            {
+                "id": entry.get("id"),
+                "path": entry.get("path"),
+                "filename": filename,
+                "label": entry.get("label") or filename,
+                "size_bytes": os.path.getsize(file_path),
+            }
+        )
+    return manifest
+
+
+def resolve_uploaded_banner_file(filename: str) -> str:
+    safe_name = normalize_banner_filename(filename)
+    file_path = os.path.join(fox_banners_dir(), safe_name)
+    if not os.path.isfile(file_path):
+        raise FileNotFoundError(safe_name)
+    return file_path
+
+
+def save_banner_upload(content: bytes, original_name: str, label: str, state: dict) -> dict:
+    if not content:
+        raise ValueError("Empty file")
+    if len(content) > MAX_BANNER_BYTES:
+        raise ValueError("Banner file too large (max 5 MB)")
+    ext = os.path.splitext(original_name or "")[1].lower()
+    if ext not in ALLOWED_BANNER_EXTENSIONS:
+        raise ValueError("Banner must be PNG, JPEG, WebP, or GIF")
+    stem = sanitize_banner_stem(original_name)
+    filename = f"{stem}-{uuid.uuid4().hex[:8]}{ext}"
+    file_path = os.path.join(fox_banners_dir(), filename)
+    with open(file_path, "wb") as handle:
+        handle.write(content)
+    entry = {
+        "id": uuid.uuid4().hex[:12],
+        "path": f"{UPLOADED_BANNER_PREFIX}{filename}",
+        "filename": filename,
+        "label": str(label or stem).strip()[:80] or filename,
+        "uploaded_at": now_iso(),
+        "size_bytes": len(content),
+    }
+    banners = state.setdefault("custom_banners", [])
+    banners.append(entry)
+    state["custom_banners"] = banners[-100:]
+    return entry
+
+
+def delete_custom_banner(state: dict, banner_id: str) -> bool:
+    banners = state.get("custom_banners") or []
+    kept = []
+    deleted = False
+    for entry in banners:
+        if entry.get("id") == banner_id:
+            deleted = True
+            filename = str(entry.get("filename") or "").strip()
+            if filename:
+                try:
+                    os.remove(os.path.join(fox_banners_dir(), normalize_banner_filename(filename)))
+                except OSError:
+                    pass
+            continue
+        kept.append(entry)
+    if deleted:
+        state["custom_banners"] = kept
+    return deleted
+
+
 def admin_payload(state: dict) -> dict:
     posts = []
     for post in state.get("scheduled_posts") or []:
@@ -604,7 +740,8 @@ def admin_payload(state: dict) -> dict:
     }
     return {
         "catalog": FOX_MESSAGE_CATALOG,
-        "banners": KNOWN_BANNERS,
+        "banners": list_banner_paths(state),
+        "custom_banners": state.get("custom_banners") or [],
         "template_editors": FOX_TEMPLATE_EDITORS,
         "builtin_settings": builtin,
         "scheduled_posts": posts,
