@@ -2129,11 +2129,14 @@ def pulse_question_suggestion_owner_fields(suggestion_id: int | None):
     }
 
 
-def pulse_suggestions_for_user(user_id=None, username=None):
+def pulse_suggestions_for_user(user_id=None, username=None, *, include_rejected: bool = True):
     identity = {"user_id": user_id, "username": username}
     rows = []
     for entry in pulse_question_suggestions:
-        if entry.get("status") in {"rejected", "deleted"}:
+        status = (entry.get("status") or "").strip().lower()
+        if status == "deleted":
+            continue
+        if status == "rejected" and not include_rejected:
             continue
         owner = {"user_id": entry.get("user_id"), "username": entry.get("username")}
         if pulse_identities_match(identity, owner):
@@ -2190,6 +2193,7 @@ def pulse_owned_suggestion_payload(identity, suggestion):
         "active_from_label": pulse_day_label(active_from) if active_from else None,
         "reviewed_at": suggestion.get("reviewed_at"),
         "rejection_reason": (suggestion.get("rejection_reason") or "").strip() or None,
+        "resubmit_allowed": bool(suggestion.get("resubmit_allowed")),
         "answers_count": len(answers),
         "answers": answers,
     }
@@ -2201,24 +2205,26 @@ def pulse_my_pulses_payload(identity):
     past_rows = []
     for suggestion in pulse_suggestions_for_user(identity.get("user_id"), identity.get("username")):
         row = pulse_owned_suggestion_payload(identity, suggestion)
-        status = suggestion.get("status")
+        status = (suggestion.get("status") or "").strip().lower()
         active_from = (suggestion.get("active_from_day_key") or "").strip()
         submitted_day = (suggestion.get("day_key") or "").strip()
+        reviewed_day = (suggestion.get("reviewed_at") or suggestion.get("submitted_at") or "")[:10]
 
-        if status in {"pending_review", "reserved"} or submitted_day == today_key or (active_from and active_from >= today_key):
+        if status in {"pending_review", "reserved"}:
             today_rows.append(row)
         elif status == "rejected":
-            reviewed_day = (suggestion.get("reviewed_at") or suggestion.get("submitted_at") or "")[:10]
             if submitted_day == today_key or reviewed_day == today_key:
                 today_rows.append(row)
             else:
                 past_rows.append(row)
+        elif submitted_day == today_key or (active_from and active_from >= today_key):
+            today_rows.append(row)
         elif status == "approved" and active_from and active_from < today_key:
             past_rows.append(row)
         elif status == "approved" and not active_from:
             past_rows.append(row)
 
-    sort_key = lambda row: row.get("active_from_day_key") or row.get("submitted_day_key") or ""
+    sort_key = lambda row: row.get("reviewed_at") or row.get("submitted_at") or row.get("active_from_day_key") or row.get("submitted_day_key") or ""
     today_rows.sort(key=sort_key, reverse=True)
     past_rows.sort(key=sort_key, reverse=True)
     return {"today": today_rows, "past": past_rows}
@@ -6911,20 +6917,44 @@ def get_pulse_questions(user_id: int | None = None, username: str | None = None)
     }
 
 
-def pulse_question_submissions_today_count(user_id=None, username=None) -> int:
+def pulse_question_submissions_for_user_today(user_id=None, username=None) -> list[dict]:
     today = pulse_day_key()
     username = (username or "").lower()
-    count = 0
+    rows = []
     for existing in pulse_question_suggestions:
         if existing.get("day_key") != today:
             continue
-        if existing.get("status") == "rejected" and not existing.get("resubmit_allowed"):
+        if (existing.get("status") or "").strip().lower() == "deleted":
             continue
         same_user = user_id and int(existing.get("user_id") or 0) == int(user_id)
         same_username = username and (existing.get("username") or "").lower() == username
         if same_user or same_username:
-            count += 1
+            rows.append(existing)
+    return rows
+
+
+def pulse_question_submissions_today_count(user_id=None, username=None) -> int:
+    count = 0
+    for existing in pulse_question_submissions_for_user_today(user_id, username):
+        status = (existing.get("status") or "").strip().lower()
+        if status == "rejected" and existing.get("resubmit_allowed"):
+            continue
+        count += 1
     return count
+
+
+def pulse_question_submissions_total_today(user_id=None, username=None) -> int:
+    return len(pulse_question_submissions_for_user_today(user_id, username))
+
+
+def pulse_can_submit_another_question(user_id=None, username=None) -> bool:
+    if pulse_unlimited_question_submit():
+        return True
+    total = pulse_question_submissions_total_today(user_id, username)
+    effective = pulse_question_submissions_today_count(user_id, username)
+    if total < 1:
+        return False
+    return effective < PULSE_DAILY_QUESTION_LIMIT
 
 
 @app.post("/api/pulse-question-suggestions")
@@ -7014,7 +7044,7 @@ def submit_pulse_question_suggestion(payload: PulseQuestionSuggestion):
         flush=True,
     )
     submissions_today = pulse_question_submissions_today_count(user_id, username)
-    can_submit_another = submissions_today < PULSE_DAILY_QUESTION_LIMIT
+    can_submit_another = pulse_can_submit_another_question(user_id, username)
     if can_submit_another:
         success_message = "Pulse sent for admin review. Submit another Pulse question below if you like."
     else:
@@ -7023,6 +7053,7 @@ def submit_pulse_question_suggestion(payload: PulseQuestionSuggestion):
         "status": "ok",
         "message": success_message,
         "submissions_today": submissions_today,
+        "submissions_total_today": pulse_question_submissions_total_today(user_id, username),
         "can_submit_another": can_submit_another,
         "daily_limit": PULSE_DAILY_QUESTION_LIMIT,
         "entry": entry,
@@ -7039,34 +7070,36 @@ def pulse_question_suggestion_status(user_id: int | None = None, username: str |
     user_id = identity.get("user_id")
     username = (identity.get("username") or "").lower()
     submissions_today = pulse_question_submissions_today_count(user_id, username)
-    if submissions_today <= 0:
+    submissions_total_today = pulse_question_submissions_total_today(user_id, username)
+    can_submit_another = pulse_can_submit_another_question(user_id, username)
+    if submissions_total_today <= 0:
         return {
             "status": "ok",
             "submitted_today": False,
             "submissions_today": 0,
+            "submissions_total_today": 0,
             "can_submit_another": False,
             "daily_limit": PULSE_DAILY_QUESTION_LIMIT,
             "message": "Submit today's Pulse question to unlock the game.",
         }
 
     latest_entry = None
-    for existing in pulse_question_suggestions:
-        if existing.get("day_key") != today:
+    for existing in pulse_question_submissions_for_user_today(user_id, username):
+        if (existing.get("status") or "").strip().lower() == "rejected":
             continue
-        if existing.get("status") == "rejected":
-            continue
-        same_user = user_id and int(existing.get("user_id") or 0) == int(user_id)
-        same_username = username and (existing.get("username") or "").lower() == username
-        if same_user or same_username:
-            latest_entry = existing
+        latest_entry = existing
 
-    can_submit_another = submissions_today < PULSE_DAILY_QUESTION_LIMIT
     if submissions_today >= PULSE_DAILY_QUESTION_LIMIT:
         message = "Both of today's Pulse questions are already with F.O.X for review."
     elif latest_entry and latest_entry.get("status") == "pending_review":
         message = "Your Pulse is with F.O.X for review. You can submit one more today."
     elif latest_entry and latest_entry.get("status") == "approved":
         message = "Your Pulse has been approved. You can submit one more today."
+    elif any(
+        (entry.get("status") or "").strip().lower() == "rejected" and entry.get("resubmit_allowed")
+        for entry in pulse_question_submissions_for_user_today(user_id, username)
+    ):
+        message = "Your Pulse was not approved. You can submit one replacement question today."
     else:
         message = "You can submit one more Pulse question today."
 
@@ -7074,6 +7107,7 @@ def pulse_question_suggestion_status(user_id: int | None = None, username: str |
         "status": "ok",
         "submitted_today": True,
         "submissions_today": submissions_today,
+        "submissions_total_today": submissions_total_today,
         "can_submit_another": can_submit_another,
         "daily_limit": PULSE_DAILY_QUESTION_LIMIT,
         "review_status": latest_entry.get("status") if latest_entry else None,
