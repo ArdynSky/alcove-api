@@ -2188,6 +2188,8 @@ def pulse_owned_suggestion_payload(identity, suggestion):
         "submitted_day_key": suggestion.get("day_key"),
         "active_from_day_key": active_from or None,
         "active_from_label": pulse_day_label(active_from) if active_from else None,
+        "reviewed_at": suggestion.get("reviewed_at"),
+        "rejection_reason": (suggestion.get("rejection_reason") or "").strip() or None,
         "answers_count": len(answers),
         "answers": answers,
     }
@@ -2205,6 +2207,12 @@ def pulse_my_pulses_payload(identity):
 
         if status in {"pending_review", "reserved"} or submitted_day == today_key or (active_from and active_from >= today_key):
             today_rows.append(row)
+        elif status == "rejected":
+            reviewed_day = (suggestion.get("reviewed_at") or suggestion.get("submitted_at") or "")[:10]
+            if submitted_day == today_key or reviewed_day == today_key:
+                today_rows.append(row)
+            else:
+                past_rows.append(row)
         elif status == "approved" and active_from and active_from < today_key:
             past_rows.append(row)
         elif status == "approved" and not active_from:
