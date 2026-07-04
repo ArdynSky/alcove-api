@@ -238,6 +238,7 @@ pulse_entries = []
 pulse_receipts = []
 pulse_red_activations = []
 pulse_red_unlock_notifications = []
+pulse_question_review_notifications = []
 pulse_question_suggestions = []
 pulse_daily_summary_posts = []
 pulse_disabled_questions = []
@@ -281,6 +282,7 @@ PULSE_UNLIMITED_QUESTION_SUBMIT = os.getenv(
     "PULSE_UNLIMITED_QUESTION_SUBMIT",
     "0" if LEAN_MODE else "1",
 ).strip().lower() in {"1", "true", "yes", "on"}
+PULSE_DAILY_QUESTION_LIMIT = 2
 PULSE_RETENTION_DAYS = max(
     7,
     int(os.getenv("PULSE_RETENTION_DAYS", "14" if LEAN_MODE else "30") or (14 if LEAN_MODE else 30)),
@@ -327,6 +329,7 @@ def runtime_state_payload() -> dict:
         "pulse_receipts": pulse_receipts,
         "pulse_red_activations": pulse_red_activations,
         "pulse_red_unlock_notifications": pulse_red_unlock_notifications,
+        "pulse_question_review_notifications": pulse_question_review_notifications,
         "pulse_question_suggestions": pulse_question_suggestions,
         "pulse_daily_summary_posts": pulse_daily_summary_posts,
         "pulse_disabled_questions": pulse_disabled_questions,
@@ -362,7 +365,7 @@ def ensure_state_store() -> None:
 
 def apply_runtime_payload(payload: dict) -> None:
     global spotlight_entries, pulse_entries, pulse_receipts, pulse_red_activations, pulse_red_unlock_notifications
-    global pulse_question_suggestions, pulse_daily_summary_posts, pulse_disabled_questions
+    global pulse_question_review_notifications, pulse_question_suggestions, pulse_daily_summary_posts, pulse_disabled_questions
     global miniapp_verifications, wheel_reaction_history, wheel_review_history, wheel_user_engagement
     global synced_alcove_users, synced_alcove_analytics, last_bot_sync_at
 
@@ -373,6 +376,11 @@ def apply_runtime_payload(payload: dict) -> None:
     pulse_red_unlock_notifications = (
         payload.get("pulse_red_unlock_notifications")
         if isinstance(payload.get("pulse_red_unlock_notifications"), list)
+        else []
+    )
+    pulse_question_review_notifications = (
+        payload.get("pulse_question_review_notifications")
+        if isinstance(payload.get("pulse_question_review_notifications"), list)
         else []
     )
     pulse_question_suggestions = payload.get("pulse_question_suggestions") if isinstance(payload.get("pulse_question_suggestions"), list) else []
@@ -1376,6 +1384,7 @@ class AdminPulseQuestionAction(BaseModel):
     admin_secret: str
     action: str
     edited_question: str | None = None
+    rejection_reason: str | None = None
 
 
 class AdminPulseQuestionCreate(BaseModel):
@@ -1541,12 +1550,85 @@ def pulse_day_label(day_key: str | None = None) -> str:
     return parsed.strftime("%d %B %Y")
 
 
+def pulse_day_ordinal(day: int) -> str:
+    if 11 <= day <= 13:
+        return f"{day}th"
+    suffix = {1: "st", 2: "nd", 3: "rd"}.get(day % 10, "th")
+    return f"{day}{suffix}"
+
+
+def pulse_day_name_with_ordinal(day_key: str | None) -> str:
+    if not day_key:
+        return "the next Pulse day"
+    try:
+        parsed = datetime.date.fromisoformat(day_key)
+    except ValueError:
+        return day_key
+    return f"{parsed.strftime('%A')} {pulse_day_ordinal(parsed.day)} {parsed.strftime('%B')}"
+
+
+def pulse_question_availability_copy(entry: dict) -> str:
+    schedule = normalize_pulse_schedule_mode(entry.get("schedule_mode"))
+    active_from = (entry.get("active_from_day_key") or "").strip()
+    day_label = pulse_day_name_with_ordinal(active_from)
+    if schedule == "today" or active_from == pulse_day_key():
+        return (
+            f"It is live in Pulse now and stays available until midnight UK time tonight "
+            f"({pulse_day_name_with_ordinal(pulse_day_key())})."
+        )
+    if schedule == "reserve":
+        return "It has been saved to the reserve pot. F.O.X will schedule it for a future Pulse day."
+    return (
+        f"It will be added to the next day's Pulse questions and will be available from "
+        f"00:00 on {day_label} (UK time) for 24 hours."
+    )
+
+
+def pulse_suggestion_submitter_user_id(entry: dict) -> int | None:
+    try:
+        user_id = int(entry.get("user_id") or 0)
+    except (TypeError, ValueError):
+        return None
+    return user_id or None
+
+
+def queue_pulse_question_review_notification(entry: dict, kind: str, *, rejection_reason: str | None = None) -> None:
+    user_id = pulse_suggestion_submitter_user_id(entry)
+    if not user_id:
+        return
+    suggestion_id = int(entry.get("id") or 0)
+    if not suggestion_id:
+        return
+    for existing in pulse_question_review_notifications:
+        if (
+            existing.get("kind") == kind
+            and int(existing.get("suggestion_id") or 0) == suggestion_id
+            and not existing.get("notified_at")
+        ):
+            return
+    pulse_question_review_notifications.append({
+        "notification_id": f"pulse-review-{kind}-{suggestion_id}-{len(pulse_question_review_notifications) + 1}",
+        "kind": kind,
+        "suggestion_id": suggestion_id,
+        "recipient_user_id": user_id,
+        "recipient_username": entry.get("username"),
+        "recipient_display_name": entry.get("display_name"),
+        "question": pulse_suggestion_question(entry),
+        "schedule_mode": entry.get("schedule_mode") or "tomorrow",
+        "active_from_day_key": entry.get("active_from_day_key"),
+        "availability_copy": pulse_question_availability_copy(entry),
+        "rejection_reason": (rejection_reason or entry.get("rejection_reason") or "").strip() or None,
+        "created_at": now_iso(),
+        "notified_at": None,
+    })
+
+
 def normalized_pulse_reset_interval(value) -> int:
     try:
         parsed = int(value)
     except (TypeError, ValueError):
         return 12
-    return parsed if parsed in {1, 3, 6, 12} else 12
+    return parsed if parsed in {1, 3, 4, 6, 12} else 12
 
 
 def pulse_question_category(question: str | None, pulse_type: str | None = None) -> str:
@@ -1712,6 +1794,63 @@ def clear_pulse_question_roster(reviewed_by=None):
         "removed_defaults": removed_defaults,
         "removed_suggested": removed_suggested,
         "remaining": len(pulse_question_roster()),
+    }
+
+
+def find_resubmittable_rejected_pulse_question(user_id: int | None = None, username: str | None = None):
+    username = (username or "").lower()
+    matches = []
+    for entry in pulse_question_suggestions:
+        if entry.get("status") != "rejected":
+            continue
+        if not entry.get("resubmit_allowed"):
+            continue
+        same_user = user_id and int(entry.get("user_id") or 0) == int(user_id)
+        same_username = username and (entry.get("username") or "").lower() == username
+        if same_user or same_username:
+            matches.append(entry)
+    if not matches:
+        return None
+    matches.sort(key=lambda item: item.get("reviewed_at") or item.get("submitted_at") or "", reverse=True)
+    return matches[0]
+
+
+def resubmit_rejected_pulse_question(user_id: int | None, username: str | None, question: str) -> dict:
+    entry = find_resubmittable_rejected_pulse_question(user_id, username)
+    if not entry:
+        return {"status": "error", "message": "No rejected Pulse question is waiting for a resubmission from you."}
+    cleaned = (question or "").strip()
+    if len(cleaned) < 8:
+        return {"status": "error", "message": "Please add a little more detail before sending your new Pulse question."}
+    entry["question"] = cleaned
+    entry["edited_question"] = None
+    entry["status"] = "pending_review"
+    entry["rejection_reason"] = None
+    entry["resubmit_allowed"] = False
+    entry["resubmitted_at"] = now_iso()
+    entry["reviewed_at"] = None
+    entry["reviewed_by"] = None
+    entry["needs_admin_notify"] = True
+    entry["review_message_sent"] = False
+    submitter = entry.get("display_name") or entry.get("username") or entry.get("user_id")
+    pulse_admin_notify(
+        "\n".join([
+            "<b>Pulse question resubmitted after rejection</b>",
+            f"ID: <code>{entry['id']}</code>",
+            f"Pool: <b>{escape((entry.get('pool') or 'green').title())}</b>",
+            f"From: <b>{escape(str(submitter))}</b>",
+            "",
+            f"<code>{escape(cleaned)}</code>",
+            "",
+            "Review in Feature Admin.",
+        ]),
+        PULSE_QUESTIONS_TOPIC_ID,
+    )
+    save_runtime_state()
+    return {
+        "status": "ok",
+        "message": "Thanks — your new Pulse question has been sent to F.O.X for review.",
+        "entry": entry,
     }
 
 
@@ -2089,7 +2228,7 @@ def pulse_reset_interval_hours() -> int:
 
 
 def pulse_green_unlock_interval_hours() -> int:
-    return PULSE_GREEN_UNLOCK_INTERVAL_HOURS
+    return pulse_reset_interval_hours()
 
 
 def next_pulse_unlock_at(now: datetime.datetime | None = None, interval_hours: int | None = None) -> datetime.datetime:
@@ -2185,7 +2324,12 @@ def drain_pulse_admin_telegram_backlog() -> None:
 drain_pulse_admin_telegram_backlog()
 
 
-def apply_admin_pulse_question_action(entry: dict, action: str, edited_question: str | None = None) -> None:
+def apply_admin_pulse_question_action(
+    entry: dict,
+    action: str,
+    edited_question: str | None = None,
+    rejection_reason: str | None = None,
+) -> None:
     action = (action or "").strip().lower()
     if action == "amend":
         text = (edited_question or "").strip()
@@ -2197,8 +2341,17 @@ def apply_admin_pulse_question_action(entry: dict, action: str, edited_question:
         entry["review_message_sent"] = False
         return
     if action == "reject":
+        reason = (rejection_reason or "").strip()
+        if not reason:
+            raise HTTPException(
+                status_code=400,
+                detail="A rejection reason is required so F.O.X can message the member.",
+            )
         entry["status"] = "rejected"
+        entry["rejection_reason"] = reason
+        entry["resubmit_allowed"] = True
         entry["reviewed_at"] = now_iso()
+        queue_pulse_question_review_notification(entry, "question_rejected", rejection_reason=reason)
         return
     if action in {"today", "tomorrow", "reserve"}:
         pool = (entry.get("pool") or "green").strip().lower()
@@ -2214,7 +2367,10 @@ def apply_admin_pulse_question_action(entry: dict, action: str, edited_question:
         ensure_single_red_slot(entry)
         entry["reviewed_at"] = now_iso()
         entry["needs_admin_notify"] = False
+        entry["resubmit_allowed"] = False
         archive_pulse_question_from_suggestion(entry)
+        if entry.get("status") == "approved":
+            queue_pulse_question_review_notification(entry, "question_approved")
         return
     raise HTTPException(status_code=400, detail="Unknown Pulse question action.")
 
@@ -5543,7 +5699,12 @@ def admin_pulse_question_action(suggestion_id: int, payload: AdminPulseQuestionA
     entry = find_pulse_question_suggestion(suggestion_id)
     if not entry:
         return {"status": "error", "message": "Pulse question suggestion not found."}
-    apply_admin_pulse_question_action(entry, payload.action, payload.edited_question)
+    apply_admin_pulse_question_action(
+        entry,
+        payload.action,
+        payload.edited_question,
+        payload.rejection_reason,
+    )
     save_runtime_state()
     return {"status": "ok", "entry": pulse_question_suggestion_admin_payload(entry)}
 
@@ -6742,6 +6903,22 @@ def get_pulse_questions(user_id: int | None = None, username: str | None = None)
     }
 
 
+def pulse_question_submissions_today_count(user_id=None, username=None) -> int:
+    today = pulse_day_key()
+    username = (username or "").lower()
+    count = 0
+    for existing in pulse_question_suggestions:
+        if existing.get("day_key") != today:
+            continue
+        if existing.get("status") == "rejected" and not existing.get("resubmit_allowed"):
+            continue
+        same_user = user_id and int(existing.get("user_id") or 0) == int(user_id)
+        same_username = username and (existing.get("username") or "").lower() == username
+        if same_user or same_username:
+            count += 1
+    return count
+
+
 @app.post("/api/pulse-question-suggestions")
 def submit_pulse_question_suggestion(payload: PulseQuestionSuggestion):
     print(
@@ -6758,23 +6935,17 @@ def submit_pulse_question_suggestion(payload: PulseQuestionSuggestion):
     user_id = identity.get("user_id")
     username = (identity.get("username") or "").lower()
     if not pulse_unlimited_question_submit():
-        for existing in pulse_question_suggestions:
-            if existing.get("day_key") != today:
-                continue
-            if existing.get("status") == "rejected":
-                continue
-            same_user = user_id and int(existing.get("user_id") or 0) == int(user_id)
-            same_username = username and (existing.get("username") or "").lower() == username
-            if same_user or same_username:
-                print(
-                    f"[{now_iso()}] pulse question submit rejected: already submitted today "
-                    f"user_id={user_id} username={username!r}",
-                    flush=True,
-                )
-                return {
-                    "status": "error",
-                    "message": "You already submitted a Pulse for tomorrow today.",
-                }
+        submissions_today = pulse_question_submissions_today_count(user_id, username)
+        if submissions_today >= PULSE_DAILY_QUESTION_LIMIT:
+            print(
+                f"[{now_iso()}] pulse question submit rejected: daily limit reached "
+                f"user_id={user_id} username={username!r} count={submissions_today}",
+                flush=True,
+            )
+            return {
+                "status": "error",
+                "message": "You've already submitted your two Pulse questions for today.",
+            }
 
     pool = (payload.pool or "green").strip().lower()
     category = (payload.category or "").strip()
@@ -6834,9 +7005,18 @@ def submit_pulse_question_suggestion(payload: PulseQuestionSuggestion):
         f"user_id={identity.get('user_id')} username={identity.get('username')!r}",
         flush=True,
     )
+    submissions_today = pulse_question_submissions_today_count(user_id, username)
+    can_submit_another = submissions_today < PULSE_DAILY_QUESTION_LIMIT
+    if can_submit_another:
+        success_message = "Pulse sent for admin review. Submit another Pulse question below if you like."
+    else:
+        success_message = "Both of today's Pulse questions are with F.O.X for review."
     return {
         "status": "ok",
-        "message": "Pulse sent for admin review. If approved, it will join tomorrow's green Pulse roster.",
+        "message": success_message,
+        "submissions_today": submissions_today,
+        "can_submit_another": can_submit_another,
+        "daily_limit": PULSE_DAILY_QUESTION_LIMIT,
         "entry": entry,
     }
 
@@ -6850,6 +7030,18 @@ def pulse_question_suggestion_status(user_id: int | None = None, username: str |
     today = pulse_day_key()
     user_id = identity.get("user_id")
     username = (identity.get("username") or "").lower()
+    submissions_today = pulse_question_submissions_today_count(user_id, username)
+    if submissions_today <= 0:
+        return {
+            "status": "ok",
+            "submitted_today": False,
+            "submissions_today": 0,
+            "can_submit_another": False,
+            "daily_limit": PULSE_DAILY_QUESTION_LIMIT,
+            "message": "Submit today's Pulse question to unlock the game.",
+        }
+
+    latest_entry = None
     for existing in pulse_question_suggestions:
         if existing.get("day_key") != today:
             continue
@@ -6857,24 +7049,28 @@ def pulse_question_suggestion_status(user_id: int | None = None, username: str |
             continue
         same_user = user_id and int(existing.get("user_id") or 0) == int(user_id)
         same_username = username and (existing.get("username") or "").lower() == username
-        if not (same_user or same_username):
-            continue
-        return {
-            "status": "ok",
-            "submitted_today": True,
-            "review_status": existing.get("status"),
-            "message": (
-                "Your Pulse for tomorrow is already with F.O.X for review."
-                if existing.get("status") == "pending_review"
-                else "Your Pulse for tomorrow has already been approved."
-            ),
-            "entry": existing,
-        }
+        if same_user or same_username:
+            latest_entry = existing
+
+    can_submit_another = submissions_today < PULSE_DAILY_QUESTION_LIMIT
+    if submissions_today >= PULSE_DAILY_QUESTION_LIMIT:
+        message = "Both of today's Pulse questions are already with F.O.X for review."
+    elif latest_entry and latest_entry.get("status") == "pending_review":
+        message = "Your Pulse is with F.O.X for review. You can submit one more today."
+    elif latest_entry and latest_entry.get("status") == "approved":
+        message = "Your Pulse has been approved. You can submit one more today."
+    else:
+        message = "You can submit one more Pulse question today."
 
     return {
         "status": "ok",
-        "submitted_today": False,
-        "message": "You can submit one Pulse for tomorrow today.",
+        "submitted_today": True,
+        "submissions_today": submissions_today,
+        "can_submit_another": can_submit_another,
+        "daily_limit": PULSE_DAILY_QUESTION_LIMIT,
+        "review_status": latest_entry.get("status") if latest_entry else None,
+        "message": message,
+        "entry": latest_entry,
     }
 
 
@@ -7478,6 +7674,15 @@ def bot_update_pulse_question_suggestion(suggestion_id: int, payload: dict | Non
     if not entry:
         return {"status": "error", "message": "Pulse question suggestion not found."}
     payload = payload or {}
+    if payload.get("reject"):
+        reason = (payload.get("rejection_reason") or "").strip()
+        if not reason:
+            return {"status": "error", "message": "Rejection reason is required."}
+        if payload.get("reviewed_by") is not None:
+            entry["reviewed_by"] = payload.get("reviewed_by")
+        apply_admin_pulse_question_action(entry, "reject", rejection_reason=reason)
+        save_runtime_state()
+        return {"status": "ok", "entry": entry}
     if "edited_question" in payload:
         entry["edited_question"] = (payload.get("edited_question") or "").strip() or None
     if "category" in payload:
@@ -7488,7 +7693,7 @@ def bot_update_pulse_question_suggestion(suggestion_id: int, payload: dict | Non
         entry["active_from_day_key"] = (payload.get("active_from_day_key") or "").strip() or None
     if "needs_admin_notify" in payload:
         entry["needs_admin_notify"] = bool(payload.get("needs_admin_notify"))
-    if "status" in payload:
+    if "status" in payload and not payload.get("approve") and not payload.get("reject"):
         entry["status"] = payload.get("status")
     if "review_message_sent" in payload:
         entry["review_message_sent"] = bool(payload.get("review_message_sent"))
@@ -7497,15 +7702,87 @@ def bot_update_pulse_question_suggestion(suggestion_id: int, payload: dict | Non
     if "reviewed_at" in payload:
         entry["reviewed_at"] = payload.get("reviewed_at")
     if payload.get("approve"):
-        apply_pulse_suggestion_schedule(
-            entry,
-            payload.get("schedule_mode") or entry.get("schedule_mode"),
-            approve=True,
-        )
+        schedule_mode = normalize_pulse_schedule_mode(payload.get("schedule_mode") or entry.get("schedule_mode"))
+        edited = (payload.get("edited_question") or entry.get("edited_question") or "").strip() or None
+        apply_admin_pulse_question_action(entry, schedule_mode, edited)
     elif entry.get("status") == "approved" and not entry.get("active_from_day_key"):
         apply_pulse_suggestion_schedule(entry, entry.get("schedule_mode"), approve=True)
+        queue_pulse_question_review_notification(entry, "question_approved")
     save_runtime_state()
     return {"status": "ok", "entry": entry}
+
+
+@app.get("/api/bot-sync/pulse-questions/review-notifications")
+def bot_pending_pulse_question_review_notifications(x_bot_sync_secret: str | None = Header(default=None)):
+    verify_bot_sync_secret(x_bot_sync_secret)
+    rows = [
+        {
+            "notification_id": item.get("notification_id"),
+            "kind": item.get("kind"),
+            "suggestion_id": item.get("suggestion_id"),
+            "recipient_user_id": item.get("recipient_user_id"),
+            "recipient_username": item.get("recipient_username"),
+            "recipient_display_name": item.get("recipient_display_name"),
+            "question": item.get("question"),
+            "schedule_mode": item.get("schedule_mode"),
+            "active_from_day_key": item.get("active_from_day_key"),
+            "availability_copy": item.get("availability_copy"),
+            "rejection_reason": item.get("rejection_reason"),
+            "created_at": item.get("created_at"),
+        }
+        for item in pulse_question_review_notifications
+        if not item.get("notified_at")
+    ]
+    return {"status": "ok", "notifications": rows}
+
+
+@app.post("/api/bot-sync/pulse-questions/review-notifications/{notification_id}")
+def bot_mark_pulse_question_review_notification_sent(
+    notification_id: str,
+    x_bot_sync_secret: str | None = Header(default=None),
+):
+    verify_bot_sync_secret(x_bot_sync_secret)
+    alert = next(
+        (item for item in pulse_question_review_notifications if item.get("notification_id") == notification_id),
+        None,
+    )
+    if not alert:
+        return {"status": "error", "message": "Pulse question review notification not found."}
+    alert["notified_at"] = now_iso()
+    save_runtime_state()
+    return {"status": "ok", "notification": alert}
+
+
+@app.get("/api/bot-sync/pulse-questions/resubmit-pending")
+def bot_pulse_question_resubmit_pending(
+    user_id: int | None = None,
+    username: str | None = None,
+    x_bot_sync_secret: str | None = Header(default=None),
+):
+    verify_bot_sync_secret(x_bot_sync_secret)
+    entry = find_resubmittable_rejected_pulse_question(user_id, username)
+    if not entry:
+        return {"status": "ok", "entry_id": None}
+    return {
+        "status": "ok",
+        "entry_id": entry.get("id"),
+        "question": pulse_suggestion_question(entry),
+        "rejection_reason": entry.get("rejection_reason"),
+    }
+
+
+@app.post("/api/bot-sync/pulse-questions/resubmit")
+def bot_pulse_question_resubmit(payload: dict | None = None, x_bot_sync_secret: str | None = Header(default=None)):
+    verify_bot_sync_secret(x_bot_sync_secret)
+    payload = payload or {}
+    result = resubmit_rejected_pulse_question(
+        payload.get("user_id"),
+        payload.get("username"),
+        payload.get("question") or "",
+    )
+    if result.get("status") != "ok":
+        return result
+    return result
 
 
 @app.post("/api/bot-sync/pulse-questions/roster/clear")
@@ -7737,7 +8014,7 @@ def list_story():
 
 @app.get("/api/membership/status")
 def membership_status(user_id: int | None = None, username: str | None = None):
-    user = find_verified_alcove_user(user_id, username) or pulse_user_identity(user_id, username)
+    user = find_verified_alcove_user(user_id, username)
     if not user:
         return {
             "status": "error",
