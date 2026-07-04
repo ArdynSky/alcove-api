@@ -280,9 +280,10 @@ PULSE_ADMIN_TELEGRAM_SUPPRESSED = os.getenv(
 ).strip().lower() not in {"1", "true", "yes", "on"}
 PULSE_UNLIMITED_QUESTION_SUBMIT = os.getenv(
     "PULSE_UNLIMITED_QUESTION_SUBMIT",
-    "0" if LEAN_MODE else "1",
+    "0",
 ).strip().lower() in {"1", "true", "yes", "on"}
 PULSE_DAILY_QUESTION_LIMIT = 2
+PULSE_DAILY_REJECTION_REPLACEMENT_LIMIT = 1
 PULSE_RETENTION_DAYS = max(
     7,
     int(os.getenv("PULSE_RETENTION_DAYS", "14" if LEAN_MODE else "30") or (14 if LEAN_MODE else 30)),
@@ -1618,6 +1619,7 @@ def queue_pulse_question_review_notification(entry: dict, kind: str, *, rejectio
         "active_from_day_key": entry.get("active_from_day_key"),
         "availability_copy": pulse_question_availability_copy(entry),
         "rejection_reason": (rejection_reason or entry.get("rejection_reason") or "").strip() or None,
+        "resubmit_allowed": bool(entry.get("resubmit_allowed")),
         "created_at": now_iso(),
         "notified_at": None,
     })
@@ -1816,6 +1818,11 @@ def find_resubmittable_rejected_pulse_question(user_id: int | None = None, usern
 
 
 def resubmit_rejected_pulse_question(user_id: int | None, username: str | None, question: str) -> dict:
+    if pulse_rejection_replacement_used_today(user_id, username):
+        return {
+            "status": "error",
+            "message": "You've already used today's one replacement attempt. Try again after midnight UK time.",
+        }
     entry = find_resubmittable_rejected_pulse_question(user_id, username)
     if not entry:
         return {"status": "error", "message": "No rejected Pulse question is waiting for a resubmission from you."}
@@ -1832,6 +1839,7 @@ def resubmit_rejected_pulse_question(user_id: int | None, username: str | None, 
     entry["reviewed_by"] = None
     entry["needs_admin_notify"] = True
     entry["review_message_sent"] = False
+    pulse_close_other_rejection_resubmits(user_id, username)
     submitter = entry.get("display_name") or entry.get("username") or entry.get("user_id")
     pulse_admin_notify(
         "\n".join([
@@ -2363,7 +2371,10 @@ def apply_admin_pulse_question_action(
             )
         entry["status"] = "rejected"
         entry["rejection_reason"] = reason
-        entry["resubmit_allowed"] = True
+        entry["resubmit_allowed"] = not pulse_rejection_replacement_used_today(
+            entry.get("user_id"),
+            entry.get("username"),
+        )
         entry["reviewed_at"] = now_iso()
         queue_pulse_question_review_notification(entry, "question_rejected", rejection_reason=reason)
         return
@@ -6933,14 +6944,53 @@ def pulse_question_submissions_for_user_today(user_id=None, username=None) -> li
     return rows
 
 
-def pulse_question_submissions_today_count(user_id=None, username=None) -> int:
-    count = 0
+def pulse_has_pending_rejection_resubmit(user_id=None, username=None) -> bool:
+    return any(
+        (existing.get("status") or "").strip().lower() == "rejected"
+        and existing.get("resubmit_allowed")
+        for existing in pulse_question_submissions_for_user_today(user_id, username)
+    )
+
+
+def pulse_rejection_replacement_used_today(user_id=None, username=None) -> bool:
+    rows = pulse_question_submissions_for_user_today(user_id, username)
+    if any(existing.get("resubmitted_at") for existing in rows):
+        return True
+    return len(rows) > PULSE_DAILY_QUESTION_LIMIT
+
+
+def pulse_rejection_replacement_available(user_id=None, username=None) -> bool:
+    if pulse_rejection_replacement_used_today(user_id, username):
+        return False
+    return pulse_has_pending_rejection_resubmit(user_id, username)
+
+
+def pulse_close_other_rejection_resubmits(user_id=None, username=None, keep_entry_id=None) -> None:
+    changed = False
     for existing in pulse_question_submissions_for_user_today(user_id, username):
-        status = (existing.get("status") or "").strip().lower()
-        if status == "rejected" and existing.get("resubmit_allowed"):
+        if keep_entry_id is not None and existing.get("id") == keep_entry_id:
             continue
-        count += 1
-    return count
+        if (existing.get("status") or "").strip().lower() != "rejected":
+            continue
+        if not existing.get("resubmit_allowed"):
+            continue
+        existing["resubmit_allowed"] = False
+        changed = True
+    if changed:
+        save_runtime_state()
+
+
+def pulse_max_submissions_allowed_today(user_id=None, username=None) -> int:
+    extra = (
+        PULSE_DAILY_REJECTION_REPLACEMENT_LIMIT
+        if pulse_rejection_replacement_available(user_id, username)
+        else 0
+    )
+    return PULSE_DAILY_QUESTION_LIMIT + extra
+
+
+def pulse_question_submissions_today_count(user_id=None, username=None) -> int:
+    return pulse_question_submissions_total_today(user_id, username)
 
 
 def pulse_question_submissions_total_today(user_id=None, username=None) -> int:
@@ -6951,10 +7001,9 @@ def pulse_can_submit_another_question(user_id=None, username=None) -> bool:
     if pulse_unlimited_question_submit():
         return True
     total = pulse_question_submissions_total_today(user_id, username)
-    effective = pulse_question_submissions_today_count(user_id, username)
     if total < 1:
         return False
-    return effective < PULSE_DAILY_QUESTION_LIMIT
+    return total < pulse_max_submissions_allowed_today(user_id, username)
 
 
 @app.post("/api/pulse-question-suggestions")
@@ -6973,17 +7022,28 @@ def submit_pulse_question_suggestion(payload: PulseQuestionSuggestion):
     user_id = identity.get("user_id")
     username = (identity.get("username") or "").lower()
     if not pulse_unlimited_question_submit():
-        submissions_today = pulse_question_submissions_today_count(user_id, username)
-        if submissions_today >= PULSE_DAILY_QUESTION_LIMIT:
+        submissions_today = pulse_question_submissions_total_today(user_id, username)
+        max_allowed = pulse_max_submissions_allowed_today(user_id, username)
+        if submissions_today >= max_allowed:
             print(
                 f"[{now_iso()}] pulse question submit rejected: daily limit reached "
-                f"user_id={user_id} username={username!r} count={submissions_today}",
+                f"user_id={user_id} username={username!r} count={submissions_today} max={max_allowed}",
                 flush=True,
             )
             return {
                 "status": "error",
-                "message": "You've already submitted your two Pulse questions for today.",
+                "message": (
+                    "You've already submitted your two Pulse questions for today."
+                    if not pulse_rejection_replacement_available(user_id, username)
+                    else "You've already used today's one replacement attempt."
+                ),
             }
+
+    using_replacement_slot = (
+        not pulse_unlimited_question_submit()
+        and pulse_rejection_replacement_available(user_id, username)
+        and pulse_question_submissions_total_today(user_id, username) >= PULSE_DAILY_QUESTION_LIMIT
+    )
 
     pool = (payload.pool or "green").strip().lower()
     category = (payload.category or "").strip()
@@ -7021,6 +7081,8 @@ def submit_pulse_question_suggestion(payload: PulseQuestionSuggestion):
         "active_from_day_key": None,
     }
     pulse_question_suggestions.append(entry)
+    if using_replacement_slot:
+        pulse_close_other_rejection_resubmits(user_id, username)
     save_runtime_state()
     submitter = entry.get("display_name") or entry.get("username") or entry.get("user_id")
     pulse_admin_notify(
@@ -7089,17 +7151,19 @@ def pulse_question_suggestion_status(user_id: int | None = None, username: str |
             continue
         latest_entry = existing
 
-    if submissions_today >= PULSE_DAILY_QUESTION_LIMIT:
-        message = "Both of today's Pulse questions are already with F.O.X for review."
+    if not can_submit_another:
+        if pulse_rejection_replacement_used_today(user_id, username):
+            message = "You've used today's one replacement attempt. New questions unlock at midnight UK time."
+        elif submissions_total_today >= PULSE_DAILY_QUESTION_LIMIT:
+            message = "Both of today's Pulse questions are already with F.O.X for review."
+        else:
+            message = "Both of today's Pulse questions are already with F.O.X for review."
+    elif pulse_rejection_replacement_available(user_id, username):
+        message = "Your Pulse was not approved. You have one replacement attempt today — choose your words carefully."
     elif latest_entry and latest_entry.get("status") == "pending_review":
         message = "Your Pulse is with F.O.X for review. You can submit one more today."
     elif latest_entry and latest_entry.get("status") == "approved":
         message = "Your Pulse has been approved. You can submit one more today."
-    elif any(
-        (entry.get("status") or "").strip().lower() == "rejected" and entry.get("resubmit_allowed")
-        for entry in pulse_question_submissions_for_user_today(user_id, username)
-    ):
-        message = "Your Pulse was not approved. You can submit one replacement question today."
     else:
         message = "You can submit one more Pulse question today."
 
