@@ -1,6 +1,6 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, Response
+from fastapi.responses import Response
 from pydantic import BaseModel
 import re
 from urllib.parse import parse_qsl, urlparse, unquote
@@ -18,9 +18,8 @@ import json
 import random
 import sqlite3
 import urllib.request
-import zipfile
 from html import escape
-from fastapi import Header, HTTPException, WebSocket, WebSocketDisconnect, File, UploadFile, Form
+from fastapi import Header, HTTPException, WebSocket, WebSocketDisconnect
 from .websocket_manager import manager
 from .cards_game import (
     CreateRoomPayload,
@@ -34,7 +33,6 @@ from .cards_game import (
 )
 from .cards_progress import fetch_pending_rewards, mark_rewards_claimed, profile_summary
 from .cards_ws_manager import cards_ws_manager
-from . import fox_messages as fox_messages_store
 
 try:
     from dotenv import load_dotenv
@@ -52,32 +50,16 @@ except ImportError:
 
 app = FastAPI()
 
-CORS_ALLOWED_ORIGINS = [
-    "null",
-    "http://127.0.0.1:5500",
-    "http://localhost:5500",
-    "http://127.0.0.1:8080",
-    "http://localhost:8080",
-    "http://127.0.0.1:8000",
-    "http://localhost:8000",
-    "http://127.0.0.1:5173",
-    "http://localhost:5173",
-    "https://euphonious-banoffee-1c8215.netlify.app",
-    "https://thealcove.netlify.app",
-    "https://ardyn-alcove.com",
-    "https://www.ardyn-alcove.com",
-]
-_extra_cors = os.getenv("CORS_ALLOWED_ORIGINS", "").strip()
-if _extra_cors:
-    CORS_ALLOWED_ORIGINS.extend(
-        origin.strip()
-        for origin in _extra_cors.split(",")
-        if origin.strip() and origin.strip() not in CORS_ALLOWED_ORIGINS
-    )
-
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=CORS_ALLOWED_ORIGINS,
+    allow_origins=[
+        "http://127.0.0.1:5500",
+        "http://localhost:5500",
+        "https://euphonious-banoffee-1c8215.netlify.app",
+        "https://thealcove.netlify.app",
+        "https://ardyn-alcove.com",
+        "https://www.ardyn-alcove.com",
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -112,10 +94,6 @@ FEATURE_FLAGS_PATH = os.getenv(
 PULSE_SETTINGS_PATH = os.getenv(
     "PULSE_SETTINGS_PATH",
     os.path.join(os.getcwd(), "pulse_settings.json"),
-)
-SAFETY_SETTINGS_PATH = os.getenv(
-    "SAFETY_SETTINGS_PATH",
-    os.path.join(os.getcwd(), "safety_settings.json"),
 )
 RUNTIME_STATE_PATH = os.getenv(
     "ALCOVE_RUNTIME_STATE_PATH",
@@ -238,10 +216,12 @@ pulse_entries = []
 pulse_receipts = []
 pulse_red_activations = []
 pulse_red_unlock_notifications = []
-pulse_question_review_notifications = []
 pulse_question_suggestions = []
 pulse_daily_summary_posts = []
 pulse_disabled_questions = []
+pulse_testing_config = {"feedback_title": "PULSE TESTING", "updated_at": None}
+pulse_testing_feedback = []
+pulse_testing_prefs = {}
 miniapp_verifications = []
 synced_alcove_users = []
 synced_alcove_analytics = {}
@@ -269,21 +249,11 @@ PULSE_GREEN_UNLOCK_INTERVAL_HOURS = 4
 PULSE_MAX_GREEN_SLOTS = 6
 PULSE_TESTING_UNLIMITED = os.getenv("PULSE_TESTING_UNLIMITED", "0").strip().lower() in {"1", "true", "yes", "on"}
 LEAN_MODE = os.getenv("LEAN_MODE", "0").strip().lower() in {"1", "true", "yes", "on"}
-PULSE_ADMIN_NOTIFY_ENABLED = os.getenv(
-    "PULSE_ADMIN_NOTIFY_ENABLED",
-    "0",
-).strip().lower() in {"1", "true", "yes", "on"}
-# Hard-off pulse admin Telegram unless PULSE_ADMIN_TELEGRAM_FORCE=1 is set explicitly.
-PULSE_ADMIN_TELEGRAM_SUPPRESSED = os.getenv(
-    "PULSE_ADMIN_TELEGRAM_FORCE",
-    "",
-).strip().lower() not in {"1", "true", "yes", "on"}
 PULSE_UNLIMITED_QUESTION_SUBMIT = os.getenv(
     "PULSE_UNLIMITED_QUESTION_SUBMIT",
-    "0",
+    "0" if LEAN_MODE else "1",
 ).strip().lower() in {"1", "true", "yes", "on"}
 PULSE_DAILY_QUESTION_LIMIT = 2
-PULSE_DAILY_REJECTION_REPLACEMENT_LIMIT = 1
 PULSE_RETENTION_DAYS = max(
     7,
     int(os.getenv("PULSE_RETENTION_DAYS", "14" if LEAN_MODE else "30") or (14 if LEAN_MODE else 30)),
@@ -319,10 +289,6 @@ def lean_mode_enabled() -> bool:
     return LEAN_MODE
 
 
-def now_iso() -> str:
-    return datetime.datetime.utcnow().isoformat()
-
-
 def runtime_state_payload() -> dict:
     payload = {
         "spotlight_entries": spotlight_entries,
@@ -330,10 +296,12 @@ def runtime_state_payload() -> dict:
         "pulse_receipts": pulse_receipts,
         "pulse_red_activations": pulse_red_activations,
         "pulse_red_unlock_notifications": pulse_red_unlock_notifications,
-        "pulse_question_review_notifications": pulse_question_review_notifications,
         "pulse_question_suggestions": pulse_question_suggestions,
         "pulse_daily_summary_posts": pulse_daily_summary_posts,
         "pulse_disabled_questions": pulse_disabled_questions,
+        "pulse_testing_config": pulse_testing_config,
+        "pulse_testing_feedback": pulse_testing_feedback,
+        "pulse_testing_prefs": pulse_testing_prefs,
         "miniapp_verifications": miniapp_verifications,
         "synced_alcove_users": synced_alcove_users,
         "last_bot_sync_at": last_bot_sync_at,
@@ -366,7 +334,8 @@ def ensure_state_store() -> None:
 
 def apply_runtime_payload(payload: dict) -> None:
     global spotlight_entries, pulse_entries, pulse_receipts, pulse_red_activations, pulse_red_unlock_notifications
-    global pulse_question_review_notifications, pulse_question_suggestions, pulse_daily_summary_posts, pulse_disabled_questions
+    global pulse_question_suggestions, pulse_daily_summary_posts, pulse_disabled_questions
+    global pulse_testing_config, pulse_testing_feedback, pulse_testing_prefs
     global miniapp_verifications, wheel_reaction_history, wheel_review_history, wheel_user_engagement
     global synced_alcove_users, synced_alcove_analytics, last_bot_sync_at
 
@@ -379,14 +348,16 @@ def apply_runtime_payload(payload: dict) -> None:
         if isinstance(payload.get("pulse_red_unlock_notifications"), list)
         else []
     )
-    pulse_question_review_notifications = (
-        payload.get("pulse_question_review_notifications")
-        if isinstance(payload.get("pulse_question_review_notifications"), list)
-        else []
-    )
     pulse_question_suggestions = payload.get("pulse_question_suggestions") if isinstance(payload.get("pulse_question_suggestions"), list) else []
     pulse_daily_summary_posts = payload.get("pulse_daily_summary_posts") if isinstance(payload.get("pulse_daily_summary_posts"), list) else []
     pulse_disabled_questions = payload.get("pulse_disabled_questions") if isinstance(payload.get("pulse_disabled_questions"), list) else []
+    incoming_pulse_testing_config = payload.get("pulse_testing_config")
+    if isinstance(incoming_pulse_testing_config, dict):
+        pulse_testing_config = incoming_pulse_testing_config
+    incoming_pulse_testing_feedback = payload.get("pulse_testing_feedback")
+    pulse_testing_feedback = incoming_pulse_testing_feedback if isinstance(incoming_pulse_testing_feedback, list) else []
+    incoming_pulse_testing_prefs = payload.get("pulse_testing_prefs")
+    pulse_testing_prefs = incoming_pulse_testing_prefs if isinstance(incoming_pulse_testing_prefs, dict) else {}
     miniapp_verifications = payload.get("miniapp_verifications") if isinstance(payload.get("miniapp_verifications"), list) else []
     if lean_mode_enabled():
         wheel_reaction_history.clear()
@@ -1065,72 +1036,62 @@ if lean_mode_enabled():
     print(
         f"[{now_iso()}] LEAN_MODE enabled: retention={PULSE_RETENTION_DAYS}d, "
         f"unlimited_question_submit={PULSE_UNLIMITED_QUESTION_SUBMIT}, "
-        f"pulse_admin_notify={PULSE_ADMIN_NOTIFY_ENABLED}, "
         "wheel history omitted from runtime state.",
         flush=True,
     )
 
 FEATURE_FLAG_REGISTRY = {
     "pages": {
-        "title": "Home launcher buttons",
+        "title": "Main Mini App Buttons",
         "flags": {
             "video_chat": {
                 "label": "Video Chat",
                 "description": "Show or hide the Video Chat button on home.",
-                "path": "video-chat.html",
                 "default": True,
             },
             "archive": {
                 "label": "Archive",
                 "description": "Show or hide the Archive button on home.",
-                "path": "archive.html",
                 "default": True,
             },
             "info": {
                 "label": "Info",
                 "description": "Show or hide the Info button on home.",
-                "path": "info.html",
                 "default": True,
             },
             "wellbeing": {
                 "label": "Connect",
-                "description": "Show or hide the Connect hub on home.",
-                "path": "wellbeing-concept-open-stage.html",
+                "description": "Show or hide the Connect area (wellbeing-concept-open-stage.html).",
                 "default": True,
             },
             "profile": {
                 "label": "Profile",
                 "description": "Show or hide the Profile loadout page on home.",
-                "path": "profile.html",
                 "default": True,
             },
             "cards": {
                 "label": "Alcove Cards",
                 "description": "Show or hide the Alcove Cards game on home.",
-                "path": "alcove-cards-demo.html",
                 "default": False,
             },
         },
     },
     "wellbeing": {
-        "title": "Connect sections",
+        "title": "Connect Sections",
         "flags": {
             "daily_checkin": {
                 "label": "Daily Check-in",
                 "description": "Show or hide Daily Check-in inside Connect.",
-                "path": "wellbeing-concept-open-stage.html#checkin",
                 "default": True,
             },
             "spotlight": {
                 "label": "Spotlight",
                 "description": "Show or hide Spotlight inside Connect.",
-                "path": "wellbeing-concept-open-stage.html#spotlight",
                 "default": True,
             },
             "pulse": {
                 "label": "Pulse",
                 "description": "Show or hide Pulse inside Connect.",
-                "path": "wellbeing-concept-open-stage.html#pulse",
                 "default": True,
             },
         },
@@ -1151,7 +1112,6 @@ def feature_flag_schema_payload() -> dict:
                 key: {
                     "label": spec["label"],
                     "description": spec.get("description", ""),
-                    "path": spec.get("path", ""),
                     "default": bool(spec["default"]),
                 }
                 for key, spec in section["flags"].items()
@@ -1240,6 +1200,29 @@ class WheelReaction(BaseModel):
     username: str | None = None
     display_name: str
     reaction_key: str
+
+
+class PulseTestingConfigUpdate(BaseModel):
+    feedback_title: str
+
+
+class PulseTestingFeedbackPayload(BaseModel):
+    user_id: int | None = None
+    username: str | None = None
+    display_name: str
+    text: str
+
+
+class PulseTestingPrefsPayload(BaseModel):
+    user_id: int | None = None
+    username: str | None = None
+    display_name: str
+    pack: str | None = None
+    pack_unlocked: bool | None = None
+    message_color: str | None = None
+    overlay: str | None = None
+    emoji_set: str | None = None
+    init_data: str | None = None
 
 
 class ModuleStateUpdate(BaseModel):
@@ -1385,7 +1368,6 @@ class AdminPulseQuestionAction(BaseModel):
     admin_secret: str
     action: str
     edited_question: str | None = None
-    rejection_reason: str | None = None
 
 
 class AdminPulseQuestionCreate(BaseModel):
@@ -1402,54 +1384,13 @@ class AdminSpotlightAction(BaseModel):
     edited_reason: str | None = None
 
 
-class AdminSafetySettingsPayload(BaseModel):
-    admin_secret: str
-    flood_message_threshold: int | None = None
-    flood_window_seconds: int | None = None
-    daily_digest_enabled: bool | None = None
-    daily_digest_hour_utc: int | None = None
-    keywords: list[dict] | None = None
-
-
-class AdminFoxBuiltinSettingsPayload(BaseModel):
-    admin_secret: str
-    self_care: dict | None = None
-    templates: dict | None = None
-
-
-class FoxAuditBatchPayload(BaseModel):
-    entries: list[dict]
-
-
-class AdminFoxScheduledPostPayload(BaseModel):
-    admin_secret: str
-    title: str | None = None
-    enabled: bool | None = None
-    schedule_type: str | None = None
-    hour_utc: int | None = None
-    minute_utc: int | None = None
-    interval_hours: int | None = None
-    weekday_utc: int | None = None
-    run_at: str | None = None
-    target: str | None = None
-    topic_id: int | None = None
-    text: str | None = None
-    banner: str | None = None
-    link_url: str | None = None
-    link_label: str | None = None
-    replace_singleton: str | None = None
-
-
-class FoxMessageDeliveryPayload(BaseModel):
-    post_id: str
-    message_id: int | None = None
-    chat_id: int | None = None
-    error: str | None = None
-
-
 # ---------------------------------
 # Helpers
 # ---------------------------------
+
+def now_iso() -> str:
+    return datetime.datetime.utcnow().isoformat()
+
 
 def iso_in_seconds(seconds: int) -> str:
     return (datetime.datetime.utcnow() + datetime.timedelta(seconds=seconds)).isoformat()
@@ -1549,80 +1490,6 @@ def pulse_day_label(day_key: str | None = None) -> str:
     except ValueError:
         return raw
     return parsed.strftime("%d %B %Y")
-
-
-def pulse_day_ordinal(day: int) -> str:
-    if 11 <= day <= 13:
-        return f"{day}th"
-    suffix = {1: "st", 2: "nd", 3: "rd"}.get(day % 10, "th")
-    return f"{day}{suffix}"
-
-
-def pulse_day_name_with_ordinal(day_key: str | None) -> str:
-    if not day_key:
-        return "the next Pulse day"
-    try:
-        parsed = datetime.date.fromisoformat(day_key)
-    except ValueError:
-        return day_key
-    return f"{parsed.strftime('%A')} {pulse_day_ordinal(parsed.day)} {parsed.strftime('%B')}"
-
-
-def pulse_question_availability_copy(entry: dict) -> str:
-    schedule = normalize_pulse_schedule_mode(entry.get("schedule_mode"))
-    active_from = (entry.get("active_from_day_key") or "").strip()
-    day_label = pulse_day_name_with_ordinal(active_from)
-    if schedule == "today" or active_from == pulse_day_key():
-        return (
-            f"It is live in Pulse now and stays available until midnight UK time tonight "
-            f"({pulse_day_name_with_ordinal(pulse_day_key())})."
-        )
-    if schedule == "reserve":
-        return "It has been saved to the reserve pot. F.O.X will schedule it for a future Pulse day."
-    return (
-        f"It will be added to the next day's Pulse questions and will be available from "
-        f"00:00 on {day_label} (UK time) for 24 hours."
-    )
-
-
-def pulse_suggestion_submitter_user_id(entry: dict) -> int | None:
-    try:
-        user_id = int(entry.get("user_id") or 0)
-    except (TypeError, ValueError):
-        return None
-    return user_id or None
-
-
-def queue_pulse_question_review_notification(entry: dict, kind: str, *, rejection_reason: str | None = None) -> None:
-    user_id = pulse_suggestion_submitter_user_id(entry)
-    if not user_id:
-        return
-    suggestion_id = int(entry.get("id") or 0)
-    if not suggestion_id:
-        return
-    for existing in pulse_question_review_notifications:
-        if (
-            existing.get("kind") == kind
-            and int(existing.get("suggestion_id") or 0) == suggestion_id
-            and not existing.get("notified_at")
-        ):
-            return
-    pulse_question_review_notifications.append({
-        "notification_id": f"pulse-review-{kind}-{suggestion_id}-{len(pulse_question_review_notifications) + 1}",
-        "kind": kind,
-        "suggestion_id": suggestion_id,
-        "recipient_user_id": user_id,
-        "recipient_username": entry.get("username"),
-        "recipient_display_name": entry.get("display_name"),
-        "question": pulse_suggestion_question(entry),
-        "schedule_mode": entry.get("schedule_mode") or "tomorrow",
-        "active_from_day_key": entry.get("active_from_day_key"),
-        "availability_copy": pulse_question_availability_copy(entry),
-        "rejection_reason": (rejection_reason or entry.get("rejection_reason") or "").strip() or None,
-        "resubmit_allowed": bool(entry.get("resubmit_allowed")),
-        "created_at": now_iso(),
-        "notified_at": None,
-    })
 
 
 def normalized_pulse_reset_interval(value) -> int:
@@ -1799,92 +1666,11 @@ def clear_pulse_question_roster(reviewed_by=None):
     }
 
 
-def find_resubmittable_rejected_pulse_question(user_id: int | None = None, username: str | None = None):
-    username = (username or "").lower()
-    matches = []
-    for entry in pulse_question_suggestions:
-        if entry.get("status") != "rejected":
-            continue
-        if not entry.get("resubmit_allowed"):
-            continue
-        same_user = user_id and int(entry.get("user_id") or 0) == int(user_id)
-        same_username = username and (entry.get("username") or "").lower() == username
-        if same_user or same_username:
-            matches.append(entry)
-    if not matches:
-        return None
-    matches.sort(key=lambda item: item.get("reviewed_at") or item.get("submitted_at") or "", reverse=True)
-    return matches[0]
-
-
-def resubmit_rejected_pulse_question(user_id: int | None, username: str | None, question: str) -> dict:
-    if pulse_rejection_replacement_used_today(user_id, username):
-        return {
-            "status": "error",
-            "message": "You've already used today's one replacement attempt. Try again after midnight UK time.",
-        }
-    entry = find_resubmittable_rejected_pulse_question(user_id, username)
-    if not entry:
-        return {"status": "error", "message": "No rejected Pulse question is waiting for a resubmission from you."}
-    cleaned = (question or "").strip()
-    if len(cleaned) < 8:
-        return {"status": "error", "message": "Please add a little more detail before sending your new Pulse question."}
-    entry["question"] = cleaned
-    entry["edited_question"] = None
-    entry["status"] = "pending_review"
-    entry["rejection_reason"] = None
-    entry["resubmit_allowed"] = False
-    entry["resubmitted_at"] = now_iso()
-    entry["reviewed_at"] = None
-    entry["reviewed_by"] = None
-    entry["needs_admin_notify"] = True
-    entry["review_message_sent"] = False
-    pulse_close_other_rejection_resubmits(user_id, username)
-    submitter = entry.get("display_name") or entry.get("username") or entry.get("user_id")
-    pulse_admin_notify(
-        "\n".join([
-            "<b>Pulse question resubmitted after rejection</b>",
-            f"ID: <code>{entry['id']}</code>",
-            f"Pool: <b>{escape((entry.get('pool') or 'green').title())}</b>",
-            f"From: <b>{escape(str(submitter))}</b>",
-            "",
-            f"<code>{escape(cleaned)}</code>",
-            "",
-            "Review in Feature Admin.",
-        ]),
-        PULSE_QUESTIONS_TOPIC_ID,
-    )
-    save_runtime_state()
-    return {
-        "status": "ok",
-        "message": "Thanks — your new Pulse question has been sent to F.O.X for review.",
-        "entry": entry,
-    }
-
-
 def find_pulse_question_suggestion(suggestion_id: int):
     for entry in pulse_question_suggestions:
         if int(entry.get("id") or 0) == int(suggestion_id):
             return entry
     return None
-
-
-def next_pulse_entry_id() -> int:
-    return max((int(entry.get("id") or 0) for entry in pulse_entries), default=0) + 1
-
-
-def find_pulse_entry(pulse_id: int, *, status: str | None = None):
-    matches = [
-        item for item in pulse_entries
-        if int(item.get("id") or 0) == int(pulse_id)
-    ]
-    if not matches:
-        return None
-    if status:
-        filtered = [item for item in matches if item.get("status") == status]
-        if filtered:
-            return filtered[-1]
-    return matches[-1]
 
 
 def prioritized_random_question(entries: list[dict], seed_value: str = "") -> dict | None:
@@ -2137,14 +1923,11 @@ def pulse_question_suggestion_owner_fields(suggestion_id: int | None):
     }
 
 
-def pulse_suggestions_for_user(user_id=None, username=None, *, include_rejected: bool = True):
+def pulse_suggestions_for_user(user_id=None, username=None):
     identity = {"user_id": user_id, "username": username}
     rows = []
     for entry in pulse_question_suggestions:
-        status = (entry.get("status") or "").strip().lower()
-        if status == "deleted":
-            continue
-        if status == "rejected" and not include_rejected:
+        if entry.get("status") in {"rejected", "deleted"}:
             continue
         owner = {"user_id": entry.get("user_id"), "username": entry.get("username")}
         if pulse_identities_match(identity, owner):
@@ -2199,9 +1982,6 @@ def pulse_owned_suggestion_payload(identity, suggestion):
         "submitted_day_key": suggestion.get("day_key"),
         "active_from_day_key": active_from or None,
         "active_from_label": pulse_day_label(active_from) if active_from else None,
-        "reviewed_at": suggestion.get("reviewed_at"),
-        "rejection_reason": (suggestion.get("rejection_reason") or "").strip() or None,
-        "resubmit_allowed": bool(suggestion.get("resubmit_allowed")),
         "answers_count": len(answers),
         "answers": answers,
     }
@@ -2213,26 +1993,18 @@ def pulse_my_pulses_payload(identity):
     past_rows = []
     for suggestion in pulse_suggestions_for_user(identity.get("user_id"), identity.get("username")):
         row = pulse_owned_suggestion_payload(identity, suggestion)
-        status = (suggestion.get("status") or "").strip().lower()
+        status = suggestion.get("status")
         active_from = (suggestion.get("active_from_day_key") or "").strip()
         submitted_day = (suggestion.get("day_key") or "").strip()
-        reviewed_day = (suggestion.get("reviewed_at") or suggestion.get("submitted_at") or "")[:10]
 
-        if status in {"pending_review", "reserved"}:
-            today_rows.append(row)
-        elif status == "rejected":
-            if submitted_day == today_key or reviewed_day == today_key:
-                today_rows.append(row)
-            else:
-                past_rows.append(row)
-        elif submitted_day == today_key or (active_from and active_from >= today_key):
+        if status in {"pending_review", "reserved"} or submitted_day == today_key or (active_from and active_from >= today_key):
             today_rows.append(row)
         elif status == "approved" and active_from and active_from < today_key:
             past_rows.append(row)
         elif status == "approved" and not active_from:
             past_rows.append(row)
 
-    sort_key = lambda row: row.get("reviewed_at") or row.get("submitted_at") or row.get("active_from_day_key") or row.get("submitted_day_key") or ""
+    sort_key = lambda row: row.get("active_from_day_key") or row.get("submitted_day_key") or ""
     today_rows.sort(key=sort_key, reverse=True)
     past_rows.sort(key=sort_key, reverse=True)
     return {"today": today_rows, "past": past_rows}
@@ -2250,7 +2022,7 @@ def pulse_reset_interval_hours() -> int:
 
 
 def pulse_green_unlock_interval_hours() -> int:
-    return pulse_reset_interval_hours()
+    return PULSE_GREEN_UNLOCK_INTERVAL_HOURS
 
 
 def next_pulse_unlock_at(now: datetime.datetime | None = None, interval_hours: int | None = None) -> datetime.datetime:
@@ -2312,46 +2084,7 @@ def telegram_admin_notify(text: str, topic_id: int | None = None) -> bool:
         return False
 
 
-def pulse_admin_notify(text: str, topic_id: int | None = None) -> bool:
-    return False
-
-
-def drain_pulse_admin_telegram_backlog() -> None:
-    if not PULSE_ADMIN_TELEGRAM_SUPPRESSED:
-        return
-    changed = False
-    stamped = now_iso()
-    for entry in pulse_question_suggestions:
-        if entry.get("status") == "pending_review" and not entry.get("review_message_sent"):
-            entry["review_message_sent"] = True
-            entry["needs_admin_notify"] = False
-            changed = True
-    for entry in pulse_entries:
-        if entry.get("status") == "completed" and not entry.get("admin_posted_at"):
-            entry["admin_posted_at"] = stamped
-            changed = True
-    for state in pulse_daily_summary_posts:
-        if not state.get("admin_posted_at"):
-            state["admin_posted_at"] = stamped
-            changed = True
-    if changed:
-        save_runtime_state(force=True)
-        print(
-            f"[{stamped}] Drained pulse admin Telegram backlog "
-            f"({sum(1 for e in pulse_entries if e.get('status') == 'completed')} completed pulses checked).",
-            flush=True,
-        )
-
-
-drain_pulse_admin_telegram_backlog()
-
-
-def apply_admin_pulse_question_action(
-    entry: dict,
-    action: str,
-    edited_question: str | None = None,
-    rejection_reason: str | None = None,
-) -> None:
+def apply_admin_pulse_question_action(entry: dict, action: str, edited_question: str | None = None) -> None:
     action = (action or "").strip().lower()
     if action == "amend":
         text = (edited_question or "").strip()
@@ -2363,20 +2096,8 @@ def apply_admin_pulse_question_action(
         entry["review_message_sent"] = False
         return
     if action == "reject":
-        reason = (rejection_reason or "").strip()
-        if not reason:
-            raise HTTPException(
-                status_code=400,
-                detail="A rejection reason is required so F.O.X can message the member.",
-            )
         entry["status"] = "rejected"
-        entry["rejection_reason"] = reason
-        entry["resubmit_allowed"] = not pulse_rejection_replacement_used_today(
-            entry.get("user_id"),
-            entry.get("username"),
-        )
         entry["reviewed_at"] = now_iso()
-        queue_pulse_question_review_notification(entry, "question_rejected", rejection_reason=reason)
         return
     if action in {"today", "tomorrow", "reserve"}:
         pool = (entry.get("pool") or "green").strip().lower()
@@ -2392,10 +2113,7 @@ def apply_admin_pulse_question_action(
         ensure_single_red_slot(entry)
         entry["reviewed_at"] = now_iso()
         entry["needs_admin_notify"] = False
-        entry["resubmit_allowed"] = False
         archive_pulse_question_from_suggestion(entry)
-        if entry.get("status") == "approved":
-            queue_pulse_question_review_notification(entry, "question_approved")
         return
     raise HTTPException(status_code=400, detail="Unknown Pulse question action.")
 
@@ -2592,11 +2310,6 @@ def upsert_miniapp_verification(user: dict) -> dict:
         None,
     )
     if existing:
-        if existing.get("status") in {"completed", "failed"}:
-            existing["status"] = "pending"
-            existing["requested_at"] = now
-            existing["completed_at"] = None
-            existing.pop("detail", None)
         existing.update({
             "username": user.get("username"),
             "first_name": user.get("first_name"),
@@ -2647,17 +2360,13 @@ def merged_feature_flags(saved: dict | None = None) -> dict:
 
 
 def load_feature_flags() -> dict:
-    saved = None
-    if os.path.exists(FEATURE_FLAGS_PATH):
-        try:
-            with open(FEATURE_FLAGS_PATH, "r", encoding="utf-8") as handle:
-                saved = json.load(handle)
-        except (OSError, json.JSONDecodeError):
-            saved = None
-    flags = merged_feature_flags(saved)
-    if flags != saved:
-        save_feature_flags(flags)
-    return flags
+    if not os.path.exists(FEATURE_FLAGS_PATH):
+        return merged_feature_flags()
+    try:
+        with open(FEATURE_FLAGS_PATH, "r", encoding="utf-8") as handle:
+            return merged_feature_flags(json.load(handle))
+    except (OSError, json.JSONDecodeError):
+        return merged_feature_flags()
 
 
 def save_feature_flags(flags: dict) -> None:
@@ -2666,79 +2375,6 @@ def save_feature_flags(flags: dict) -> None:
         os.makedirs(directory, exist_ok=True)
     with open(FEATURE_FLAGS_PATH, "w", encoding="utf-8") as handle:
         json.dump(flags, handle, indent=2, sort_keys=True)
-
-
-DEFAULT_SAFETY_SETTINGS = {
-    "flood_message_threshold": 8,
-    "flood_window_seconds": 60,
-    "daily_digest_enabled": True,
-    "daily_digest_hour_utc": 8,
-    "keywords": [],
-}
-
-
-def normalized_safety_settings(raw: dict | None = None) -> dict:
-    settings = {
-        **DEFAULT_SAFETY_SETTINGS,
-        "keywords": [],
-    }
-    if not isinstance(raw, dict):
-        return settings
-    try:
-        settings["flood_message_threshold"] = max(3, min(int(raw.get("flood_message_threshold", 8)), 50))
-    except (TypeError, ValueError):
-        pass
-    try:
-        settings["flood_window_seconds"] = max(15, min(int(raw.get("flood_window_seconds", 60)), 600))
-    except (TypeError, ValueError):
-        pass
-    settings["daily_digest_enabled"] = bool(raw.get("daily_digest_enabled", True))
-    try:
-        settings["daily_digest_hour_utc"] = max(0, min(int(raw.get("daily_digest_hour_utc", 8)), 23))
-    except (TypeError, ValueError):
-        pass
-    keywords = []
-    for entry in raw.get("keywords") or []:
-        if not isinstance(entry, dict):
-            continue
-        term = str(entry.get("term") or "").strip().lower()
-        if not term:
-            continue
-        severity = str(entry.get("severity") or "medium").strip().lower()
-        if severity not in {"low", "medium", "high"}:
-            severity = "medium"
-        keywords.append(
-            {
-                "term": term,
-                "category": str(entry.get("category") or "custom").strip() or "custom",
-                "severity": severity,
-                "enabled": bool(entry.get("enabled", True)),
-                "added_at": entry.get("added_at") or now_iso(),
-                "added_by": entry.get("added_by") or "admin",
-            }
-        )
-    settings["keywords"] = keywords
-    return settings
-
-
-def load_safety_settings() -> dict:
-    if not os.path.exists(SAFETY_SETTINGS_PATH):
-        return normalized_safety_settings()
-    try:
-        with open(SAFETY_SETTINGS_PATH, "r", encoding="utf-8") as handle:
-            return normalized_safety_settings(json.load(handle))
-    except (OSError, json.JSONDecodeError):
-        return normalized_safety_settings()
-
-
-def save_safety_settings(settings: dict) -> dict:
-    normalized = normalized_safety_settings(settings)
-    directory = os.path.dirname(SAFETY_SETTINGS_PATH)
-    if directory:
-        os.makedirs(directory, exist_ok=True)
-    with open(SAFETY_SETTINGS_PATH, "w", encoding="utf-8") as handle:
-        json.dump(normalized, handle, indent=2, sort_keys=True)
-    return normalized
 
 
 def normalized_pulse_threshold(value) -> int:
@@ -2907,60 +2543,6 @@ def ensure_fox_read_tables(conn):
         )
         """
     )
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS admin_actions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            admin_user_id INTEGER,
-            target_user_id INTEGER,
-            action_type TEXT,
-            delivery TEXT,
-            template_id INTEGER,
-            reason TEXT,
-            logged_at TEXT
-        )
-        """
-    )
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS member_events (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            username TEXT,
-            display_name TEXT,
-            event_type TEXT,
-            detail TEXT,
-            logged_at TEXT
-        )
-        """
-    )
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS flood_flags (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            username TEXT,
-            display_name TEXT,
-            message_count INTEGER,
-            window_seconds INTEGER,
-            message_excerpt TEXT,
-            logged_at TEXT
-        )
-        """
-    )
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS watchlist_keywords (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            term TEXT UNIQUE,
-            category TEXT DEFAULT 'custom',
-            severity TEXT DEFAULT 'medium',
-            enabled INTEGER DEFAULT 1,
-            added_at TEXT,
-            added_by TEXT
-        )
-        """
-    )
     conn.commit()
 
 
@@ -2987,9 +2569,13 @@ def since_clause(column: str, since: str | None):
     return f" WHERE {column} >= ?", (since,)
 
 
+def is_alcove_verified_user(user):
+    return bool(str((user or {}).get("verified_at") or "").strip())
+
+
 def get_verified_alcove_users():
     if synced_alcove_users:
-        return synced_alcove_users
+        return [user for user in synced_alcove_users if is_alcove_verified_user(user)]
 
     rows = fox_db_rows(
         """
@@ -3055,12 +2641,14 @@ def get_verified_alcove_users():
             }
         )
 
-    return users
+    return [user for user in users if is_alcove_verified_user(user)]
 
 
 def find_verified_alcove_user(user_id=None, username=None):
     username = (username or "").lstrip("@").lower()
     for user in get_verified_alcove_users():
+        if not is_alcove_verified_user(user):
+            continue
         if user_id is not None and int(user.get("user_id") or 0) == int(user_id):
             return user
         if username and (user.get("username") or "").lower() == username:
@@ -3551,718 +3139,6 @@ def build_alcove_analytics(period: str):
         "storiesActed": len([entry for entry in story_entries if not since or entry.get("time", "") >= since]),
         "audioSessions": len([entry for entry in asmr_entries if not since or entry.get("time", "") >= since]),
     }
-
-
-def group_activity_period(period: str) -> str:
-    allowed = {"today", "week", "all", "allTime"}
-    normalized = (period or "today").strip()
-    if normalized == "allTime":
-        normalized = "all"
-    if normalized not in allowed:
-        raise HTTPException(status_code=400, detail="period must be today, week, or all")
-    return normalized
-
-
-def group_activity_since(period: str) -> str | None:
-    normalized = group_activity_period(period)
-    if normalized == "all":
-        return None
-    return period_start(normalized)
-
-
-def format_group_user_ref(user_id, username="", display_name=""):
-    username = (username or "").strip()
-    display_name = (display_name or "").strip()
-    if username:
-        label = f"@{username.lstrip('@')}"
-    elif display_name:
-        label = display_name
-    else:
-        label = str(user_id or "unknown")
-    return {
-        "user_id": user_id,
-        "username": username.lstrip("@") if username else "",
-        "display_name": display_name,
-        "label": label,
-    }
-
-
-def group_activity_count_rows(rows, label_key="label", count_key="count"):
-    formatted = []
-    for row in rows:
-        if isinstance(row, dict):
-            user = format_group_user_ref(
-                row.get("user_id"),
-                row.get("username"),
-                row.get("display_name"),
-            )
-            formatted.append({**user, "count": row.get(count_key) or 0})
-            continue
-        user_id, username, display_name, count = row
-        formatted.append({**format_group_user_ref(user_id, username, display_name), "count": count})
-    return formatted
-
-
-def build_group_activity_summary(period: str):
-    since = group_activity_since(period)
-    message_where, message_params = since_clause("timestamp", since)
-    verified_where, verified_params = since_clause("verified_at", since)
-    link_where, link_params = since_clause("logged_at", since)
-    tone_where, tone_params = since_clause("logged_at", since)
-    action_where, action_params = since_clause("logged_at", since)
-    captcha_where, captcha_params = since_clause("attempt_time", since)
-
-    tone_alert_where = tone_where + (" AND" if tone_where else " WHERE") + " severity IN ('medium', 'high')"
-    failed_captcha_where = captcha_where + (" AND" if captcha_where else " WHERE") + " success = 0"
-
-    top_posters = fox_db_rows(
-        f"""
-        SELECT m.user_id, COALESCE(p.username, ''), COALESCE(p.display_name, ''), COUNT(*) AS count
-        FROM messages m
-        LEFT JOIN user_profiles p ON p.user_id = m.user_id
-        {message_where}{' AND' if message_where else ' WHERE'} m.user_id IS NOT NULL
-        GROUP BY m.user_id, p.username, p.display_name
-        ORDER BY count DESC
-        LIMIT 8
-        """,
-        message_params,
-    )
-    top_tone = fox_db_rows(
-        f"""
-        SELECT user_id, COALESCE(username, ''), COALESCE(display_name, ''), COUNT(*) AS count
-        FROM tone_flags
-        {tone_where}
-        GROUP BY user_id, username, display_name
-        ORDER BY count DESC
-        LIMIT 8
-        """,
-        tone_params,
-    )
-    top_links = fox_db_rows(
-        f"""
-        SELECT user_id, COALESCE(username, ''), COALESCE(display_name, ''), COUNT(*) AS count
-        FROM link_violations
-        {link_where}
-        GROUP BY user_id, username, display_name
-        ORDER BY count DESC
-        LIMIT 8
-        """,
-        link_params,
-    )
-    users_needing_attention = fox_db_rows(
-        """
-        SELECT s.user_id, COALESCE(p.username, ''), COALESCE(p.display_name, ''), COUNT(*) AS count
-        FROM user_strikes s
-        LEFT JOIN user_profiles p ON p.user_id = s.user_id
-        WHERE s.active = 1
-        GROUP BY s.user_id, p.username, p.display_name
-        HAVING count >= 2
-        ORDER BY count DESC
-        LIMIT 12
-        """
-    )
-    action_breakdown = fox_db_rows(
-        f"""
-        SELECT action_type, COUNT(*) AS count
-        FROM admin_actions
-        {action_where}
-        GROUP BY action_type
-        ORDER BY count DESC
-        """,
-        action_params,
-    )
-
-    return {
-        "period": group_activity_period(period),
-        "since": since,
-        "generated_at": now_iso(),
-        "source": "bot_sync" if synced_alcove_analytics else "fox_logs",
-        "db_available": os.path.exists(FOX_LOGS_DB_PATH),
-        "last_bot_sync_at": last_bot_sync_at,
-        "overview": {
-            "newResidents": fox_db_value(f"SELECT COUNT(*) FROM verified_users{verified_where}", verified_params),
-            "totalResidents": len(get_verified_alcove_users()),
-            "messages": fox_db_value(f"SELECT COUNT(*) FROM messages{message_where}", message_params),
-            "activeUsers": fox_db_value(
-                f"SELECT COUNT(DISTINCT user_id) FROM messages{message_where}"
-                + (" AND" if message_where else " WHERE")
-                + " user_id IS NOT NULL",
-                message_params,
-            ),
-            "linkAttempts": fox_db_value(f"SELECT COUNT(*) FROM link_violations{link_where}", link_params),
-            "toneFlags": fox_db_value(f"SELECT COUNT(*) FROM tone_flags{tone_where}", tone_params),
-            "toneAlerts": fox_db_value(tone_alert_where, tone_params),
-            "failedCaptcha": fox_db_value(failed_captcha_where, captcha_params),
-            "floodAlerts": fox_db_value(f"SELECT COUNT(*) FROM flood_flags{link_where}", link_params),
-            "memberEvents": fox_db_value(f"SELECT COUNT(*) FROM member_events{link_where}", link_params),
-            "warnings": fox_db_value(
-                f"SELECT COUNT(*) FROM admin_actions{action_where}"
-                + (" AND" if action_where else " WHERE")
-                + " action_type = 'warning'",
-                action_params,
-            ),
-            "mutes": fox_db_value(
-                f"SELECT COUNT(*) FROM admin_actions{action_where}"
-                + (" AND" if action_where else " WHERE")
-                + " action_type = 'mute'",
-                action_params,
-            ),
-            "strikesAdded": fox_db_value(
-                f"SELECT COUNT(*) FROM admin_actions{action_where}"
-                + (" AND" if action_where else " WHERE")
-                + " action_type = 'strike_add'",
-                action_params,
-            ),
-            "strikesRemoved": fox_db_value(
-                f"SELECT COUNT(*) FROM admin_actions{action_where}"
-                + (" AND" if action_where else " WHERE")
-                + " action_type = 'strike_remove'",
-                action_params,
-            ),
-            "bansApproved": fox_db_value(
-                f"SELECT COUNT(*) FROM admin_actions{action_where}"
-                + (" AND" if action_where else " WHERE")
-                + " action_type = 'ban_approved'",
-                action_params,
-            ),
-            "bansRejected": fox_db_value(
-                f"SELECT COUNT(*) FROM admin_actions{action_where}"
-                + (" AND" if action_where else " WHERE")
-                + " action_type = 'ban_rejected'",
-                action_params,
-            ),
-        },
-        "topPosters": group_activity_count_rows(top_posters),
-        "topToneFlags": group_activity_count_rows(top_tone),
-        "topLinkAttempts": group_activity_count_rows(top_links),
-        "usersNeedingAttention": group_activity_count_rows(users_needing_attention),
-        "actionBreakdown": [
-            {"action_type": row.get("action_type") or "unknown", "count": row.get("count") or 0}
-            for row in action_breakdown
-        ],
-    }
-
-
-def build_group_activity_users(period: str, sort: str = "risk", limit: int = 50):
-    since = group_activity_since(period)
-    limit = max(1, min(int(limit or 50), 200))
-    users = get_verified_alcove_users()
-
-    message_counts = {
-        row["user_id"]: row.get("count") or 0
-        for row in fox_db_rows(
-            f"""
-            SELECT user_id, COUNT(*) AS count
-            FROM messages
-            {since_clause("timestamp", since)[0]}
-            GROUP BY user_id
-            """,
-            since_clause("timestamp", since)[1],
-        )
-    }
-    link_counts = {
-        row["user_id"]: row.get("count") or 0
-        for row in fox_db_rows(
-            f"""
-            SELECT user_id, COUNT(*) AS count
-            FROM link_violations
-            {since_clause("logged_at", since)[0]}
-            GROUP BY user_id
-            """,
-            since_clause("logged_at", since)[1],
-        )
-    }
-    tone_counts = {
-        row["user_id"]: row.get("count") or 0
-        for row in fox_db_rows(
-            f"""
-            SELECT user_id, COUNT(*) AS count
-            FROM tone_flags
-            {since_clause("logged_at", since)[0]}
-            GROUP BY user_id
-            """,
-            since_clause("logged_at", since)[1],
-        )
-    }
-
-    enriched = []
-    for user in users:
-        user_id = user.get("user_id")
-        period_messages = message_counts.get(user_id, 0)
-        period_links = link_counts.get(user_id, 0)
-        period_tone = tone_counts.get(user_id, 0)
-        active_strikes = user.get("active_strikes") or 0
-        risk_score = (active_strikes * 5) + (period_links * 2) + period_tone
-        enriched.append(
-            {
-                **user,
-                "period_messages": period_messages,
-                "period_link_attempts": period_links,
-                "period_tone_flags": period_tone,
-                "risk_score": risk_score,
-                "needs_attention": active_strikes >= 2 or period_links >= 3 or period_tone >= 3,
-            }
-        )
-
-    sort_key = (sort or "risk").strip().lower()
-    sort_map = {
-        "risk": lambda item: (item["risk_score"], item["period_messages"]),
-        "messages": lambda item: item["period_messages"],
-        "links": lambda item: item["period_link_attempts"],
-        "tone": lambda item: item["period_tone_flags"],
-        "strikes": lambda item: item["active_strikes"],
-    }
-    enriched.sort(key=sort_map.get(sort_key, sort_map["risk"]), reverse=True)
-    return {
-        "period": group_activity_period(period),
-        "since": since,
-        "sort": sort_key,
-        "users": enriched[:limit],
-    }
-
-
-def build_group_activity_violations(violation_type: str, period: str, limit: int = 40):
-    since = group_activity_since(period)
-    limit = max(1, min(int(limit or 40), 200))
-    where, params = since_clause("logged_at", since)
-
-    if violation_type == "links":
-        rows = fox_db_rows(
-            f"""
-            SELECT id, message_id, user_id, username, display_name, message_excerpt, link_samples, logged_at
-            FROM link_violations
-            {where}
-            ORDER BY logged_at DESC
-            LIMIT ?
-            """,
-            params + (limit,),
-        )
-    elif violation_type == "tone":
-        rows = fox_db_rows(
-            f"""
-            SELECT id, message_id, user_id, username, display_name, categories, severity, score,
-                   matched_terms, message_excerpt, logged_at
-            FROM tone_flags
-            {where}
-            ORDER BY logged_at DESC
-            LIMIT ?
-            """,
-            params + (limit,),
-        )
-    else:
-        raise HTTPException(status_code=400, detail="type must be links or tone")
-
-    for row in rows:
-        user = format_group_user_ref(row.get("user_id"), row.get("username"), row.get("display_name"))
-        row.update(user)
-    return {
-        "period": group_activity_period(period),
-        "since": since,
-        "type": violation_type,
-        "items": rows,
-    }
-
-
-def build_group_activity_actions(period: str, limit: int = 40):
-    since = group_activity_since(period)
-    limit = max(1, min(int(limit or 40), 200))
-    where, params = since_clause("logged_at", since)
-    rows = fox_db_rows(
-        f"""
-        SELECT id, admin_user_id, target_user_id, action_type, delivery, template_id, reason, logged_at
-        FROM admin_actions
-        {where}
-        ORDER BY logged_at DESC
-        LIMIT ?
-        """,
-        params + (limit,),
-    )
-    return {
-        "period": group_activity_period(period),
-        "since": since,
-        "items": rows,
-    }
-
-
-def build_group_activity_user_detail(user_id: int):
-    profile_rows = fox_db_rows(
-        """
-        SELECT user_id, username, first_name, last_name, display_name, first_seen, last_seen, verified_at, source
-        FROM user_profiles
-        WHERE user_id = ?
-        LIMIT 1
-        """,
-        (user_id,),
-    )
-    profile = profile_rows[0] if profile_rows else {"user_id": user_id}
-    user = format_group_user_ref(
-        profile.get("user_id", user_id),
-        profile.get("username"),
-        profile.get("display_name"),
-    )
-
-    return {
-        **user,
-        "first_seen": profile.get("first_seen"),
-        "last_seen": profile.get("last_seen"),
-        "verified_at": profile.get("verified_at"),
-        "source": profile.get("source"),
-        "message_count": fox_db_value("SELECT COUNT(*) FROM messages WHERE user_id = ?", (user_id,)),
-        "link_attempts": fox_db_value("SELECT COUNT(*) FROM link_violations WHERE user_id = ?", (user_id,)),
-        "tone_flags": fox_db_value("SELECT COUNT(*) FROM tone_flags WHERE user_id = ?", (user_id,)),
-        "high_tone_flags": fox_db_value(
-            "SELECT COUNT(*) FROM tone_flags WHERE user_id = ? AND severity = 'high'",
-            (user_id,),
-        ),
-        "active_strikes": fox_db_value(
-            "SELECT COUNT(*) FROM user_strikes WHERE user_id = ? AND active = 1",
-            (user_id,),
-        ),
-        "total_strikes": fox_db_value("SELECT COUNT(*) FROM user_strikes WHERE user_id = ?", (user_id,)),
-        "recent_strikes": fox_db_rows(
-            """
-            SELECT active, reason, created_at, admin_user_id, removed_at, removed_by
-            FROM user_strikes
-            WHERE user_id = ?
-            ORDER BY created_at DESC
-            LIMIT 8
-            """,
-            (user_id,),
-        ),
-        "recent_tone_flags": fox_db_rows(
-            """
-            SELECT categories, severity, score, matched_terms, message_excerpt, logged_at
-            FROM tone_flags
-            WHERE user_id = ?
-            ORDER BY logged_at DESC
-            LIMIT 6
-            """,
-            (user_id,),
-        ),
-        "recent_link_attempts": fox_db_rows(
-            """
-            SELECT link_samples, message_excerpt, logged_at
-            FROM link_violations
-            WHERE user_id = ?
-            ORDER BY logged_at DESC
-            LIMIT 6
-            """,
-            (user_id,),
-        ),
-        "recent_admin_actions": fox_db_rows(
-            """
-            SELECT admin_user_id, action_type, delivery, reason, logged_at
-            FROM admin_actions
-            WHERE target_user_id = ?
-            ORDER BY logged_at DESC
-            LIMIT 8
-            """,
-            (user_id,),
-        ),
-    }
-
-
-def build_group_activity_sheets_feed(period: str):
-    summary = build_group_activity_summary(period)
-    users = build_group_activity_users(period, sort="risk", limit=500)
-    links = build_group_activity_violations("links", period, limit=2000)
-    tone = build_group_activity_violations("tone", period, limit=2000)
-    actions = build_group_activity_actions(period, limit=2000)
-    return {
-        "generated_at": now_iso(),
-        "period": summary.get("period"),
-        "since": summary.get("since"),
-        "source": summary.get("source"),
-        "db_available": summary.get("db_available"),
-        "last_bot_sync_at": summary.get("last_bot_sync_at"),
-        "overview": summary.get("overview") or {},
-        "top_posters": summary.get("topPosters") or [],
-        "top_tone_flags": summary.get("topToneFlags") or [],
-        "top_link_attempts": summary.get("topLinkAttempts") or [],
-        "users_needing_attention": summary.get("usersNeedingAttention") or [],
-        "action_breakdown": summary.get("actionBreakdown") or [],
-        "users": users.get("users") or [],
-        "link_alerts": links.get("items") or [],
-        "tone_flags": tone.get("items") or [],
-        "admin_actions": actions.get("items") or [],
-        "member_events": build_group_activity_member_events(period, limit=200).get("items") or [],
-        "flood_flags": build_group_activity_flood_flags(period, limit=200).get("items") or [],
-    }
-
-
-def _csv_from_rows(fieldnames: list[str], rows: list[dict]) -> str:
-    buffer = io.StringIO()
-    writer = csv.DictWriter(buffer, fieldnames=fieldnames, extrasaction="ignore")
-    writer.writeheader()
-    for row in rows:
-        writer.writerow({key: row.get(key, "") for key in fieldnames})
-    return buffer.getvalue()
-
-
-def build_group_activity_csv_files(period: str) -> dict[str, str]:
-    feed = build_group_activity_sheets_feed(period)
-    overview = feed.get("overview") or {}
-    overview_rows = [
-        {"metric": key, "value": value}
-        for key, value in overview.items()
-    ]
-    overview_rows.extend([
-        {"metric": "generated_at", "value": feed.get("generated_at")},
-        {"metric": "period", "value": feed.get("period")},
-        {"metric": "since", "value": feed.get("since")},
-        {"metric": "source", "value": feed.get("source")},
-        {"metric": "last_bot_sync_at", "value": feed.get("last_bot_sync_at")},
-    ])
-
-    user_rows = [
-        {
-            "user_id": row.get("user_id"),
-            "username": row.get("username"),
-            "display_name": row.get("display_name"),
-            "label": row.get("label"),
-            "period_messages": row.get("period_messages"),
-            "period_link_attempts": row.get("period_link_attempts"),
-            "period_tone_flags": row.get("period_tone_flags"),
-            "active_strikes": row.get("active_strikes"),
-            "message_count": row.get("message_count"),
-            "link_attempts": row.get("link_attempts"),
-            "tone_flags": row.get("tone_flags"),
-            "risk_score": row.get("risk_score"),
-            "needs_attention": row.get("needs_attention"),
-            "first_seen": row.get("first_seen"),
-            "last_seen": row.get("last_seen"),
-            "verified_at": row.get("verified_at"),
-        }
-        for row in feed.get("users") or []
-    ]
-
-    link_rows = [
-        {
-            "logged_at": row.get("logged_at"),
-            "user_id": row.get("user_id"),
-            "username": row.get("username"),
-            "display_name": row.get("display_name"),
-            "label": row.get("label"),
-            "link_samples": row.get("link_samples"),
-            "message_excerpt": row.get("message_excerpt"),
-            "message_id": row.get("message_id"),
-        }
-        for row in feed.get("link_alerts") or []
-    ]
-
-    tone_rows = [
-        {
-            "logged_at": row.get("logged_at"),
-            "user_id": row.get("user_id"),
-            "username": row.get("username"),
-            "display_name": row.get("display_name"),
-            "label": row.get("label"),
-            "severity": row.get("severity"),
-            "score": row.get("score"),
-            "categories": row.get("categories"),
-            "matched_terms": row.get("matched_terms"),
-            "message_excerpt": row.get("message_excerpt"),
-            "message_id": row.get("message_id"),
-        }
-        for row in feed.get("tone_flags") or []
-    ]
-
-    action_rows = [
-        {
-            "logged_at": row.get("logged_at"),
-            "action_type": row.get("action_type"),
-            "target_user_id": row.get("target_user_id"),
-            "admin_user_id": row.get("admin_user_id"),
-            "delivery": row.get("delivery"),
-            "reason": row.get("reason"),
-            "template_id": row.get("template_id"),
-        }
-        for row in feed.get("admin_actions") or []
-    ]
-
-    rank_rows = []
-    for section, rows in (
-        ("top_posters", feed.get("top_posters") or []),
-        ("top_tone_flags", feed.get("top_tone_flags") or []),
-        ("top_link_attempts", feed.get("top_link_attempts") or []),
-        ("users_needing_attention", feed.get("users_needing_attention") or []),
-    ):
-        for row in rows:
-            rank_rows.append(
-                {
-                    "section": section,
-                    "user_id": row.get("user_id"),
-                    "username": row.get("username"),
-                    "display_name": row.get("display_name"),
-                    "label": row.get("label"),
-                    "count": row.get("count"),
-                }
-            )
-
-    return {
-        "overview.csv": _csv_from_rows(["metric", "value"], overview_rows),
-        "users.csv": _csv_from_rows(
-            [
-                "user_id", "username", "display_name", "label", "risk_score", "needs_attention",
-                "period_messages", "period_link_attempts", "period_tone_flags", "active_strikes",
-                "message_count", "link_attempts", "tone_flags", "first_seen", "last_seen", "verified_at",
-            ],
-            user_rows,
-        ),
-        "link_alerts.csv": _csv_from_rows(
-            ["logged_at", "user_id", "username", "display_name", "label", "link_samples", "message_excerpt", "message_id"],
-            link_rows,
-        ),
-        "tone_flags.csv": _csv_from_rows(
-            [
-                "logged_at", "user_id", "username", "display_name", "label", "severity", "score",
-                "categories", "matched_terms", "message_excerpt", "message_id",
-            ],
-            tone_rows,
-        ),
-        "admin_actions.csv": _csv_from_rows(
-            ["logged_at", "action_type", "target_user_id", "admin_user_id", "delivery", "reason", "template_id"],
-            action_rows,
-        ),
-        "rankings.csv": _csv_from_rows(
-            ["section", "user_id", "username", "display_name", "label", "count"],
-            rank_rows,
-        ),
-    }
-
-
-def build_group_activity_csv(period: str, view: str = "users") -> str:
-    files = build_group_activity_csv_files(period)
-    view_map = {
-        "overview": "overview.csv",
-        "users": "users.csv",
-        "links": "link_alerts.csv",
-        "tone": "tone_flags.csv",
-        "actions": "admin_actions.csv",
-        "rankings": "rankings.csv",
-    }
-    filename = view_map.get((view or "users").strip().lower())
-    if not filename:
-        raise HTTPException(status_code=400, detail="view must be overview, users, links, tone, actions, rankings, or full")
-    return files[filename]
-
-
-def build_group_activity_export_zip(period: str) -> bytes:
-    files = build_group_activity_csv_files(period)
-    buffer = io.BytesIO()
-    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
-        for name, content in files.items():
-            archive.writestr(name, content)
-    return buffer.getvalue()
-
-
-def build_safety_action_queue(period: str = "today"):
-    since = group_activity_since(period)
-    summary = build_group_activity_summary(period)
-    overview = summary.get("overview") or {}
-    items = []
-
-    def add_item(kind, title, count, severity, hint=""):
-        if not count:
-            return
-        items.append(
-            {
-                "kind": kind,
-                "title": title,
-                "count": count,
-                "severity": severity,
-                "hint": hint,
-            }
-        )
-
-    add_item("flood", "Flood alerts", overview.get("floodAlerts", 0), "high", "Users posting too fast")
-    add_item("links", "Link violations", overview.get("linkAttempts", 0), "high", "Review link alerts tab")
-    add_item("tone", "Tone alerts", overview.get("toneAlerts", 0), "medium", "Review tone flags tab")
-    add_item("strikes", "Users at 2+ strikes", len(summary.get("usersNeedingAttention") or []), "high", "Review user profiles")
-    add_item("captcha", "Failed verifications", overview.get("failedCaptcha", 0), "medium", "Check join verification flow")
-
-    link_where, link_params = since_clause("logged_at", since)
-    recent_flood = fox_db_rows(
-        f"""
-        SELECT user_id, username, display_name, message_count, window_seconds, message_excerpt, logged_at
-        FROM flood_flags
-        {link_where}
-        ORDER BY logged_at DESC
-        LIMIT 5
-        """,
-        link_params,
-    )
-    member_where, member_params = since_clause("logged_at", since)
-    recent_joins = fox_db_rows(
-        f"""
-        SELECT user_id, username, display_name, event_type, detail, logged_at
-        FROM member_events
-        {member_where}
-        ORDER BY logged_at DESC
-        LIMIT 8
-        """,
-        member_params,
-    )
-
-    pending_pulse = len([
-        entry for entry in pulse_question_suggestions
-        if entry.get("status") == "pending_review"
-    ])
-    pending_spotlight = len([
-        entry for entry in spotlight_entries
-        if entry.get("status") == "pending_review"
-    ])
-    add_item("pulse", "Pulse questions awaiting review", pending_pulse, "medium", "Open Pulse admin tab")
-    add_item("spotlight", "Spotlights awaiting review", pending_spotlight, "medium", "Open Pulse admin tab")
-
-    items.sort(key=lambda row: {"high": 0, "medium": 1, "low": 2}.get(row["severity"], 3))
-    return {
-        "period": group_activity_period(period),
-        "since": since,
-        "generated_at": now_iso(),
-        "items": items,
-        "recent_flood": recent_flood,
-        "recent_member_events": recent_joins,
-        "settings": load_safety_settings(),
-    }
-
-
-def build_group_activity_member_events(period: str, limit: int = 60):
-    since = group_activity_since(period)
-    limit = max(1, min(int(limit or 60), 300))
-    where, params = since_clause("logged_at", since)
-    rows = fox_db_rows(
-        f"""
-        SELECT id, user_id, username, display_name, event_type, detail, logged_at
-        FROM member_events
-        {where}
-        ORDER BY logged_at DESC
-        LIMIT ?
-        """,
-        params + (limit,),
-    )
-    for row in rows:
-        row.update(format_group_user_ref(row.get("user_id"), row.get("username"), row.get("display_name")))
-    return {"period": group_activity_period(period), "since": since, "items": rows}
-
-
-def build_group_activity_flood_flags(period: str, limit: int = 60):
-    since = group_activity_since(period)
-    limit = max(1, min(int(limit or 60), 300))
-    where, params = since_clause("logged_at", since)
-    rows = fox_db_rows(
-        f"""
-        SELECT id, user_id, username, display_name, message_count, window_seconds, message_excerpt, logged_at
-        FROM flood_flags
-        {where}
-        ORDER BY logged_at DESC
-        LIMIT ?
-        """,
-        params + (limit,),
-    )
-    for row in rows:
-        row.update(format_group_user_ref(row.get("user_id"), row.get("username"), row.get("display_name")))
-    return {"period": group_activity_period(period), "since": since, "items": rows}
 
 
 def add_notification(kind: str, text: str, public: bool = True):
@@ -4828,12 +3704,7 @@ async def cards_startup_tasks():
 
 @app.get("/")
 def root():
-    return {
-        "status": "Alcove API running",
-        "lean_mode": LEAN_MODE,
-        "pulse_admin_notify_enabled": PULSE_ADMIN_NOTIFY_ENABLED,
-        "pulse_admin_telegram_suppressed": PULSE_ADMIN_TELEGRAM_SUPPRESSED,
-    }
+    return {"status": "Alcove API running"}
 
 
 def bot_sync_health() -> dict:
@@ -4953,7 +3824,7 @@ def bot_sync_alcove(payload: BotSyncPayload, x_bot_sync_secret: str | None = Hea
 
     verify_bot_sync_secret(x_bot_sync_secret)
 
-    incoming = payload.users or []
+    incoming = [user for user in (payload.users or []) if is_alcove_verified_user(user)]
     users_changed = bool(incoming) and incoming != synced_alcove_users
     analytics_changed = payload.analytics is not None and payload.analytics != synced_alcove_analytics
     if incoming:
@@ -5204,11 +4075,7 @@ def update_modules(payload: ModuleStateUpdate):
 
 @app.get("/api/feature-flags")
 def get_feature_flags():
-    return {
-        "status": "ok",
-        "features": load_feature_flags(),
-        "schema": feature_flag_schema_payload(),
-    }
+    return {"status": "ok", "features": load_feature_flags()}
 
 
 @app.post("/api/feature-flags")
@@ -5217,17 +4084,13 @@ def update_feature_flags(payload: FeatureFlagsUpdate, x_bot_sync_secret: str | N
     flags = load_feature_flags()
     incoming = payload.dict(exclude_none=True)
     for group, values in incoming.items():
-        if group == "admin_secret" or group not in flags or not isinstance(values, dict):
+        if group not in flags or not isinstance(values, dict):
             continue
         for key, value in values.items():
             if key in flags[group]:
                 flags[group][key] = bool(value)
     save_feature_flags(flags)
-    return {
-        "status": "ok",
-        "features": flags,
-        "schema": feature_flag_schema_payload(),
-    }
+    return {"status": "ok", "features": flags}
 
 
 @app.get("/api/pulse-settings")
@@ -5361,315 +4224,6 @@ def admin_pulse_archive_export(
     )
 
 
-@app.get("/api/admin/group-activity/summary")
-def admin_group_activity_summary(admin_secret: str, period: str = "today"):
-    verify_admin_secret(admin_secret)
-    return {"status": "ok", **build_group_activity_summary(period)}
-
-
-@app.get("/api/admin/group-activity/users")
-def admin_group_activity_users(
-    admin_secret: str,
-    period: str = "week",
-    sort: str = "risk",
-    limit: int = 50,
-):
-    verify_admin_secret(admin_secret)
-    return {"status": "ok", **build_group_activity_users(period, sort=sort, limit=limit)}
-
-
-@app.get("/api/admin/group-activity/violations")
-def admin_group_activity_violations(
-    admin_secret: str,
-    type: str = "links",
-    period: str = "week",
-    limit: int = 40,
-):
-    verify_admin_secret(admin_secret)
-    return {"status": "ok", **build_group_activity_violations(type, period, limit=limit)}
-
-
-@app.get("/api/admin/group-activity/actions")
-def admin_group_activity_actions(admin_secret: str, period: str = "week", limit: int = 40):
-    verify_admin_secret(admin_secret)
-    return {"status": "ok", **build_group_activity_actions(period, limit=limit)}
-
-
-@app.get("/api/admin/group-activity/user/{user_id}")
-def admin_group_activity_user_detail(user_id: int, admin_secret: str):
-    verify_admin_secret(admin_secret)
-    return {"status": "ok", "user": build_group_activity_user_detail(user_id)}
-
-
-@app.get("/api/admin/safety/action-queue")
-def admin_safety_action_queue(admin_secret: str, period: str = "today"):
-    verify_admin_secret(admin_secret)
-    return {"status": "ok", **build_safety_action_queue(period)}
-
-
-@app.get("/api/admin/safety/settings")
-def admin_safety_settings_get(admin_secret: str):
-    verify_admin_secret(admin_secret)
-    return {"status": "ok", "settings": load_safety_settings()}
-
-
-@app.post("/api/admin/safety/settings")
-def admin_safety_settings_save(payload: AdminSafetySettingsPayload):
-    verify_admin_secret(payload.admin_secret)
-    current = load_safety_settings()
-    if payload.flood_message_threshold is not None:
-        current["flood_message_threshold"] = payload.flood_message_threshold
-    if payload.flood_window_seconds is not None:
-        current["flood_window_seconds"] = payload.flood_window_seconds
-    if payload.daily_digest_enabled is not None:
-        current["daily_digest_enabled"] = payload.daily_digest_enabled
-    if payload.daily_digest_hour_utc is not None:
-        current["daily_digest_hour_utc"] = payload.daily_digest_hour_utc
-    if payload.keywords is not None:
-        current["keywords"] = payload.keywords
-    saved = save_safety_settings(current)
-    return {"status": "ok", "settings": saved}
-
-
-@app.get("/api/admin/safety/member-events")
-def admin_safety_member_events(admin_secret: str, period: str = "week", limit: int = 60):
-    verify_admin_secret(admin_secret)
-    return {"status": "ok", **build_group_activity_member_events(period, limit=limit)}
-
-
-@app.get("/api/admin/safety/flood-flags")
-def admin_safety_flood_flags(admin_secret: str, period: str = "week", limit: int = 60):
-    verify_admin_secret(admin_secret)
-    return {"status": "ok", **build_group_activity_flood_flags(period, limit=limit)}
-
-
-@app.get("/api/bot-sync/safety-settings")
-def bot_sync_safety_settings(x_bot_sync_secret: str | None = Header(default=None)):
-    verify_bot_sync_secret(x_bot_sync_secret)
-    return {"status": "ok", "settings": load_safety_settings()}
-
-
-@app.get("/api/admin/fox-messages")
-def admin_fox_messages(admin_secret: str):
-    verify_admin_secret(admin_secret)
-    state = fox_messages_store.load_fox_messages_state()
-    return {"status": "ok", **fox_messages_store.admin_payload(state)}
-
-
-@app.post("/api/admin/fox-messages/builtin")
-def admin_fox_messages_builtin(payload: AdminFoxBuiltinSettingsPayload):
-    verify_admin_secret(payload.admin_secret)
-    state = fox_messages_store.load_fox_messages_state()
-    builtin = state.setdefault("builtin_settings", {})
-    if isinstance(payload.self_care, dict):
-        current = builtin.setdefault("self_care", {})
-        if "enabled" in payload.self_care:
-            current["enabled"] = bool(payload.self_care["enabled"])
-        if payload.self_care.get("interval_min_hours") is not None:
-            current["interval_min_hours"] = max(1, min(int(payload.self_care["interval_min_hours"]), 168))
-        if payload.self_care.get("interval_max_hours") is not None:
-            current["interval_max_hours"] = max(1, min(int(payload.self_care["interval_max_hours"]), 168))
-        if payload.self_care.get("banner") is not None:
-            current["banner"] = str(payload.self_care["banner"]).strip()
-        if isinstance(payload.self_care.get("messages"), list):
-            messages = [str(line).strip() for line in payload.self_care["messages"] if str(line).strip()]
-            if messages:
-                current["messages"] = messages[:40]
-        if current.get("interval_min_hours", 8) > current.get("interval_max_hours", 12):
-            current["interval_max_hours"] = current["interval_min_hours"]
-        builtin["self_care"] = current
-    if isinstance(payload.templates, dict):
-        current_templates = fox_messages_store.normalize_templates(builtin.get("templates"))
-        for template_id, patch in payload.templates.items():
-            if isinstance(patch, dict):
-                current_templates = fox_messages_store.merge_template_update(current_templates, str(template_id), patch)
-        builtin["templates"] = current_templates
-    fox_messages_store.save_fox_messages_state(state)
-    return {"status": "ok", **fox_messages_store.admin_payload(state)}
-
-
-@app.post("/api/admin/fox-messages/scheduled")
-def admin_fox_messages_scheduled_create(payload: AdminFoxScheduledPostPayload):
-    verify_admin_secret(payload.admin_secret)
-    state = fox_messages_store.load_fox_messages_state()
-    post = fox_messages_store.upsert_scheduled_post(state, payload.model_dump(exclude={"admin_secret"}))
-    fox_messages_store.save_fox_messages_state(state)
-    return {"status": "ok", "post": post}
-
-
-@app.put("/api/admin/fox-messages/scheduled/{post_id}")
-def admin_fox_messages_scheduled_update(post_id: str, payload: AdminFoxScheduledPostPayload):
-    verify_admin_secret(payload.admin_secret)
-    state = fox_messages_store.load_fox_messages_state()
-    try:
-        post = fox_messages_store.upsert_scheduled_post(
-            state,
-            payload.model_dump(exclude={"admin_secret"}, exclude_none=True),
-            post_id=post_id,
-        )
-    except KeyError:
-        raise HTTPException(status_code=404, detail="Scheduled post not found")
-    fox_messages_store.save_fox_messages_state(state)
-    return {"status": "ok", "post": post}
-
-
-@app.delete("/api/admin/fox-messages/scheduled/{post_id}")
-def admin_fox_messages_scheduled_delete(post_id: str, admin_secret: str):
-    verify_admin_secret(admin_secret)
-    state = fox_messages_store.load_fox_messages_state()
-    if not fox_messages_store.delete_scheduled_post(state, post_id):
-        raise HTTPException(status_code=404, detail="Scheduled post not found")
-    fox_messages_store.save_fox_messages_state(state)
-    return {"status": "ok", "deleted": post_id}
-
-
-@app.post("/api/admin/fox-messages/scheduled/{post_id}/test")
-def admin_fox_messages_scheduled_test(post_id: str, admin_secret: str):
-    verify_admin_secret(admin_secret)
-    state = fox_messages_store.load_fox_messages_state()
-    post = fox_messages_store.queue_test_send(state, post_id)
-    if not post:
-        raise HTTPException(status_code=404, detail="Scheduled post not found")
-    fox_messages_store.save_fox_messages_state(state)
-    return {"status": "ok", "post": post, "message": "Queued — F.O.X will send on the next poll (about 60 seconds)."}
-
-
-@app.get("/api/bot-sync/fox-messages")
-def bot_sync_fox_messages(x_bot_sync_secret: str | None = Header(default=None)):
-    verify_bot_sync_secret(x_bot_sync_secret)
-    state = fox_messages_store.load_fox_messages_state()
-    due = fox_messages_store.posts_due_now(state)
-    return {
-        "status": "ok",
-        "builtin_settings": state.get("builtin_settings") or {},
-        "due_posts": due,
-        "uploaded_banners": fox_messages_store.banner_manifest(state),
-    }
-
-
-@app.post("/api/admin/fox-messages/banners/upload")
-async def admin_fox_banner_upload(
-    admin_secret: str = Form(...),
-    file: UploadFile = File(...),
-    label: str = Form(""),
-):
-    verify_admin_secret(admin_secret)
-    content = await file.read()
-    state = fox_messages_store.load_fox_messages_state()
-    try:
-        entry = fox_messages_store.save_banner_upload(
-            content,
-            file.filename or "banner.png",
-            label,
-            state,
-        )
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    fox_messages_store.save_fox_messages_state(state)
-    return {"status": "ok", "banner": entry, **fox_messages_store.admin_payload(state)}
-
-
-@app.get("/api/admin/fox-messages/banners/{filename}")
-def admin_fox_banner_file(filename: str, admin_secret: str):
-    verify_admin_secret(admin_secret)
-    try:
-        file_path = fox_messages_store.resolve_uploaded_banner_file(filename)
-    except (ValueError, FileNotFoundError):
-        raise HTTPException(status_code=404, detail="Banner not found")
-    media_type = "image/png"
-    lower = filename.lower()
-    if lower.endswith((".jpg", ".jpeg")):
-        media_type = "image/jpeg"
-    elif lower.endswith(".webp"):
-        media_type = "image/webp"
-    elif lower.endswith(".gif"):
-        media_type = "image/gif"
-    return FileResponse(file_path, media_type=media_type)
-
-
-@app.delete("/api/admin/fox-messages/banners/{banner_id}")
-def admin_fox_banner_delete(banner_id: str, admin_secret: str):
-    verify_admin_secret(admin_secret)
-    state = fox_messages_store.load_fox_messages_state()
-    if not fox_messages_store.delete_custom_banner(state, banner_id):
-        raise HTTPException(status_code=404, detail="Banner not found")
-    fox_messages_store.save_fox_messages_state(state)
-    return {"status": "ok", **fox_messages_store.admin_payload(state)}
-
-
-@app.get("/api/bot-sync/fox-banners/{filename}")
-def bot_sync_fox_banner_file(filename: str, x_bot_sync_secret: str | None = Header(default=None)):
-    verify_bot_sync_secret(x_bot_sync_secret)
-    try:
-        file_path = fox_messages_store.resolve_uploaded_banner_file(filename)
-    except (ValueError, FileNotFoundError):
-        raise HTTPException(status_code=404, detail="Banner not found")
-    return FileResponse(file_path)
-
-
-@app.post("/api/bot-sync/fox-messages/delivery")
-def bot_sync_fox_messages_delivery(
-    payload: FoxMessageDeliveryPayload,
-    x_bot_sync_secret: str | None = Header(default=None),
-):
-    verify_bot_sync_secret(x_bot_sync_secret)
-    state = fox_messages_store.load_fox_messages_state()
-    fox_messages_store.mark_post_sent(
-        state,
-        payload.post_id,
-        message_id=payload.message_id,
-        chat_id=payload.chat_id,
-        error=payload.error,
-    )
-    fox_messages_store.save_fox_messages_state(state)
-    return {"status": "ok"}
-
-
-@app.post("/api/bot-sync/fox-messages/audit")
-def bot_sync_fox_messages_audit(
-    payload: FoxAuditBatchPayload,
-    x_bot_sync_secret: str | None = Header(default=None),
-):
-    verify_bot_sync_secret(x_bot_sync_secret)
-    state = fox_messages_store.load_fox_messages_state()
-    added = fox_messages_store.append_audit_log(state, payload.entries or [])
-    if added:
-        fox_messages_store.save_fox_messages_state(state)
-    return {"status": "ok", "added": added, "audit_total": len(state.get("audit_log") or [])}
-
-
-@app.get("/api/admin/group-activity/sheets-feed")
-def admin_group_activity_sheets_feed(admin_secret: str, period: str = "week"):
-    verify_admin_secret(admin_secret)
-    return {"status": "ok", **build_group_activity_sheets_feed(period)}
-
-
-@app.get("/api/admin/group-activity/export")
-def admin_group_activity_export(
-    admin_secret: str,
-    period: str = "week",
-    view: str = "full",
-):
-    verify_admin_secret(admin_secret)
-    normalized_period = group_activity_period(period)
-    stamp = datetime.datetime.utcnow().strftime("%Y%m%d")
-    if (view or "full").strip().lower() == "full":
-        zip_bytes = build_group_activity_export_zip(normalized_period)
-        filename = f"alcove-group-activity-{normalized_period}-{stamp}.zip"
-        return Response(
-            content=zip_bytes,
-            media_type="application/zip",
-            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
-        )
-    csv_text = build_group_activity_csv(normalized_period, view=view)
-    filename = f"alcove-group-activity-{normalized_period}-{view.strip().lower()}-{stamp}.csv"
-    return Response(
-        content=csv_text,
-        media_type="text/csv; charset=utf-8",
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
-    )
-
-
 @app.get("/api/admin/review-queue")
 def admin_review_queue(admin_secret: str):
     verify_admin_secret(admin_secret)
@@ -5724,12 +4278,7 @@ def admin_pulse_question_action(suggestion_id: int, payload: AdminPulseQuestionA
     entry = find_pulse_question_suggestion(suggestion_id)
     if not entry:
         return {"status": "error", "message": "Pulse question suggestion not found."}
-    apply_admin_pulse_question_action(
-        entry,
-        payload.action,
-        payload.edited_question,
-        payload.rejection_reason,
-    )
+    apply_admin_pulse_question_action(entry, payload.action, payload.edited_question)
     save_runtime_state()
     return {"status": "ok", "entry": pulse_question_suggestion_admin_payload(entry)}
 
@@ -6494,6 +5043,200 @@ def list_reviews():
 
 
 # ---------------------------------
+# Pulse testing live session
+# ---------------------------------
+
+PULSE_TESTING_CLASSIC_REACTIONS = {"fire", "shock", "hot", "love", "wild"}
+PULSE_TESTING_PACK_REACTIONS = {
+    "biker": {"biker_moto", "biker_horns", "biker_skull", "biker_zap", "biker_wrench"},
+    "dancer": {"dancer_dance", "dancer_sparkle", "dancer_disco", "dancer_music", "dancer_crown"},
+    "daddy": {"daddy_whiskey", "daddy_shades", "daddy_brief", "daddy_flame", "daddy_smirk"},
+    "pup": {"pup_paw", "pup_ball", "pup_bone", "pup_dog", "pup_love"},
+}
+PULSE_TESTING_VALID_PACKS = {"biker", "dancer", "daddy", "pup"}
+
+
+def normalize_pulse_testing_pack(value: str | None) -> str:
+    pack = (value or "biker").strip().lower()
+    if pack not in PULSE_TESTING_VALID_PACKS:
+        pack = "biker"
+    return pack.capitalize()
+
+
+def pulse_testing_prefs_key(user_id: int | None, display_name: str | None) -> str:
+    if user_id:
+        return f"id:{int(user_id)}"
+    name = (display_name or "").strip().lower()
+    return f"name:{name}" if name else "anonymous"
+
+
+def default_pulse_testing_prefs(user_id: int | None = None, display_name: str | None = None, pack: str | None = None) -> dict:
+    return {
+        "user_id": user_id,
+        "display_name": (display_name or "Viewer").strip() or "Viewer",
+        "pack": normalize_pulse_testing_pack(pack),
+        "pack_unlocked": False,
+        "message_color": "cream",
+        "overlay": "none",
+        "emoji_set": "classic",
+        "updated_at": now_iso(),
+    }
+
+
+def lookup_user_verification_pack(user_id: int | None = None, username: str | None = None) -> str:
+    if user_id:
+        for entry in reversed(miniapp_verifications):
+            if int(entry.get("user_id") or 0) == int(user_id):
+                return normalize_pulse_testing_pack(entry.get("selected_pack"))
+    username_key = (username or "").strip().lower().lstrip("@")
+    if username_key:
+        for entry in reversed(miniapp_verifications):
+            entry_username = (entry.get("username") or "").strip().lower().lstrip("@")
+            if entry_username and entry_username == username_key:
+                return normalize_pulse_testing_pack(entry.get("selected_pack"))
+    return "Biker"
+
+
+def get_pulse_testing_prefs(user_id: int | None, display_name: str | None, pack: str | None = None) -> dict:
+    key = pulse_testing_prefs_key(user_id, display_name)
+    existing = pulse_testing_prefs.get(key)
+    if isinstance(existing, dict):
+        merged = default_pulse_testing_prefs(user_id, display_name, existing.get("pack") or pack)
+        merged.update(existing)
+        merged["pack"] = normalize_pulse_testing_pack(merged.get("pack") or pack)
+        return merged
+    resolved_pack = pack or lookup_user_verification_pack(user_id)
+    return default_pulse_testing_prefs(user_id, display_name, resolved_pack)
+
+
+def pulse_testing_feed_style(user_id: int | None, display_name: str | None) -> dict:
+    prefs = get_pulse_testing_prefs(user_id, display_name)
+    return {
+        "color": prefs.get("message_color") or "cream",
+        "overlay": prefs.get("overlay") or "none",
+        "pack": prefs.get("pack") or "Biker",
+        "pack_unlocked": bool(prefs.get("pack_unlocked")),
+    }
+
+
+def allowed_pulse_testing_reactions(user_id: int | None, display_name: str | None) -> set[str]:
+    prefs = get_pulse_testing_prefs(user_id, display_name)
+    if prefs.get("pack_unlocked") and (prefs.get("emoji_set") or "classic") == "pack":
+        pack_key = normalize_pulse_testing_pack(prefs.get("pack")).lower()
+        return set(PULSE_TESTING_PACK_REACTIONS.get(pack_key, set()))
+    return set(PULSE_TESTING_CLASSIC_REACTIONS)
+
+
+@app.get("/api/pulse-testing/config")
+def get_pulse_testing_config():
+    title = (pulse_testing_config.get("feedback_title") or "PULSE TESTING").strip() or "PULSE TESTING"
+    return {
+        "status": "ok",
+        "feedback_title": title,
+        "updated_at": pulse_testing_config.get("updated_at"),
+    }
+
+
+@app.post("/api/pulse-testing/config")
+def update_pulse_testing_config(payload: PulseTestingConfigUpdate):
+    title = clipped_text(payload.feedback_title, 80).strip() or "PULSE TESTING"
+    pulse_testing_config["feedback_title"] = title
+    pulse_testing_config["updated_at"] = now_iso()
+    save_runtime_state()
+    return {"status": "ok", "feedback_title": title, "updated_at": pulse_testing_config["updated_at"]}
+
+
+@app.get("/api/pulse-testing/feedback")
+def get_pulse_testing_feedback():
+    return {
+        "status": "ok",
+        "feedback_title": pulse_testing_config.get("feedback_title") or "PULSE TESTING",
+        "entries": list(reversed(pulse_testing_feedback[-500:])),
+    }
+
+
+@app.post("/api/pulse-testing/feedback")
+def submit_pulse_testing_feedback(payload: PulseTestingFeedbackPayload):
+    text = clipped_text(payload.text, 600).strip()
+    if not text:
+        return {"status": "error", "message": "Feedback cannot be empty."}
+    display_name = (payload.display_name or "Viewer").strip() or "Viewer"
+    entry = {
+        "id": (max([int(item.get("id") or 0) for item in pulse_testing_feedback] or [0]) + 1),
+        "user_id": payload.user_id,
+        "username": payload.username,
+        "display_name": display_name,
+        "text": text,
+        "feedback_for": pulse_testing_config.get("feedback_title") or "PULSE TESTING",
+        "time": now_iso(),
+    }
+    pulse_testing_feedback.append(entry)
+    pulse_testing_feedback[:] = pulse_testing_feedback[-2000:]
+    add_notification("pulse_testing", f"Feedback ({entry['feedback_for']}): {display_name}", False)
+    save_runtime_state()
+    return {"status": "ok", "entry": entry}
+
+
+@app.get("/api/pulse-testing/prefs")
+def read_pulse_testing_prefs(user_id: int | None = None, display_name: str | None = None):
+    prefs = get_pulse_testing_prefs(user_id, display_name)
+    return {"status": "ok", "prefs": prefs}
+
+
+@app.post("/api/pulse-testing/prefs")
+def save_pulse_testing_prefs(payload: PulseTestingPrefsPayload):
+    user = None
+    if payload.init_data:
+        try:
+            user = verify_telegram_init_data(payload.init_data)
+        except HTTPException:
+            user = None
+    user_id = payload.user_id or (int(user.get("id")) if user and user.get("id") else None)
+    display_name = (payload.display_name or (user or {}).get("first_name") or "Viewer").strip() or "Viewer"
+    username = payload.username or (user or {}).get("username")
+    key = pulse_testing_prefs_key(user_id, display_name)
+    prefs = get_pulse_testing_prefs(user_id, display_name)
+    if payload.pack:
+        prefs["pack"] = normalize_pulse_testing_pack(payload.pack)
+    if payload.pack_unlocked is not None:
+        prefs["pack_unlocked"] = bool(payload.pack_unlocked)
+    if payload.message_color:
+        prefs["message_color"] = clipped_text(payload.message_color, 40)
+    if payload.overlay is not None:
+        prefs["overlay"] = clipped_text(payload.overlay, 40) or "none"
+    if payload.emoji_set:
+        prefs["emoji_set"] = clipped_text(payload.emoji_set, 20) or "classic"
+    prefs["user_id"] = user_id
+    prefs["display_name"] = display_name
+    prefs["username"] = username
+    prefs["updated_at"] = now_iso()
+    pulse_testing_prefs[key] = prefs
+    save_runtime_state()
+    return {"status": "ok", "prefs": prefs}
+
+
+@app.get("/api/pulse-testing/user-pack")
+def get_pulse_testing_user_pack(user_id: int | None = None, username: str | None = None, init_data: str | None = None):
+    resolved_user_id = user_id
+    resolved_username = username
+    if init_data:
+        try:
+            user = verify_telegram_init_data(init_data)
+            resolved_user_id = int(user.get("id") or 0) or resolved_user_id
+            resolved_username = user.get("username") or resolved_username
+        except HTTPException:
+            pass
+    pack = lookup_user_verification_pack(resolved_user_id, resolved_username)
+    prefs = get_pulse_testing_prefs(resolved_user_id, None, pack)
+    return {
+        "status": "ok",
+        "pack": pack,
+        "pack_unlocked": bool(prefs.get("pack_unlocked")),
+        "prefs": prefs,
+    }
+
+
+# ---------------------------------
 # Stream comments moderation
 # ---------------------------------
 
@@ -6532,6 +5275,7 @@ def submit_stream_comment(comment: StreamComment):
             "text": text,
             "time": now_iso(),
             "approved": True,
+            "feed_style": pulse_testing_feed_style(comment.user_id, display_name),
         }
     )
     add_notification("comment", f"{display_name}: {text}", False)
@@ -6575,8 +5319,8 @@ def reject_comment(comment_id: int):
 @app.post("/api/wheel-reaction")
 def submit_wheel_reaction(payload: WheelReaction):
     global current_wheel_reaction, wheel_reaction_events
-    allowed = {"fire", "shock", "hot", "love", "wild"}
     reaction_key = (payload.reaction_key or "").strip().lower()
+    allowed = allowed_pulse_testing_reactions(payload.user_id, payload.display_name)
     if reaction_key not in allowed:
         return {"status": "error", "message": "Unknown reaction."}
 
@@ -6928,84 +5672,6 @@ def get_pulse_questions(user_id: int | None = None, username: str | None = None)
     }
 
 
-def pulse_question_submissions_for_user_today(user_id=None, username=None) -> list[dict]:
-    today = pulse_day_key()
-    username = (username or "").lower()
-    rows = []
-    for existing in pulse_question_suggestions:
-        if existing.get("day_key") != today:
-            continue
-        if (existing.get("status") or "").strip().lower() == "deleted":
-            continue
-        same_user = user_id and int(existing.get("user_id") or 0) == int(user_id)
-        same_username = username and (existing.get("username") or "").lower() == username
-        if same_user or same_username:
-            rows.append(existing)
-    return rows
-
-
-def pulse_has_pending_rejection_resubmit(user_id=None, username=None) -> bool:
-    return any(
-        (existing.get("status") or "").strip().lower() == "rejected"
-        and existing.get("resubmit_allowed")
-        for existing in pulse_question_submissions_for_user_today(user_id, username)
-    )
-
-
-def pulse_rejection_replacement_used_today(user_id=None, username=None) -> bool:
-    rows = pulse_question_submissions_for_user_today(user_id, username)
-    if any(existing.get("resubmitted_at") for existing in rows):
-        return True
-    return len(rows) > PULSE_DAILY_QUESTION_LIMIT
-
-
-def pulse_rejection_replacement_available(user_id=None, username=None) -> bool:
-    if pulse_rejection_replacement_used_today(user_id, username):
-        return False
-    return pulse_has_pending_rejection_resubmit(user_id, username)
-
-
-def pulse_close_other_rejection_resubmits(user_id=None, username=None, keep_entry_id=None) -> None:
-    changed = False
-    for existing in pulse_question_submissions_for_user_today(user_id, username):
-        if keep_entry_id is not None and existing.get("id") == keep_entry_id:
-            continue
-        if (existing.get("status") or "").strip().lower() != "rejected":
-            continue
-        if not existing.get("resubmit_allowed"):
-            continue
-        existing["resubmit_allowed"] = False
-        changed = True
-    if changed:
-        save_runtime_state()
-
-
-def pulse_max_submissions_allowed_today(user_id=None, username=None) -> int:
-    extra = (
-        PULSE_DAILY_REJECTION_REPLACEMENT_LIMIT
-        if pulse_rejection_replacement_available(user_id, username)
-        else 0
-    )
-    return PULSE_DAILY_QUESTION_LIMIT + extra
-
-
-def pulse_question_submissions_today_count(user_id=None, username=None) -> int:
-    return pulse_question_submissions_total_today(user_id, username)
-
-
-def pulse_question_submissions_total_today(user_id=None, username=None) -> int:
-    return len(pulse_question_submissions_for_user_today(user_id, username))
-
-
-def pulse_can_submit_another_question(user_id=None, username=None) -> bool:
-    if pulse_unlimited_question_submit():
-        return True
-    total = pulse_question_submissions_total_today(user_id, username)
-    if total < 1:
-        return False
-    return total < pulse_max_submissions_allowed_today(user_id, username)
-
-
 @app.post("/api/pulse-question-suggestions")
 def submit_pulse_question_suggestion(payload: PulseQuestionSuggestion):
     print(
@@ -7022,28 +5688,23 @@ def submit_pulse_question_suggestion(payload: PulseQuestionSuggestion):
     user_id = identity.get("user_id")
     username = (identity.get("username") or "").lower()
     if not pulse_unlimited_question_submit():
-        submissions_today = pulse_question_submissions_total_today(user_id, username)
-        max_allowed = pulse_max_submissions_allowed_today(user_id, username)
-        if submissions_today >= max_allowed:
-            print(
-                f"[{now_iso()}] pulse question submit rejected: daily limit reached "
-                f"user_id={user_id} username={username!r} count={submissions_today} max={max_allowed}",
-                flush=True,
-            )
-            return {
-                "status": "error",
-                "message": (
-                    "You've already submitted your two Pulse questions for today."
-                    if not pulse_rejection_replacement_available(user_id, username)
-                    else "You've already used today's one replacement attempt."
-                ),
-            }
-
-    using_replacement_slot = (
-        not pulse_unlimited_question_submit()
-        and pulse_rejection_replacement_available(user_id, username)
-        and pulse_question_submissions_total_today(user_id, username) >= PULSE_DAILY_QUESTION_LIMIT
-    )
+        for existing in pulse_question_suggestions:
+            if existing.get("day_key") != today:
+                continue
+            if existing.get("status") == "rejected":
+                continue
+            same_user = user_id and int(existing.get("user_id") or 0) == int(user_id)
+            same_username = username and (existing.get("username") or "").lower() == username
+            if same_user or same_username:
+                print(
+                    f"[{now_iso()}] pulse question submit rejected: already submitted today "
+                    f"user_id={user_id} username={username!r}",
+                    flush=True,
+                )
+                return {
+                    "status": "error",
+                    "message": "You already submitted a Pulse for tomorrow today.",
+                }
 
     pool = (payload.pool or "green").strip().lower()
     category = (payload.category or "").strip()
@@ -7081,11 +5742,9 @@ def submit_pulse_question_suggestion(payload: PulseQuestionSuggestion):
         "active_from_day_key": None,
     }
     pulse_question_suggestions.append(entry)
-    if using_replacement_slot:
-        pulse_close_other_rejection_resubmits(user_id, username)
     save_runtime_state()
     submitter = entry.get("display_name") or entry.get("username") or entry.get("user_id")
-    pulse_admin_notify(
+    telegram_admin_notify(
         "\n".join([
             "<b>New Pulse question submitted</b>",
             f"ID: <code>{entry['id']}</code>",
@@ -7105,19 +5764,9 @@ def submit_pulse_question_suggestion(payload: PulseQuestionSuggestion):
         f"user_id={identity.get('user_id')} username={identity.get('username')!r}",
         flush=True,
     )
-    submissions_today = pulse_question_submissions_today_count(user_id, username)
-    can_submit_another = pulse_can_submit_another_question(user_id, username)
-    if can_submit_another:
-        success_message = "Pulse sent for admin review. Submit another Pulse question below if you like."
-    else:
-        success_message = "Both of today's Pulse questions are with F.O.X for review."
     return {
         "status": "ok",
-        "message": success_message,
-        "submissions_today": submissions_today,
-        "submissions_total_today": pulse_question_submissions_total_today(user_id, username),
-        "can_submit_another": can_submit_another,
-        "daily_limit": PULSE_DAILY_QUESTION_LIMIT,
+        "message": "Pulse sent for admin review. If approved, it will join tomorrow's green Pulse roster.",
         "entry": entry,
     }
 
@@ -7131,52 +5780,31 @@ def pulse_question_suggestion_status(user_id: int | None = None, username: str |
     today = pulse_day_key()
     user_id = identity.get("user_id")
     username = (identity.get("username") or "").lower()
-    submissions_today = pulse_question_submissions_today_count(user_id, username)
-    submissions_total_today = pulse_question_submissions_total_today(user_id, username)
-    can_submit_another = pulse_can_submit_another_question(user_id, username)
-    if submissions_total_today <= 0:
+    for existing in pulse_question_suggestions:
+        if existing.get("day_key") != today:
+            continue
+        if existing.get("status") == "rejected":
+            continue
+        same_user = user_id and int(existing.get("user_id") or 0) == int(user_id)
+        same_username = username and (existing.get("username") or "").lower() == username
+        if not (same_user or same_username):
+            continue
         return {
             "status": "ok",
-            "submitted_today": False,
-            "submissions_today": 0,
-            "submissions_total_today": 0,
-            "can_submit_another": False,
-            "daily_limit": PULSE_DAILY_QUESTION_LIMIT,
-            "message": "Submit today's Pulse question to unlock the game.",
+            "submitted_today": True,
+            "review_status": existing.get("status"),
+            "message": (
+                "Your Pulse for tomorrow is already with F.O.X for review."
+                if existing.get("status") == "pending_review"
+                else "Your Pulse for tomorrow has already been approved."
+            ),
+            "entry": existing,
         }
-
-    latest_entry = None
-    for existing in pulse_question_submissions_for_user_today(user_id, username):
-        if (existing.get("status") or "").strip().lower() == "rejected":
-            continue
-        latest_entry = existing
-
-    if not can_submit_another:
-        if pulse_rejection_replacement_used_today(user_id, username):
-            message = "You've used today's one replacement attempt. New questions unlock at midnight UK time."
-        elif submissions_total_today >= PULSE_DAILY_QUESTION_LIMIT:
-            message = "Both of today's Pulse questions are already with F.O.X for review."
-        else:
-            message = "Both of today's Pulse questions are already with F.O.X for review."
-    elif pulse_rejection_replacement_available(user_id, username):
-        message = "Your Pulse was not approved. You have one replacement attempt today — choose your words carefully."
-    elif latest_entry and latest_entry.get("status") == "pending_review":
-        message = "Your Pulse is with F.O.X for review. You can submit one more today."
-    elif latest_entry and latest_entry.get("status") == "approved":
-        message = "Your Pulse has been approved. You can submit one more today."
-    else:
-        message = "You can submit one more Pulse question today."
 
     return {
         "status": "ok",
-        "submitted_today": True,
-        "submissions_today": submissions_today,
-        "submissions_total_today": submissions_total_today,
-        "can_submit_another": can_submit_another,
-        "daily_limit": PULSE_DAILY_QUESTION_LIMIT,
-        "review_status": latest_entry.get("status") if latest_entry else None,
-        "message": message,
-        "entry": latest_entry,
+        "submitted_today": False,
+        "message": "You can submit one Pulse for tomorrow today.",
     }
 
 
@@ -7307,7 +5935,7 @@ def submit_pulse(entry: PulseEntry):
     day = slots["day_key"]
     previous_cycles = pulse_red_unlocked_cycles(day)
     data = {
-        "id": next_pulse_entry_id(),
+        "id": len(pulse_entries) + 1,
         "day_key": pulse_day_key(),
         "pulse_type": pulse_type,
         "category": pulse_question_category(question, pulse_type),
@@ -7360,7 +5988,7 @@ def submit_pulse(entry: PulseEntry):
     maybe_queue_red_pulse_unlock_notifications(day, previous_cycles, new_cycles)
     save_runtime_state()
     if pulse_type != "red":
-        pulse_admin_notify(
+        telegram_admin_notify(
             "\n".join([
                 "<b>New Pulse answer</b>",
                 f"Question: <code>{escape(question)}</code>",
@@ -7403,7 +6031,7 @@ def respond_to_pulse_assignment(pulse_id: int, payload: PulseAssignmentResponse)
         f"username={payload.username!r}",
         flush=True,
     )
-    entry = find_pulse_entry(pulse_id, status="awaiting_response") or find_pulse_entry(pulse_id)
+    entry = next((item for item in pulse_entries if int(item.get("id") or 0) == int(pulse_id)), None)
     if not entry:
         print(f"[{now_iso()}] pulse answer rejected: pulse not found", flush=True)
         return {"status": "error", "message": "Pulse assignment not found."}
@@ -7508,7 +6136,7 @@ def bot_respond_to_pulse(
 ):
     verify_bot_sync_secret(x_bot_sync_secret)
     payload = payload or {}
-    entry = find_pulse_entry(pulse_id, status="awaiting_response") or find_pulse_entry(pulse_id)
+    entry = next((item for item in pulse_entries if int(item.get("id") or 0) == int(pulse_id)), None)
     if not entry:
         return {"status": "error", "message": "Pulse assignment not found."}
     if entry.get("status") != "awaiting_response":
@@ -7561,8 +6189,6 @@ def bot_respond_to_pulse(
 @app.get("/api/bot-sync/pulses/completed")
 def bot_completed_pulses(x_bot_sync_secret: str | None = Header(default=None)):
     verify_bot_sync_secret(x_bot_sync_secret)
-    if PULSE_ADMIN_TELEGRAM_SUPPRESSED:
-        return {"status": "ok", "entries": []}
     return {"status": "ok", "entries": pulse_completed_admin_entries()}
 
 
@@ -7617,8 +6243,6 @@ def bot_pulse_answers(
 @app.get("/api/bot-sync/pulse-questions/pending")
 def bot_pending_pulse_question_suggestions(x_bot_sync_secret: str | None = Header(default=None)):
     verify_bot_sync_secret(x_bot_sync_secret)
-    if PULSE_ADMIN_TELEGRAM_SUPPRESSED:
-        return {"status": "ok", "entries": []}
     entries = [
         pulse_question_suggestion_admin_payload(entry)
         for entry in pulse_question_suggestions
@@ -7780,15 +6404,6 @@ def bot_update_pulse_question_suggestion(suggestion_id: int, payload: dict | Non
     if not entry:
         return {"status": "error", "message": "Pulse question suggestion not found."}
     payload = payload or {}
-    if payload.get("reject"):
-        reason = (payload.get("rejection_reason") or "").strip()
-        if not reason:
-            return {"status": "error", "message": "Rejection reason is required."}
-        if payload.get("reviewed_by") is not None:
-            entry["reviewed_by"] = payload.get("reviewed_by")
-        apply_admin_pulse_question_action(entry, "reject", rejection_reason=reason)
-        save_runtime_state()
-        return {"status": "ok", "entry": entry}
     if "edited_question" in payload:
         entry["edited_question"] = (payload.get("edited_question") or "").strip() or None
     if "category" in payload:
@@ -7799,7 +6414,7 @@ def bot_update_pulse_question_suggestion(suggestion_id: int, payload: dict | Non
         entry["active_from_day_key"] = (payload.get("active_from_day_key") or "").strip() or None
     if "needs_admin_notify" in payload:
         entry["needs_admin_notify"] = bool(payload.get("needs_admin_notify"))
-    if "status" in payload and not payload.get("approve") and not payload.get("reject"):
+    if "status" in payload:
         entry["status"] = payload.get("status")
     if "review_message_sent" in payload:
         entry["review_message_sent"] = bool(payload.get("review_message_sent"))
@@ -7808,87 +6423,15 @@ def bot_update_pulse_question_suggestion(suggestion_id: int, payload: dict | Non
     if "reviewed_at" in payload:
         entry["reviewed_at"] = payload.get("reviewed_at")
     if payload.get("approve"):
-        schedule_mode = normalize_pulse_schedule_mode(payload.get("schedule_mode") or entry.get("schedule_mode"))
-        edited = (payload.get("edited_question") or entry.get("edited_question") or "").strip() or None
-        apply_admin_pulse_question_action(entry, schedule_mode, edited)
+        apply_pulse_suggestion_schedule(
+            entry,
+            payload.get("schedule_mode") or entry.get("schedule_mode"),
+            approve=True,
+        )
     elif entry.get("status") == "approved" and not entry.get("active_from_day_key"):
         apply_pulse_suggestion_schedule(entry, entry.get("schedule_mode"), approve=True)
-        queue_pulse_question_review_notification(entry, "question_approved")
     save_runtime_state()
     return {"status": "ok", "entry": entry}
-
-
-@app.get("/api/bot-sync/pulse-questions/review-notifications")
-def bot_pending_pulse_question_review_notifications(x_bot_sync_secret: str | None = Header(default=None)):
-    verify_bot_sync_secret(x_bot_sync_secret)
-    rows = [
-        {
-            "notification_id": item.get("notification_id"),
-            "kind": item.get("kind"),
-            "suggestion_id": item.get("suggestion_id"),
-            "recipient_user_id": item.get("recipient_user_id"),
-            "recipient_username": item.get("recipient_username"),
-            "recipient_display_name": item.get("recipient_display_name"),
-            "question": item.get("question"),
-            "schedule_mode": item.get("schedule_mode"),
-            "active_from_day_key": item.get("active_from_day_key"),
-            "availability_copy": item.get("availability_copy"),
-            "rejection_reason": item.get("rejection_reason"),
-            "created_at": item.get("created_at"),
-        }
-        for item in pulse_question_review_notifications
-        if not item.get("notified_at")
-    ]
-    return {"status": "ok", "notifications": rows}
-
-
-@app.post("/api/bot-sync/pulse-questions/review-notifications/{notification_id}")
-def bot_mark_pulse_question_review_notification_sent(
-    notification_id: str,
-    x_bot_sync_secret: str | None = Header(default=None),
-):
-    verify_bot_sync_secret(x_bot_sync_secret)
-    alert = next(
-        (item for item in pulse_question_review_notifications if item.get("notification_id") == notification_id),
-        None,
-    )
-    if not alert:
-        return {"status": "error", "message": "Pulse question review notification not found."}
-    alert["notified_at"] = now_iso()
-    save_runtime_state()
-    return {"status": "ok", "notification": alert}
-
-
-@app.get("/api/bot-sync/pulse-questions/resubmit-pending")
-def bot_pulse_question_resubmit_pending(
-    user_id: int | None = None,
-    username: str | None = None,
-    x_bot_sync_secret: str | None = Header(default=None),
-):
-    verify_bot_sync_secret(x_bot_sync_secret)
-    entry = find_resubmittable_rejected_pulse_question(user_id, username)
-    if not entry:
-        return {"status": "ok", "entry_id": None}
-    return {
-        "status": "ok",
-        "entry_id": entry.get("id"),
-        "question": pulse_suggestion_question(entry),
-        "rejection_reason": entry.get("rejection_reason"),
-    }
-
-
-@app.post("/api/bot-sync/pulse-questions/resubmit")
-def bot_pulse_question_resubmit(payload: dict | None = None, x_bot_sync_secret: str | None = Header(default=None)):
-    verify_bot_sync_secret(x_bot_sync_secret)
-    payload = payload or {}
-    result = resubmit_rejected_pulse_question(
-        payload.get("user_id"),
-        payload.get("username"),
-        payload.get("question") or "",
-    )
-    if result.get("status") != "ok":
-        return result
-    return result
 
 
 @app.post("/api/bot-sync/pulse-questions/roster/clear")
@@ -7922,24 +6465,10 @@ def bot_delete_pulse_question(roster_id: int, payload: dict | None = None, x_bot
     return {"status": "ok", "deleted": entry}
 
 
-@app.post("/api/bot-sync/pulses/completed/mark-all-posted")
-def mark_all_completed_pulses_posted(x_bot_sync_secret: str | None = Header(default=None)):
-    verify_bot_sync_secret(x_bot_sync_secret)
-    stamped = now_iso()
-    count = 0
-    for entry in pulse_entries:
-        if entry.get("status") == "completed" and not entry.get("admin_posted_at"):
-            entry["admin_posted_at"] = stamped
-            count += 1
-    if count:
-        save_runtime_state(force=True)
-    return {"status": "ok", "count": count}
-
-
 @app.post("/api/bot-sync/pulses/completed/{pulse_id}")
 def mark_completed_pulse_posted(pulse_id: int, x_bot_sync_secret: str | None = Header(default=None)):
     verify_bot_sync_secret(x_bot_sync_secret)
-    entry = find_pulse_entry(pulse_id, status="completed") or find_pulse_entry(pulse_id)
+    entry = next((item for item in pulse_entries if int(item.get("id") or 0) == int(pulse_id)), None)
     if not entry:
         return {"status": "error", "message": "Pulse not found."}
     entry["admin_posted_at"] = now_iso()
@@ -7961,8 +6490,6 @@ def bot_pulse_daily_summaries(x_bot_sync_secret: str | None = Header(default=Non
         for summary in pulse_daily_summary_payload(day_key):
             if not summary.get("admin_posted_at"):
                 summaries.append(summary)
-    if PULSE_ADMIN_TELEGRAM_SUPPRESSED:
-        return {"status": "ok", "summaries": []}
     return {"status": "ok", "summaries": summaries}
 
 
