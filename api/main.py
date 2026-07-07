@@ -3209,6 +3209,31 @@ def pulse_user_sent_entries(user_id, username=None, day_key: str | None = None):
     return rows
 
 
+def pulse_red_community_answers_payload(day_key: str | None = None, identity: dict | None = None):
+    day = day_key or pulse_day_key()
+    question = pulse_red_daily_question().strip()
+    rows = []
+    for entry in pulse_entries_for_day(day):
+        if (entry.get("pulse_type") or "").lower() != "red":
+            continue
+        if (entry.get("question") or "").strip() != question:
+            continue
+        answer = (entry.get("response_answer") or entry.get("answer") or entry.get("sender_note") or "").strip()
+        if not answer:
+            continue
+        owner = {
+            "user_id": entry.get("sender_user_id") or entry.get("responder_user_id"),
+            "username": entry.get("sender_username") or entry.get("responder_username"),
+        }
+        rows.append({
+            "answer": answer,
+            "received_at": entry.get("responded_at") or entry.get("sent_at"),
+            "is_mine": bool(identity and pulse_identities_match(identity, owner)),
+        })
+    rows.sort(key=lambda row: row.get("received_at") or "")
+    return rows
+
+
 def pulse_red_activations_for_user(user_id=None, username=None, day_key: str | None = None):
     day = day_key or pulse_day_key()
     uname = (username or "").lower().lstrip("@")
@@ -7219,6 +7244,7 @@ def get_pulse_status(user_id: int | None = None, username: str | None = None):
         "responded": responded,
         "sent": sent,
         "my_pulses": pulse_my_pulses_payload(identity),
+        "red_community_answers": pulse_red_community_answers_payload(slots["day_key"], identity),
         "pending_queue": len([entry for entry in pulse_entries_for_day() if entry.get("status") == "queued"]),
     }
 
