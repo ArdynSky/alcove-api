@@ -151,6 +151,10 @@ STATE_DB_PATH = os.getenv(
 )
 
 ROOM_MEDIA_DIR = os.path.join(_PERSISTENT_DATA_DIR, "room-media")
+LIVE_ROOM_STATE_PATH = os.getenv(
+    "ALCOVE_LIVE_ROOM_STATE_PATH",
+    os.path.join(_PERSISTENT_DATA_DIR, "live_room_state.json"),
+)
 ROOM_MEDIA_ALLOWED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".mp4", ".mov", ".webm", ".m4v"}
 ROOM_MEDIA_MAX_BYTES = 100 * 1024 * 1024
 ROOM_DISCUSSION_DURATIONS = {5, 10, 20, 30, 45, 60}
@@ -1110,6 +1114,80 @@ def load_runtime_state() -> None:
 
 
 load_runtime_state()
+
+
+def live_room_state_payload() -> dict:
+    return {
+        "room_discussion": state.get("room_discussion"),
+        "active_poll": active_poll,
+        "room_qa_items": room_qa_items,
+        "room_qa_archive": room_qa_archive,
+        "poll_history": poll_history,
+        "room_media_submissions": room_media_submissions,
+        "now_showing_media": now_showing_media,
+        "next_room_qa_id_seq": _next_room_qa_id_seq,
+        "next_poll_id_seq": _next_poll_id_seq,
+        "next_media_id_seq": _next_media_id_seq,
+    }
+
+
+def apply_live_room_payload(payload: dict) -> None:
+    global active_poll, room_qa_items, room_qa_archive, poll_history, room_media_submissions, now_showing_media
+    global _next_room_qa_id_seq, _next_poll_id_seq, _next_media_id_seq
+
+    if not isinstance(payload, dict):
+        return
+    discussion = payload.get("room_discussion")
+    if isinstance(discussion, dict):
+        state["room_discussion"] = discussion
+    if "active_poll" in payload:
+        active_poll = payload.get("active_poll")
+    if isinstance(payload.get("room_qa_items"), list):
+        room_qa_items = payload["room_qa_items"]
+    if isinstance(payload.get("room_qa_archive"), list):
+        room_qa_archive = payload["room_qa_archive"]
+    if isinstance(payload.get("poll_history"), list):
+        poll_history = payload["poll_history"]
+    if isinstance(payload.get("room_media_submissions"), list):
+        room_media_submissions = payload["room_media_submissions"]
+    if "now_showing_media" in payload:
+        now_showing_media = payload.get("now_showing_media")
+    if isinstance(payload.get("next_room_qa_id_seq"), int) and payload["next_room_qa_id_seq"] > 0:
+        _next_room_qa_id_seq = payload["next_room_qa_id_seq"]
+    if isinstance(payload.get("next_poll_id_seq"), int) and payload["next_poll_id_seq"] > 0:
+        _next_poll_id_seq = payload["next_poll_id_seq"]
+    if isinstance(payload.get("next_media_id_seq"), int) and payload["next_media_id_seq"] > 0:
+        _next_media_id_seq = payload["next_media_id_seq"]
+
+
+def save_live_room_state() -> None:
+    payload = live_room_state_payload()
+    directory = os.path.dirname(LIVE_ROOM_STATE_PATH)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    temp_path = f"{LIVE_ROOM_STATE_PATH}.tmp"
+    with open(temp_path, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, separators=(",", ":"), sort_keys=True)
+    os.replace(temp_path, LIVE_ROOM_STATE_PATH)
+
+
+def load_live_room_state() -> None:
+    if not os.path.exists(LIVE_ROOM_STATE_PATH):
+        return
+    try:
+        with open(LIVE_ROOM_STATE_PATH, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return
+    apply_live_room_payload(payload)
+
+
+def persist_live_room() -> None:
+    save_live_room_state()
+    ws_broadcast_bundle()
+
+
+load_live_room_state()
 prune_pulse_runtime_data(force=True)
 save_runtime_state(force=True)
 if lean_mode_enabled():
@@ -4701,6 +4779,7 @@ def reset_wheel_session_state() -> None:
     active_poll = None
     room_media_submissions.clear()
     now_showing_media = None
+    save_live_room_state()
 
 
 def find_entry(entry_id: int):
@@ -6887,12 +6966,12 @@ def start_room_discussion(payload: RoomDiscussionStart):
         "discussion_id": discussion_id,
         "title": title,
         "duration_minutes": duration,
-        "started_at": started.isoformat(),
-        "ends_at": ends.isoformat(),
+        "started_at": started.isoformat() + "Z",
+        "ends_at": ends.isoformat() + "Z",
         "status": "active",
     }
     add_notification("system", f"Discussion started: {title}", True)
-    ws_broadcast_bundle()
+    persist_live_room()
     return {"status": "ok", "room_discussion": state["room_discussion"]}
 
 
@@ -6909,7 +6988,7 @@ def end_room_discussion():
         "ended_at": now_iso(),
     }
     add_notification("system", "Discussion ended", True)
-    ws_broadcast_bundle()
+    persist_live_room()
     return {"status": "ok", "room_discussion": state["room_discussion"]}
 
 
@@ -6947,7 +7026,7 @@ def submit_room_qa(payload: RoomQASubmit):
     }
     room_qa_items.append(item)
     room_qa_items[:] = room_qa_items[-100:]
-    ws_broadcast_bundle()
+    persist_live_room()
     return {"status": "ok", "item": item}
 
 
@@ -6962,7 +7041,7 @@ def archive_room_qa(item_id: int):
             room_qa_archive.insert(0, archived)
             room_qa_archive[:] = room_qa_archive[:200]
             del room_qa_items[index]
-            ws_broadcast_bundle()
+            persist_live_room()
             return {"status": "ok", "item": archived}
     return {"status": "error", "message": "Question not found."}
 
@@ -6977,7 +7056,7 @@ def restore_room_qa(item_id: int):
             restored["restored_at"] = now_iso()
             room_qa_items.insert(0, restored)
             del room_qa_archive[index]
-            ws_broadcast_bundle()
+            persist_live_room()
             return {"status": "ok", "item": restored}
     return {"status": "error", "message": "Archived question not found."}
 
@@ -6991,7 +7070,7 @@ def answer_room_qa(item_id: int, payload: dict | None = None):
         if int(item.get("id") or 0) == int(item_id):
             item["answer"] = answer
             item["answered_at"] = now_iso()
-            ws_broadcast_bundle()
+            persist_live_room()
             return {"status": "ok", "item": item}
     return {"status": "error", "message": "Question not found."}
 
@@ -7020,7 +7099,7 @@ def create_room_poll(payload: RoomPollCreate):
         "status": "draft",
         "created_at": now_iso(),
     }
-    ws_broadcast_bundle()
+    persist_live_room()
     return {"status": "ok", "poll": active_poll}
 
 
@@ -7030,7 +7109,7 @@ def open_room_poll():
         return {"status": "error", "message": "No poll to open."}
     active_poll["status"] = "open"
     active_poll["opened_at"] = now_iso()
-    ws_broadcast_bundle()
+    persist_live_room()
     return {"status": "ok", "poll": active_poll}
 
 
@@ -7040,7 +7119,7 @@ def close_room_poll():
         return {"status": "error", "message": "No poll to close."}
     active_poll["status"] = "closed"
     active_poll["closed_at"] = now_iso()
-    ws_broadcast_bundle()
+    persist_live_room()
     return {"status": "ok", "poll": active_poll}
 
 
@@ -7050,14 +7129,14 @@ def reveal_room_poll():
         return {"status": "error", "message": "No poll to reveal."}
     active_poll["status"] = "revealed"
     active_poll["revealed_at"] = now_iso()
-    ws_broadcast_bundle()
+    persist_live_room()
     return {"status": "ok", "poll": active_poll}
 
 
 @app.post("/api/room-poll/archive")
 def archive_room_poll():
     archive_active_poll()
-    ws_broadcast_bundle()
+    persist_live_room()
     return {"status": "ok", "poll_history": poll_history[-20:]}
 
 
@@ -7083,7 +7162,7 @@ def vote_room_poll(payload: RoomPollVote):
             return {"status": "error", "message": "You already voted in this poll."}
     voters = votes.setdefault(option_id, [])
     voters.append(user_key)
-    ws_broadcast_bundle()
+    persist_live_room()
     return {"status": "ok", "poll": active_poll}
 
 
@@ -7143,18 +7222,20 @@ async def upload_room_media(
     room_media_submissions.append(item)
     room_media_submissions[:] = room_media_submissions[-50:]
     add_notification("system", f"Media upload from {item['display_name']}", False)
-    ws_broadcast_bundle()
+    persist_live_room()
     return {"status": "ok", "item": item}
 
 
 @app.post("/api/room-media/approve/{media_id}")
-def approve_room_media(media_id: int):
+def approve_room_media(media_id: int, payload: dict | None = None):
     item = find_room_media(media_id)
     if not item:
         return {"status": "error", "message": "Upload not found."}
+    if payload and "anonymous" in payload:
+        item["anonymous"] = bool(payload.get("anonymous"))
     item["status"] = "approved"
     item["approved_at"] = now_iso()
-    ws_broadcast_bundle()
+    persist_live_room()
     return {"status": "ok", "item": item}
 
 
@@ -7165,7 +7246,7 @@ def reject_room_media(media_id: int):
         return {"status": "error", "message": "Upload not found."}
     item["status"] = "rejected"
     item["rejected_at"] = now_iso()
-    ws_broadcast_bundle()
+    persist_live_room()
     return {"status": "ok", "item": item}
 
 
@@ -7188,7 +7269,7 @@ def show_room_media(media_id: int, payload: dict | None = None):
         "anonymous": anonymous,
         "shown_at": now_iso(),
     }
-    ws_broadcast_bundle()
+    persist_live_room()
     return {"status": "ok", "now_showing_media": now_showing_media}
 
 
@@ -7196,7 +7277,7 @@ def show_room_media(media_id: int, payload: dict | None = None):
 def clear_room_media():
     global now_showing_media
     now_showing_media = None
-    ws_broadcast_bundle()
+    persist_live_room()
     return {"status": "ok"}
 
 
