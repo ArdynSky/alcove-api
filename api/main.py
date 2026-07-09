@@ -291,9 +291,9 @@ poll_history = []
 active_poll = None
 room_media_submissions = []
 now_showing_media = None
-_next_room_qa_id = 1
-_next_poll_id = 1
-_next_media_id = 1
+_next_room_qa_id_seq = 1
+_next_poll_id_seq = 1
+_next_media_id_seq = 1
 
 notification_feed = []
 
@@ -364,7 +364,7 @@ def lean_mode_enabled() -> bool:
 
 
 def now_iso() -> str:
-    return datetime.datetime.utcnow().isoformat()
+    return datetime.datetime.utcnow().isoformat() + "Z"
 
 
 def runtime_state_payload() -> dict:
@@ -6814,23 +6814,23 @@ def submit_wheel_reaction(payload: WheelReaction):
 # ---------------------------------
 
 def _next_room_qa_id() -> int:
-    global _next_room_qa_id
-    value = _next_room_qa_id
-    _next_room_qa_id += 1
+    global _next_room_qa_id_seq
+    value = _next_room_qa_id_seq
+    _next_room_qa_id_seq += 1
     return value
 
 
 def _next_poll_id() -> int:
-    global _next_poll_id
-    value = _next_poll_id
-    _next_poll_id += 1
+    global _next_poll_id_seq
+    value = _next_poll_id_seq
+    _next_poll_id_seq += 1
     return value
 
 
 def _next_media_id() -> int:
-    global _next_media_id
-    value = _next_media_id
-    _next_media_id += 1
+    global _next_media_id_seq
+    value = _next_media_id_seq
+    _next_media_id_seq += 1
     return value
 
 
@@ -7099,6 +7099,7 @@ async def upload_room_media(
     user_id: int = Form(...),
     display_name: str = Form("Viewer"),
     text: str = Form(""),
+    anonymous: str = Form("0"),
     file: UploadFile = File(...),
 ):
     global room_media_submissions
@@ -7132,6 +7133,7 @@ async def upload_room_media(
         "discussion_title": meta.get("discussion_title") or "",
         "user_id": user_id,
         "display_name": (display_name or "Viewer").strip() or "Viewer",
+        "anonymous": str(anonymous).strip().lower() in {"1", "true", "yes", "on"},
         "caption": (text or "").strip()[:220],
         "filename": stored_name,
         "kind": kind,
@@ -7168,17 +7170,22 @@ def reject_room_media(media_id: int):
 
 
 @app.post("/api/room-media/show/{media_id}")
-def show_room_media(media_id: int):
+def show_room_media(media_id: int, payload: dict | None = None):
     global now_showing_media
     item = find_room_media(media_id)
     if not item or item.get("status") != "approved":
         return {"status": "error", "message": "Approved media not found."}
+    payload = payload or {}
+    anonymous = payload.get("anonymous") if "anonymous" in payload else item.get("anonymous", False)
+    anonymous = bool(anonymous)
+    display_name = "Anonymous" if anonymous else (item.get("display_name") or "Viewer")
     now_showing_media = {
         "id": item["id"],
         "url": f"/api/room-media/file/{item['id']}",
         "kind": item.get("kind") or "image",
         "caption": item.get("caption") or "",
-        "display_name": item.get("display_name") or "Viewer",
+        "display_name": display_name,
+        "anonymous": anonymous,
         "shown_at": now_iso(),
     }
     ws_broadcast_bundle()
