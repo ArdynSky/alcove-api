@@ -17,7 +17,7 @@ import io
 import json
 import random
 import sqlite3
-import urllib.request
+import uuid
 import zipfile
 from html import escape
 from fastapi import Header, HTTPException, WebSocket, WebSocketDisconnect, File, UploadFile, Form
@@ -150,7 +150,12 @@ STATE_DB_PATH = os.getenv(
     os.path.join(os.getcwd(), "alcove_state.db"),
 )
 
-for path in [DOWNLOADS_DIR, READY_DIR, ARCHIVE_DIR, PLAYOUT_DIR]:
+ROOM_MEDIA_DIR = os.path.join(_PERSISTENT_DATA_DIR, "room-media")
+ROOM_MEDIA_ALLOWED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".mp4", ".mov", ".webm", ".m4v"}
+ROOM_MEDIA_MAX_BYTES = 100 * 1024 * 1024
+ROOM_DISCUSSION_DURATIONS = {5, 10, 20, 30, 45, 60}
+
+for path in [DOWNLOADS_DIR, READY_DIR, ARCHIVE_DIR, PLAYOUT_DIR, ROOM_MEDIA_DIR]:
     os.makedirs(path, exist_ok=True)
 
 
@@ -280,6 +285,16 @@ wheel_user_engagement = {}
 pending_comments = []
 approved_comments = []
 
+room_qa_items = []
+room_qa_archive = []
+poll_history = []
+active_poll = None
+room_media_submissions = []
+now_showing_media = None
+_next_room_qa_id = 1
+_next_poll_id = 1
+_next_media_id = 1
+
 notification_feed = []
 
 wheel_submission_limits = {}
@@ -332,6 +347,14 @@ state = {
         "asmr": False,
         "story": False,
         "shoutouts": False,
+    },
+    "room_discussion": {
+        "discussion_id": None,
+        "title": "",
+        "duration_minutes": None,
+        "started_at": None,
+        "ends_at": None,
+        "status": "idle",
     },
 }
 
@@ -1108,6 +1131,12 @@ FEATURE_FLAG_REGISTRY = {
                 "path": "video-chat.html",
                 "default": True,
             },
+            "live_room": {
+                "label": "Live Room",
+                "description": "Show or hide the Live Room button on home.",
+                "path": "live-room.html",
+                "default": True,
+            },
             "archive": {
                 "label": "Archive",
                 "description": "Show or hide the Archive button on home.",
@@ -1268,6 +1297,28 @@ class WheelReaction(BaseModel):
     username: str | None = None
     display_name: str
     reaction_key: str
+
+
+class RoomDiscussionStart(BaseModel):
+    title: str
+    duration_minutes: int
+
+
+class RoomQASubmit(BaseModel):
+    user_id: int | None = None
+    username: str | None = None
+    display_name: str
+    question: str
+
+
+class RoomPollCreate(BaseModel):
+    question: str
+    options: list[str]
+
+
+class RoomPollVote(BaseModel):
+    user_id: int | None = None
+    option_id: str
 
 
 class ModuleStateUpdate(BaseModel):
@@ -4608,6 +4659,7 @@ def get_ready_unplayed_entries(round_number: int):
 
 def reset_wheel_session_state() -> None:
     global current_winner, current_now_playing, current_wheel_reaction, latest_review_overlay
+    global active_poll, room_media_submissions, now_showing_media, room_qa_items, room_qa_archive, poll_history
 
     wheel_entries.clear()
     archived_wheel_entries.clear()
@@ -4635,6 +4687,20 @@ def reset_wheel_session_state() -> None:
     state["review_prompt_open"] = False
     state["review_reveal_active"] = False
     state["review_score_reveal_active"] = False
+    state["room_discussion"] = {
+        "discussion_id": None,
+        "title": "",
+        "duration_minutes": None,
+        "started_at": None,
+        "ends_at": None,
+        "status": "idle",
+    }
+    room_qa_items.clear()
+    room_qa_archive.clear()
+    poll_history.clear()
+    active_poll = None
+    room_media_submissions.clear()
+    now_showing_media = None
 
 
 def find_entry(entry_id: int):
@@ -5149,6 +5215,20 @@ def get_app_state():
         "active_wheel_reaction": current_active_wheel_reaction(),
         "active_wheel_reactions": current_active_wheel_reactions(),
         "active_review_overlay": current_active_review_overlay(),
+        "room_discussion": state.get("room_discussion") or {
+            "discussion_id": None,
+            "title": "",
+            "duration_minutes": None,
+            "started_at": None,
+            "ends_at": None,
+            "status": "idle",
+        },
+        "active_poll": active_poll,
+        "room_qa_items": [item for item in room_qa_items if item.get("status") != "archived"],
+        "room_qa_archive": room_qa_archive,
+        "poll_history": poll_history[-20:],
+        "media_submissions": room_media_submissions,
+        "now_showing_media": now_showing_media,
     }
 
 
@@ -6727,6 +6807,412 @@ def submit_wheel_reaction(payload: WheelReaction):
     save_runtime_state()
     ws_broadcast_bundle()
     return {"status": "ok", "reaction": current_wheel_reaction}
+
+
+# ---------------------------------
+# Live Room — discussion, Q&A, polls, media
+# ---------------------------------
+
+def _next_room_qa_id() -> int:
+    global _next_room_qa_id
+    value = _next_room_qa_id
+    _next_room_qa_id += 1
+    return value
+
+
+def _next_poll_id() -> int:
+    global _next_poll_id
+    value = _next_poll_id
+    _next_poll_id += 1
+    return value
+
+
+def _next_media_id() -> int:
+    global _next_media_id
+    value = _next_media_id
+    _next_media_id += 1
+    return value
+
+
+def room_discussion_payload() -> dict:
+    return state.get("room_discussion") or {
+        "discussion_id": None,
+        "title": "",
+        "duration_minutes": None,
+        "started_at": None,
+        "ends_at": None,
+        "status": "idle",
+    }
+
+
+def current_discussion_id() -> str | None:
+    discussion = room_discussion_payload()
+    if discussion.get("status") != "active":
+        return None
+    return discussion.get("discussion_id")
+
+
+def discussion_meta() -> dict:
+    discussion = room_discussion_payload()
+    return {
+        "discussion_id": discussion.get("discussion_id"),
+        "discussion_title": discussion.get("title") or "",
+        "discussion_started_at": discussion.get("started_at"),
+    }
+
+
+def archive_active_poll() -> None:
+    global active_poll, poll_history
+    if not active_poll:
+        return
+    archived = dict(active_poll)
+    archived["archived_at"] = now_iso()
+    poll_history.append(archived)
+    poll_history[:] = poll_history[-200:]
+    active_poll = None
+
+
+@app.post("/api/room-discussion/start")
+def start_room_discussion(payload: RoomDiscussionStart):
+    title = (payload.title or "").strip()
+    if not title:
+        return {"status": "error", "message": "Discussion title is required."}
+    duration = int(payload.duration_minutes)
+    if duration not in ROOM_DISCUSSION_DURATIONS:
+        return {"status": "error", "message": "Duration must be 5, 10, 20, 30, 45, or 60 minutes."}
+    started = datetime.datetime.utcnow()
+    ends = started + datetime.timedelta(minutes=duration)
+    discussion_id = f"disc_{uuid.uuid4().hex[:12]}"
+    state["room_discussion"] = {
+        "discussion_id": discussion_id,
+        "title": title,
+        "duration_minutes": duration,
+        "started_at": started.isoformat(),
+        "ends_at": ends.isoformat(),
+        "status": "active",
+    }
+    add_notification("system", f"Discussion started: {title}", True)
+    ws_broadcast_bundle()
+    return {"status": "ok", "room_discussion": state["room_discussion"]}
+
+
+@app.post("/api/room-discussion/end")
+def end_room_discussion():
+    discussion = room_discussion_payload()
+    if discussion.get("status") != "active":
+        return {"status": "error", "message": "No active discussion to end."}
+    archive_active_poll()
+    state["room_discussion"] = {
+        **discussion,
+        "status": "ended",
+        "ends_at": now_iso(),
+        "ended_at": now_iso(),
+    }
+    add_notification("system", "Discussion ended", True)
+    ws_broadcast_bundle()
+    return {"status": "ok", "room_discussion": state["room_discussion"]}
+
+
+@app.get("/api/room-qa")
+def list_room_qa(archived: bool = False):
+    if archived:
+        return room_qa_archive
+    return [item for item in room_qa_items if item.get("status") != "archived"]
+
+
+@app.post("/api/room-qa")
+def submit_room_qa(payload: RoomQASubmit):
+    global room_qa_items
+    discussion_id = current_discussion_id()
+    if not discussion_id:
+        return {"status": "error", "message": "No active discussion right now."}
+    question = (payload.question or "").strip()
+    if not question:
+        return {"status": "error", "message": "Question cannot be empty."}
+    if len(question) > 300:
+        return {"status": "error", "message": "Question must be 300 characters or fewer."}
+    display_name = (payload.display_name or "Viewer").strip() or "Viewer"
+    meta = discussion_meta()
+    item = {
+        "id": _next_room_qa_id(),
+        "discussion_id": discussion_id,
+        "discussion_title": meta.get("discussion_title") or "",
+        "user_id": payload.user_id,
+        "username": payload.username,
+        "display_name": display_name,
+        "question": question,
+        "answer": None,
+        "status": "active",
+        "created_at": now_iso(),
+    }
+    room_qa_items.append(item)
+    room_qa_items[:] = room_qa_items[-100:]
+    ws_broadcast_bundle()
+    return {"status": "ok", "item": item}
+
+
+@app.post("/api/room-qa/{item_id}/archive")
+def archive_room_qa(item_id: int):
+    global room_qa_items, room_qa_archive
+    for index, item in enumerate(room_qa_items):
+        if int(item.get("id") or 0) == int(item_id):
+            archived = dict(item)
+            archived["status"] = "archived"
+            archived["archived_at"] = now_iso()
+            room_qa_archive.insert(0, archived)
+            room_qa_archive[:] = room_qa_archive[:200]
+            del room_qa_items[index]
+            ws_broadcast_bundle()
+            return {"status": "ok", "item": archived}
+    return {"status": "error", "message": "Question not found."}
+
+
+@app.post("/api/room-qa/{item_id}/restore")
+def restore_room_qa(item_id: int):
+    global room_qa_items, room_qa_archive
+    for index, item in enumerate(room_qa_archive):
+        if int(item.get("id") or 0) == int(item_id):
+            restored = dict(item)
+            restored["status"] = "active"
+            restored["restored_at"] = now_iso()
+            room_qa_items.insert(0, restored)
+            del room_qa_archive[index]
+            ws_broadcast_bundle()
+            return {"status": "ok", "item": restored}
+    return {"status": "error", "message": "Archived question not found."}
+
+
+@app.post("/api/room-qa/{item_id}/answer")
+def answer_room_qa(item_id: int, payload: dict | None = None):
+    answer = str((payload or {}).get("answer") or "").strip()
+    if not answer:
+        return {"status": "error", "message": "Answer cannot be empty."}
+    for item in room_qa_items:
+        if int(item.get("id") or 0) == int(item_id):
+            item["answer"] = answer
+            item["answered_at"] = now_iso()
+            ws_broadcast_bundle()
+            return {"status": "ok", "item": item}
+    return {"status": "error", "message": "Question not found."}
+
+
+@app.post("/api/room-poll/create")
+def create_room_poll(payload: RoomPollCreate):
+    global active_poll
+    discussion_id = current_discussion_id()
+    if not discussion_id:
+        return {"status": "error", "message": "Start a discussion before creating a poll."}
+    question = (payload.question or "").strip()
+    options = [str(opt).strip() for opt in (payload.options or []) if str(opt).strip()]
+    if not question:
+        return {"status": "error", "message": "Poll question is required."}
+    if len(options) < 2 or len(options) > 6:
+        return {"status": "error", "message": "Polls need between 2 and 6 options."}
+    meta = discussion_meta()
+    poll_id = str(_next_poll_id())
+    active_poll = {
+        "id": poll_id,
+        "discussion_id": discussion_id,
+        "discussion_title": meta.get("discussion_title") or "",
+        "question": question,
+        "options": [{"id": f"opt_{index + 1}", "text": text} for index, text in enumerate(options)],
+        "votes": {},
+        "status": "draft",
+        "created_at": now_iso(),
+    }
+    ws_broadcast_bundle()
+    return {"status": "ok", "poll": active_poll}
+
+
+@app.post("/api/room-poll/open")
+def open_room_poll():
+    if not active_poll:
+        return {"status": "error", "message": "No poll to open."}
+    active_poll["status"] = "open"
+    active_poll["opened_at"] = now_iso()
+    ws_broadcast_bundle()
+    return {"status": "ok", "poll": active_poll}
+
+
+@app.post("/api/room-poll/close")
+def close_room_poll():
+    if not active_poll:
+        return {"status": "error", "message": "No poll to close."}
+    active_poll["status"] = "closed"
+    active_poll["closed_at"] = now_iso()
+    ws_broadcast_bundle()
+    return {"status": "ok", "poll": active_poll}
+
+
+@app.post("/api/room-poll/reveal")
+def reveal_room_poll():
+    if not active_poll:
+        return {"status": "error", "message": "No poll to reveal."}
+    active_poll["status"] = "revealed"
+    active_poll["revealed_at"] = now_iso()
+    ws_broadcast_bundle()
+    return {"status": "ok", "poll": active_poll}
+
+
+@app.post("/api/room-poll/archive")
+def archive_room_poll():
+    archive_active_poll()
+    ws_broadcast_bundle()
+    return {"status": "ok", "poll_history": poll_history[-20:]}
+
+
+@app.get("/api/room-poll/history")
+def list_poll_history():
+    return poll_history[-50:]
+
+
+@app.post("/api/room-poll/vote")
+def vote_room_poll(payload: RoomPollVote):
+    if not active_poll or active_poll.get("status") != "open":
+        return {"status": "error", "message": "No open poll right now."}
+    option_id = (payload.option_id or "").strip()
+    valid_ids = {opt["id"] for opt in active_poll.get("options") or []}
+    if option_id not in valid_ids:
+        return {"status": "error", "message": "Invalid poll option."}
+    user_key = str(payload.user_id or "").strip()
+    if not user_key:
+        return {"status": "error", "message": "User identity required to vote."}
+    votes = active_poll.setdefault("votes", {})
+    for voted_option, voters in votes.items():
+        if user_key in [str(v) for v in voters]:
+            return {"status": "error", "message": "You already voted in this poll."}
+    voters = votes.setdefault(option_id, [])
+    voters.append(user_key)
+    ws_broadcast_bundle()
+    return {"status": "ok", "poll": active_poll}
+
+
+def find_room_media(media_id: int):
+    for item in room_media_submissions:
+        if int(item.get("id") or 0) == int(media_id):
+            return item
+    return None
+
+
+@app.post("/api/room-media/upload")
+async def upload_room_media(
+    user_id: int = Form(...),
+    display_name: str = Form("Viewer"),
+    text: str = Form(""),
+    file: UploadFile = File(...),
+):
+    global room_media_submissions
+    original_name = Path(file.filename or "upload.bin").name
+    ext = Path(original_name).suffix.lower()
+    if ext not in ROOM_MEDIA_ALLOWED_EXTENSIONS:
+        return {"status": "error", "message": "Unsupported file type. Use a picture or video."}
+    media_id = _next_media_id()
+    stored_name = f"{media_id}{ext}"
+    stored_path = os.path.join(ROOM_MEDIA_DIR, stored_name)
+    total = 0
+    try:
+        with open(stored_path, "wb") as out:
+            while True:
+                chunk = await file.read(1024 * 1024)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > ROOM_MEDIA_MAX_BYTES:
+                    out.close()
+                    os.remove(stored_path)
+                    return {"status": "error", "message": "File too large (max 100 MB)."}
+                out.write(chunk)
+    except OSError:
+        return {"status": "error", "message": "Could not save upload."}
+    kind = "video" if ext in {".mp4", ".mov", ".webm", ".m4v"} else "image"
+    meta = discussion_meta()
+    item = {
+        "id": media_id,
+        "discussion_id": meta.get("discussion_id"),
+        "discussion_title": meta.get("discussion_title") or "",
+        "user_id": user_id,
+        "display_name": (display_name or "Viewer").strip() or "Viewer",
+        "caption": (text or "").strip()[:220],
+        "filename": stored_name,
+        "kind": kind,
+        "status": "pending",
+        "created_at": now_iso(),
+    }
+    room_media_submissions.append(item)
+    room_media_submissions[:] = room_media_submissions[-50:]
+    add_notification("system", f"Media upload from {item['display_name']}", False)
+    ws_broadcast_bundle()
+    return {"status": "ok", "item": item}
+
+
+@app.post("/api/room-media/approve/{media_id}")
+def approve_room_media(media_id: int):
+    item = find_room_media(media_id)
+    if not item:
+        return {"status": "error", "message": "Upload not found."}
+    item["status"] = "approved"
+    item["approved_at"] = now_iso()
+    ws_broadcast_bundle()
+    return {"status": "ok", "item": item}
+
+
+@app.post("/api/room-media/reject/{media_id}")
+def reject_room_media(media_id: int):
+    item = find_room_media(media_id)
+    if not item:
+        return {"status": "error", "message": "Upload not found."}
+    item["status"] = "rejected"
+    item["rejected_at"] = now_iso()
+    ws_broadcast_bundle()
+    return {"status": "ok", "item": item}
+
+
+@app.post("/api/room-media/show/{media_id}")
+def show_room_media(media_id: int):
+    global now_showing_media
+    item = find_room_media(media_id)
+    if not item or item.get("status") != "approved":
+        return {"status": "error", "message": "Approved media not found."}
+    now_showing_media = {
+        "id": item["id"],
+        "url": f"/api/room-media/file/{item['id']}",
+        "kind": item.get("kind") or "image",
+        "caption": item.get("caption") or "",
+        "display_name": item.get("display_name") or "Viewer",
+        "shown_at": now_iso(),
+    }
+    ws_broadcast_bundle()
+    return {"status": "ok", "now_showing_media": now_showing_media}
+
+
+@app.post("/api/room-media/clear")
+def clear_room_media():
+    global now_showing_media
+    now_showing_media = None
+    ws_broadcast_bundle()
+    return {"status": "ok"}
+
+
+@app.get("/api/room-media/file/{media_id}")
+def get_room_media_file(media_id: int):
+    item = find_room_media(media_id)
+    if not item:
+        raise HTTPException(status_code=404, detail="File not found")
+    path = os.path.join(ROOM_MEDIA_DIR, item.get("filename") or "")
+    if not os.path.exists(path):
+        raise HTTPException(status_code=404, detail="File not found")
+    media_types = {
+        ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg",
+        ".png": "image/png",
+        ".webp": "image/webp",
+        ".mp4": "video/mp4",
+        ".mov": "video/quicktime",
+        ".webm": "video/webm",
+        ".m4v": "video/mp4",
+    }
+    ext = Path(path).suffix.lower()
+    return FileResponse(path, media_type=media_types.get(ext, "application/octet-stream"))
 
 
 # ---------------------------------
