@@ -105,14 +105,6 @@ ALCOVE_ADMIN_GROUP_ID = int(os.getenv("ALCOVE_ADMIN_GROUP_ID", "-1003971041191")
 PULSE_QUESTIONS_TOPIC_ID = int(os.getenv("PULSE_QUESTIONS_TOPIC_ID", "289") or "289")
 PULSE_REPORTS_TOPIC_ID = int(os.getenv("PULSE_REPORTS_TOPIC_ID", "365") or "365")
 SPOTLIGHT_REVIEW_TOPIC_ID = int(os.getenv("SPOTLIGHT_REVIEW_TOPIC_ID", "97") or "97")
-FEATURE_FLAGS_PATH = os.getenv(
-    "FEATURE_FLAGS_PATH",
-    os.path.join(os.getcwd(), "feature_flags.json"),
-)
-PULSE_SETTINGS_PATH = os.getenv(
-    "PULSE_SETTINGS_PATH",
-    os.path.join(os.getcwd(), "pulse_settings.json"),
-)
 SAFETY_SETTINGS_PATH = os.getenv(
     "SAFETY_SETTINGS_PATH",
     os.path.join(os.getcwd(), "safety_settings.json"),
@@ -120,6 +112,34 @@ SAFETY_SETTINGS_PATH = os.getenv(
 RUNTIME_STATE_PATH = os.getenv(
     "ALCOVE_RUNTIME_STATE_PATH",
     os.path.join(os.getcwd(), "alcove_runtime_state.json"),
+)
+
+
+def persistent_data_dir() -> str:
+    """Prefer the Render /var/data disk when sibling settings already use it."""
+    for path in (
+        os.getenv("ALCOVE_RUNTIME_STATE_PATH", ""),
+        os.getenv("ALCOVE_STATE_DB_PATH", ""),
+        os.getenv("FOX_LOGS_DB_PATH", ""),
+        os.getenv("SAFETY_SETTINGS_PATH", ""),
+        os.getenv("FOX_MESSAGES_PATH", ""),
+    ):
+        if path:
+            parent = os.path.dirname(path)
+            if parent:
+                return parent
+    return os.getcwd()
+
+
+_PERSISTENT_DATA_DIR = persistent_data_dir()
+
+FEATURE_FLAGS_PATH = os.getenv(
+    "FEATURE_FLAGS_PATH",
+    os.path.join(_PERSISTENT_DATA_DIR, "feature_flags.json"),
+)
+PULSE_SETTINGS_PATH = os.getenv(
+    "PULSE_SETTINGS_PATH",
+    os.path.join(_PERSISTENT_DATA_DIR, "pulse_settings.json"),
 )
 VERIFY_FLOW_LOG_PATH = os.getenv(
     "VERIFY_FLOW_LOG_PATH",

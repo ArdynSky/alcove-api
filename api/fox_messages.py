@@ -35,6 +35,57 @@ DEFAULT_ADMIN_WARN_TEMPLATES = {
     "6": "Please avoid using the group to arrange sex, chems, smoking, slamming, or similar activity. Keep it conversational and safe.",
 }
 
+DEFAULT_VERIFIED_WELCOME_MESSAGES = [
+    "{name}\n\nWelcome to The Alcove. Settle in, say hi, and share the sticker you received from me.",
+    "{name}\n\nThe door is open. Come in gently, say hello, and drop your welcome sticker when you are ready.",
+    "{name}\n\nWelcome in. The room is better with you here. Say hi and show us the sticker you picked.",
+    "{name}\n\nYou made it through. Welcome to The Alcove. Say hello, get comfortable, and share your sticker.",
+    "{name}\n\nF.O.X has opened the door. Welcome to The Alcove. Come say hi and let the room meet you.",
+    "{name}\n\nA new resident has arrived. Welcome to The Alcove. Say hi and share your sticker with us.",
+]
+
+FOX_VERIFICATION_DM_REFERENCE = [
+    {
+        "id": "verify_intro",
+        "title": "Verification intro (private DM)",
+        "step": "1 · Start",
+        "summary": "First DM after someone opens verification. Includes the “Let’s do it” button.",
+        "sample": (
+            "VERIFICATION REQUIRED - F.O.X_Security_v1.012\n\n"
+            "Hello, I am F.O.X - resident bot and your guide here at The Alcove. "
+            "Before I open its doors fully, I just need to run you through a quick check."
+        ),
+    },
+    {
+        "id": "verify_ethos",
+        "title": "Led by the heart (private DM)",
+        "step": "2 · After intro button",
+        "summary": "Ethos message plus hi sticker. Includes “Yes, I understand!” button.",
+        "sample": "The Alcove is not just about horny chatter… If that sounds like your kind of space, we’d love to get to know you.",
+    },
+    {
+        "id": "verify_captcha",
+        "title": "Captcha check (private DM)",
+        "step": "3 · After ethos confirm",
+        "summary": "CHECK 1 intro before the visual captcha buttons.",
+        "sample": "Perfect. We’re excited to get to know you… CHECK 1: Can you identify the real F.O.X among these imposters?",
+    },
+    {
+        "id": "verify_reward",
+        "title": "Welcome gift link (private DM)",
+        "step": "Late · After captcha",
+        "summary": "Reward sticker plus welcome gift / sticker-pack link. Includes “Got it” button.",
+        "sample": "Here you go — your little welcome gift:\n\n[welcome topic / sticker pack link]",
+    },
+    {
+        "id": "verify_resident",
+        "title": "Resident confirmation (private DM)",
+        "step": "Final · After gift",
+        "summary": "Tells them they are verified and to say hello in General Chat.",
+        "sample": "You are now officially a resident of The Alcove… Head back to the group and drop a message in General Chat…",
+    },
+]
+
 
 def default_template_settings() -> dict:
     return {
@@ -48,6 +99,7 @@ def default_template_settings() -> dict:
             "banner": "assets/fox_welcome.png",
             "headline": "Welcome our newest resident. 👋",
             "body": "{name}\n\nSay hi and please share your sticker you received from me.",
+            "messages": list(DEFAULT_VERIFIED_WELCOME_MESSAGES),
         },
         "join_verification": {
             "enabled": True,
@@ -101,8 +153,9 @@ FOX_TEMPLATE_EDITORS = [
         "fields": [
             {"key": "enabled", "type": "bool", "label": "Enabled"},
             {"key": "banner", "type": "banner", "label": "Banner image"},
-            {"key": "headline", "type": "text", "label": "Headline"},
-            {"key": "body", "type": "textarea", "label": "Body (after headline)"},
+            {"key": "headline", "type": "text", "label": "Headline (used when variants below are empty)"},
+            {"key": "body", "type": "textarea", "label": "Single body fallback (after headline)"},
+            {"key": "messages", "type": "lines", "label": "Welcome variants (one per line — F.O.X picks one at random; use {name})"},
         ],
     },
     {
@@ -292,6 +345,11 @@ def normalize_templates(raw: dict | None = None) -> dict:
                 entry["messages"] = [str(line).strip() for line in messages if str(line).strip()][:40]
             entry["banner"] = str(entry.get("banner") or default["banner"]).strip()
         elif template_id == "verified_welcome":
+            messages = entry.get("messages")
+            if not isinstance(messages, list) or not messages:
+                entry["messages"] = list(default.get("messages") or DEFAULT_VERIFIED_WELCOME_MESSAGES)
+            else:
+                entry["messages"] = [str(line).strip() for line in messages if str(line).strip()][:40]
             entry["headline"] = str(entry.get("headline") or default["headline"]).strip()
             entry["body"] = str(entry.get("body") or default["body"]).strip()
             entry["banner"] = str(entry.get("banner") or default["banner"]).strip()
@@ -740,6 +798,7 @@ def admin_payload(state: dict) -> dict:
     }
     return {
         "catalog": FOX_MESSAGE_CATALOG,
+        "verification_dm_reference": FOX_VERIFICATION_DM_REFERENCE,
         "banners": list_banner_paths(state),
         "custom_banners": state.get("custom_banners") or [],
         "template_editors": FOX_TEMPLATE_EDITORS,
