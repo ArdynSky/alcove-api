@@ -2586,13 +2586,13 @@ def upsert_miniapp_verification(user: dict) -> dict:
 
     existing = next(
         (
-            entry for entry in miniapp_verifications
-            if int(entry.get("user_id") or 0) == user_id and entry.get("status") in {"pending", "completed"}
+            entry for entry in reversed(miniapp_verifications)
+            if int(entry.get("user_id") or 0) == user_id
         ),
         None,
     )
     if existing:
-        if existing.get("status") in {"completed", "failed"}:
+        if existing.get("status") == "failed":
             existing["status"] = "pending"
             existing["requested_at"] = now
             existing["completed_at"] = None
