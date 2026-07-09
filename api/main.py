@@ -266,6 +266,7 @@ miniapp_verifications = []
 synced_alcove_users = []
 synced_alcove_analytics = {}
 last_bot_sync_at = None
+admin_jobs: dict = {}
 
 current_now_playing = None
 video_reviews = []
@@ -357,6 +358,7 @@ def runtime_state_payload() -> dict:
         "miniapp_verifications": miniapp_verifications,
         "synced_alcove_users": synced_alcove_users,
         "last_bot_sync_at": last_bot_sync_at,
+        "admin_jobs": admin_jobs,
     }
     if lean_mode_enabled():
         return payload
@@ -388,7 +390,7 @@ def apply_runtime_payload(payload: dict) -> None:
     global spotlight_entries, pulse_entries, pulse_receipts, pulse_red_activations, pulse_red_unlock_notifications
     global pulse_question_review_notifications, pulse_question_suggestions, pulse_daily_summary_posts, pulse_disabled_questions
     global miniapp_verifications, wheel_reaction_history, wheel_review_history, wheel_user_engagement
-    global synced_alcove_users, synced_alcove_analytics, last_bot_sync_at
+    global synced_alcove_users, synced_alcove_analytics, last_bot_sync_at, admin_jobs
 
     spotlight_entries = payload.get("spotlight_entries") if isinstance(payload.get("spotlight_entries"), list) else []
     pulse_entries = payload.get("pulse_entries") if isinstance(payload.get("pulse_entries"), list) else []
@@ -420,6 +422,12 @@ def apply_runtime_payload(payload: dict) -> None:
         synced_alcove_analytics = payload.get("synced_alcove_analytics") if isinstance(payload.get("synced_alcove_analytics"), dict) else {}
     synced_alcove_users = payload.get("synced_alcove_users") if isinstance(payload.get("synced_alcove_users"), list) else []
     last_bot_sync_at = payload.get("last_bot_sync_at") if isinstance(payload.get("last_bot_sync_at"), str) else None
+    admin_jobs = payload.get("admin_jobs") if isinstance(payload.get("admin_jobs"), dict) else {}
+
+
+def get_admin_job(name: str) -> dict:
+    job = admin_jobs.get(name)
+    return job if isinstance(job, dict) else {}
 
 
 def load_runtime_state_from_db() -> dict | None:
@@ -5811,6 +5819,63 @@ def admin_spotlight_action(entry_id: int, payload: AdminSpotlightAction):
         raise HTTPException(status_code=400, detail="Unknown Spotlight action.")
     save_runtime_state()
     return {"status": "ok", "entry": entry}
+
+
+@app.post("/api/admin/verify-all-group-members")
+def admin_queue_bulk_verify_group_members(admin_secret: str):
+    verify_admin_secret(admin_secret)
+    job = get_admin_job("bulk_verify_group")
+    if job.get("status") == "pending":
+        return {
+            "status": "ok",
+            "message": "Bulk verify is already queued. F.O.X will run it on the next sync cycle.",
+            "job": job,
+        }
+    admin_jobs["bulk_verify_group"] = {
+        "status": "pending",
+        "requested_at": now_iso(),
+        "source": "feature_admin",
+        "completed_at": None,
+        "result": None,
+    }
+    save_runtime_state()
+    return {
+        "status": "ok",
+        "message": "Queued. F.O.X will mark every current group member as verified on the next sync cycle (about 60 seconds).",
+        "job": admin_jobs["bulk_verify_group"],
+    }
+
+
+@app.get("/api/admin/verify-all-group-members")
+def admin_bulk_verify_group_members_status(admin_secret: str):
+    verify_admin_secret(admin_secret)
+    return {"status": "ok", "job": get_admin_job("bulk_verify_group")}
+
+
+@app.get("/api/bot-sync/admin-jobs")
+def bot_pending_admin_jobs(x_bot_sync_secret: str | None = Header(default=None)):
+    verify_bot_sync_secret(x_bot_sync_secret)
+    jobs = []
+    bulk_job = get_admin_job("bulk_verify_group")
+    if bulk_job.get("status") == "pending":
+        jobs.append({"job": "bulk_verify_group", **bulk_job})
+    return {"status": "ok", "jobs": jobs}
+
+
+@app.post("/api/bot-sync/admin-jobs/bulk-verify-group")
+def bot_complete_bulk_verify_group_job(payload: dict | None = None, x_bot_sync_secret: str | None = Header(default=None)):
+    verify_bot_sync_secret(x_bot_sync_secret)
+    payload = payload or {}
+    current = get_admin_job("bulk_verify_group")
+    admin_jobs["bulk_verify_group"] = {
+        **current,
+        "status": payload.get("status") or "completed",
+        "completed_at": now_iso(),
+        "result": payload.get("result") if isinstance(payload.get("result"), dict) else {},
+        "error": payload.get("error"),
+    }
+    save_runtime_state()
+    return {"status": "ok", "job": admin_jobs["bulk_verify_group"]}
 
 
 @app.get("/api/debug/domains")
