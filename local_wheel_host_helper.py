@@ -391,6 +391,32 @@ def clip_fields(start_seconds: float | None, end_seconds: float | None) -> dict:
     }
 
 
+def build_viewer_url_with_clip(submitted_url: str, clip_start_seconds: float | int | None = None) -> str:
+    source = str(submitted_url or "").strip()
+    if not source:
+        return source
+    try:
+        seconds = float(clip_start_seconds) if clip_start_seconds is not None and str(clip_start_seconds) != "" else None
+    except Exception:
+        seconds = None
+    if seconds is None or seconds <= 0:
+        return source
+    try:
+        parsed = urlparse(source)
+        host = (parsed.netloc or "").lower()
+        whole_seconds = int(seconds)
+        if "youtube.com" in host or "youtu.be" in host:
+            query = parse_qs(parsed.query, keep_blank_values=True)
+            query["t"] = [f"{whole_seconds}s"]
+            return urlunparse(parsed._replace(query=urlencode(query, doseq=True), fragment=""))
+        query = parse_qs(parsed.query, keep_blank_values=True)
+        query["t"] = [str(whole_seconds)]
+        return urlunparse(parsed._replace(query=urlencode(query, doseq=True), fragment=""))
+    except Exception:
+        separator = "&" if "?" in source else "?"
+        return f"{source}{separator}t={int(seconds)}"
+
+
 def download_low_res_video(url: str, entry_id: int) -> tuple[Path, str | None]:
     DOWNLOADS_DIR.mkdir(parents=True, exist_ok=True)
     template = str(DOWNLOADS_DIR / f"alcove_{entry_id}_%(title).80s.%(ext)s")
@@ -1628,6 +1654,22 @@ class HelperHandler(BaseHTTPRequestHandler):
             except Exception as exc:
                 return json_response(self, 200, {"status": "error", "message": str(exc)})
             return json_response(self, 200, {"status": "ok", "active": True, "intro": CURRENT_VIDEO_INTRO_STATE})
+
+        if self.path == "/api/viewer/open":
+            submitted_url = str(payload.get("submitted_url") or payload.get("url") or "").strip()
+            if not submitted_url:
+                return json_response(self, 200, {"status": "error", "message": "No submitted URL was supplied."})
+            viewer_url = build_viewer_url_with_clip(submitted_url, payload.get("clip_start_seconds"))
+            try:
+                result = start_auth_browser(viewer_url)
+            except Exception as exc:
+                return json_response(self, 200, {"status": "error", "message": str(exc)})
+            return json_response(self, 200, {
+                "status": "ok",
+                "viewer_url": viewer_url,
+                "submitted_url": submitted_url,
+                **result,
+            })
 
         if self.path == "/api/downloads/manual-ready-latest":
             entry_id = int(payload.get("entry_id") or 0)
