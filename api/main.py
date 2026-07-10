@@ -6722,6 +6722,13 @@ def submit_review(review: VideoReview):
 
 @app.post("/api/review/open")
 def open_review_prompt():
+    global current_now_playing
+    if current_now_playing is None and current_winner:
+        entry_id = current_winner.get("entry_id")
+        if entry_id:
+            entry = find_entry(entry_id)
+            if entry:
+                current_now_playing = entry
     state["review_prompt_open"] = True
     state["round_status"] = "reviewing"
     state["review_score_reveal_active"] = False
