@@ -4710,8 +4710,18 @@ def review_average_rating() -> float:
         return 0.0
     return round(sum(ratings) / len(ratings), 2)
 
+def get_wheel_spin_pool(round_number: int):
+    return [
+        entry
+        for entry in wheel_entries
+        if entry.get("round_id") == round_number
+        and entry_is_approved(entry)
+        and not entry.get("played", False)
+    ]
+
+
 def get_next_spin_pool(round_number: int):
-    return get_ready_unplayed_entries(round_number)
+    return get_wheel_spin_pool(round_number)
 
 
 def entry_is_download_ready(entry: dict) -> bool:
@@ -4727,11 +4737,8 @@ def clear_processed_candidates(entry: dict) -> None:
 def get_ready_unplayed_entries(round_number: int):
     return [
         entry
-        for entry in wheel_entries
-        if entry.get("round_id") == round_number
-        and entry_is_approved(entry)
-        and not entry.get("played", False)
-        and entry_is_download_ready(entry)
+        for entry in get_wheel_spin_pool(round_number)
+        if entry_is_download_ready(entry)
     ]
 
 
@@ -5373,6 +5380,7 @@ def start_spin():
         "video_title": chosen["data"].get("video_title"),
         "local_filename": chosen.get("local_filename"),
         "local_path": chosen.get("local_path"),
+        "submitted_url": chosen.get("submitted_url") or chosen.get("data", {}).get("link"),
         "clip_start_seconds": chosen.get("clip_start_seconds"),
         "clip_end_seconds": chosen.get("clip_end_seconds"),
         "time": now_iso(),
@@ -6562,8 +6570,8 @@ def set_spin_result(payload: dict):
     if not entry:
         return {"status": "error", "message": "winner entry not found"}
 
-    if not entry_is_download_ready(entry):
-        return {"status": "error", "message": "winner is not download-ready"}
+    if not entry_is_approved(entry):
+        return {"status": "error", "message": "winner entry is not approved"}
 
     state["winner_intro_loaded"] = False
     current_winner = {
@@ -6572,6 +6580,7 @@ def set_spin_result(payload: dict):
         "video_title": entry["data"].get("video_title"),
         "local_filename": entry.get("local_filename"),
         "local_path": entry.get("local_path"),
+        "submitted_url": entry.get("submitted_url") or entry.get("data", {}).get("link"),
         "clip_start_seconds": entry.get("clip_start_seconds"),
         "clip_end_seconds": entry.get("clip_end_seconds"),
         "time": now_iso(),
@@ -7375,7 +7384,7 @@ def archive_wheel_entry(entry_id: int):
                 current_winner = None
 
             del wheel_entries[i]
-            state["round_status"] = "locked" if get_ready_unplayed_entries(state["current_round"]) else "closed"
+            state["round_status"] = "locked" if get_wheel_spin_pool(state["current_round"]) else "closed"
             ws_broadcast_bundle()
             return {"status": "ok"}
 
