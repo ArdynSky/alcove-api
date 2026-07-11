@@ -76,7 +76,10 @@ ALLOWED_ORIGINS = {
     "null",
     "http://127.0.0.1:5500",
     "http://localhost:5500",
+    "http://127.0.0.1:8765",
+    "http://localhost:8765",
     "https://thealcove.netlify.app",
+    "https://euphonious-banoffee-1c8215.netlify.app",
     "https://ardyn-alcove.com",
     "https://www.ardyn-alcove.com",
 }
