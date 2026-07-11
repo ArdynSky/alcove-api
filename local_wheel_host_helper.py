@@ -17,8 +17,44 @@ from datetime import datetime
 from urllib.error import HTTPError
 from urllib.parse import parse_qs, quote, urljoin, urlencode, urlparse, urlunparse
 from urllib.request import Request, urlopen
-from yt_dlp import YoutubeDL
-from yt_dlp.networking.impersonate import ImpersonateTarget
+
+_YTDLP = None
+_YTDLP_ERROR = None
+
+
+def ytdlp_available() -> bool:
+    try:
+        _ensure_ytdlp()
+        return True
+    except RuntimeError:
+        return False
+
+
+def _ensure_ytdlp():
+    global _YTDLP, _YTDLP_ERROR
+    if _YTDLP is not None:
+        return _YTDLP
+    if _YTDLP_ERROR is not None:
+        raise RuntimeError(_YTDLP_ERROR)
+    try:
+        from yt_dlp import YoutubeDL
+        from yt_dlp.networking.impersonate import ImpersonateTarget
+    except ImportError as exc:
+        _YTDLP_ERROR = (
+            "yt-dlp is not installed. Run: pip install yt-dlp "
+            "(needed for downloads/stream resolve; viewer open and video intro work without it)."
+        )
+        raise RuntimeError(_YTDLP_ERROR) from exc
+    _YTDLP = {"YoutubeDL": YoutubeDL, "ImpersonateTarget": ImpersonateTarget}
+    return _YTDLP
+
+
+def get_youtube_dl():
+    return _ensure_ytdlp()["YoutubeDL"]
+
+
+def get_impersonate_target():
+    return _ensure_ytdlp()["ImpersonateTarget"]
 
 
 HOST = "127.0.0.1"
@@ -438,7 +474,7 @@ def download_low_res_video(url: str, entry_id: int) -> tuple[Path, str | None]:
         "progress_with_newline": False,
         **impersonate_options(os.getenv("ALCOVE_YTDLP_IMPERSONATE") or YTDLP_IMPERSONATE_TARGETS[0]),
     }
-    with YoutubeDL(options) as ydl:
+    with get_youtube_dl()(options) as ydl:
         info = ydl.extract_info(url, download=True)
     title = str(info.get("title") or "").strip() or None
     prefix = f"alcove_{entry_id}_"
@@ -466,7 +502,7 @@ def fetch_video_title(url: str | None) -> str | None:
         "logger": QuietYDLLogger(),
         "verbose": False,
     }
-    with YoutubeDL(options) as ydl:
+    with get_youtube_dl()(options) as ydl:
         info = ydl.extract_info(source, download=False)
     title = str(info.get("title") or "").strip()
     return title or None
@@ -493,7 +529,7 @@ def impersonate_options(target: str, referer: str | None = None) -> dict:
     if referer:
         headers["Referer"] = referer
     options = {
-        "impersonate": ImpersonateTarget.from_str(target),
+        "impersonate": get_impersonate_target().from_str(target),
         "extractor_args": {"generic": {"impersonate": [""]}},
     }
     if headers:
@@ -1363,7 +1399,7 @@ def browser_capture_media(source: str) -> dict:
 
 
 def extract_info(source: str, extra_options: dict | None = None) -> dict:
-    with YoutubeDL(build_extract_options(extra_options)) as ydl:
+    with get_youtube_dl()(build_extract_options(extra_options)) as ydl:
         info = ydl.extract_info(source, download=False)
     if not isinstance(info, dict):
         raise RuntimeError("Could not extract media details from that page.")
@@ -1517,6 +1553,7 @@ class HelperHandler(BaseHTTPRequestHandler):
                     "download_mode": "yt-dlp direct low-res",
                     "ffmpeg_path": str(FFMPEG_EXE),
                     "ffmpeg_available": ffmpeg_available(),
+                    "ytdlp_available": ytdlp_available(),
                     "compression_profile": {
                         "height": TARGET_VIDEO_HEIGHT,
                         "video_bitrate": TARGET_VIDEO_BITRATE,
@@ -2023,5 +2060,9 @@ class HelperHandler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
+    ytdlp_status = "available" if ytdlp_available() else "missing (viewer open + video intro still work)"
     print(f"Starting Alcove local wheel host helper on http://{HOST}:{PORT}/api/health")
+    print(f"yt-dlp: {ytdlp_status}")
+    if not ytdlp_available():
+        print("Install optional downloads support with: pip install yt-dlp")
     ThreadingHTTPServer((HOST, PORT), HelperHandler).serve_forever()
