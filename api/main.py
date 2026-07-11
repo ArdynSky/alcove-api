@@ -800,6 +800,43 @@ def pulse_archive_stats_payload() -> dict:
     }
 
 
+def parse_archive_pool_filter(pool: str | None) -> list[str] | None:
+    if not pool:
+        return None
+    pools = [item.strip().lower() for item in pool.split(",") if item.strip()]
+    return pools or None
+
+
+def pulse_archive_answer_order_sql(sort: str | None = None) -> str:
+    sort_key = (sort or "date_desc").strip().lower()
+    if sort_key == "date_asc":
+        return "COALESCE(responded_at, sent_at, archived_at) ASC, pulse_id ASC"
+    if sort_key == "question_az":
+        return "LOWER(question) ASC, COALESCE(responded_at, sent_at, archived_at) DESC, pulse_id DESC"
+    if sort_key == "question_za":
+        return "LOWER(question) DESC, COALESCE(responded_at, sent_at, archived_at) DESC, pulse_id DESC"
+    return "COALESCE(responded_at, sent_at, archived_at) DESC, pulse_id DESC"
+
+
+def pulse_archive_question_order_sql(sort: str | None = None) -> str:
+    sort_key = (sort or "date_desc").strip().lower()
+    if sort_key == "date_asc":
+        return "COALESCE(active_from_day_key, submitted_at, archived_at) ASC, suggestion_id ASC"
+    if sort_key == "question_az":
+        return "LOWER(question) ASC, COALESCE(active_from_day_key, submitted_at, archived_at) DESC, suggestion_id DESC"
+    if sort_key == "question_za":
+        return "LOWER(question) DESC, COALESCE(active_from_day_key, submitted_at, archived_at) DESC, suggestion_id DESC"
+    return "COALESCE(active_from_day_key, submitted_at, archived_at) DESC, suggestion_id DESC"
+
+
+def archive_viewer_identity(user_id: int | None = None, username: str | None = None) -> dict:
+    clean_username = (username or "").strip().lstrip("@") or None
+    return {
+        "user_id": int(user_id) if user_id is not None else None,
+        "username": clean_username,
+    }
+
+
 def query_pulse_archive_answers(
     *,
     day: str | None = None,
@@ -809,6 +846,10 @@ def query_pulse_archive_answers(
     q: str | None = None,
     username: str | None = None,
     suggestion_id: int | None = None,
+    sort: str | None = None,
+    mine_only: bool = False,
+    viewer_user_id: int | None = None,
+    viewer_username: str | None = None,
     page: int = 1,
     limit: int = 50,
 ) -> dict:
@@ -824,9 +865,14 @@ def query_pulse_archive_answers(
     if to_day:
         clauses.append("day_key <= ?")
         params.append(to_day.strip())
-    if pool:
-        clauses.append("pool = ?")
-        params.append(pool.strip().lower())
+    pools = parse_archive_pool_filter(pool)
+    if pools:
+        if len(pools) == 1:
+            clauses.append("pool = ?")
+            params.append(pools[0])
+        else:
+            clauses.append(f"pool IN ({','.join('?' * len(pools))})")
+            params.extend(pools)
     if suggestion_id:
         clauses.append("suggestion_id = ?")
         params.append(int(suggestion_id))
@@ -838,9 +884,20 @@ def query_pulse_archive_answers(
     if uname:
         clauses.append("LOWER(COALESCE(sender_username, '')) LIKE ?")
         params.append(f"%{uname}%")
+    if mine_only:
+        viewer_username_clean = (viewer_username or "").strip().lower().lstrip("@")
+        if viewer_user_id is not None:
+            clauses.append("(sender_user_id = ? OR question_owner_user_id = ?)")
+            params.extend([int(viewer_user_id), int(viewer_user_id)])
+        elif viewer_username_clean:
+            clauses.append(
+                "(LOWER(COALESCE(sender_username, '')) = ? OR LOWER(COALESCE(question_owner_username, '')) = ?)"
+            )
+            params.extend([viewer_username_clean, viewer_username_clean])
     where_sql = " AND ".join(clauses)
     offset = max(0, (max(1, page) - 1) * max(1, min(limit, 200)))
     row_limit = max(1, min(limit, 200))
+    order_sql = pulse_archive_answer_order_sql(sort)
     with sqlite3.connect(STATE_DB_PATH) as conn:
         total = int(conn.execute(
             f"SELECT COUNT(*) FROM pulse_archive_answers WHERE {where_sql}",
@@ -854,7 +911,7 @@ def query_pulse_archive_answers(
                    archived_at
             FROM pulse_archive_answers
             WHERE {where_sql}
-            ORDER BY COALESCE(responded_at, sent_at, archived_at) DESC, pulse_id DESC
+            ORDER BY {order_sql}
             LIMIT ? OFFSET ?
             """,
             [*params, row_limit, offset],
@@ -875,15 +932,24 @@ def query_pulse_archive_questions(
     q: str | None = None,
     from_day: str | None = None,
     to_day: str | None = None,
+    sort: str | None = None,
+    mine_only: bool = False,
+    viewer_user_id: int | None = None,
+    viewer_username: str | None = None,
     page: int = 1,
     limit: int = 50,
 ) -> dict:
     ensure_pulse_archive_store()
     clauses = ["1=1"]
     params: list = []
-    if pool:
-        clauses.append("pool = ?")
-        params.append(pool.strip().lower())
+    pools = parse_archive_pool_filter(pool)
+    if pools:
+        if len(pools) == 1:
+            clauses.append("pool = ?")
+            params.append(pools[0])
+        else:
+            clauses.append(f"pool IN ({','.join('?' * len(pools))})")
+            params.extend(pools)
     if status:
         clauses.append("status = ?")
         params.append(status.strip())
@@ -897,9 +963,18 @@ def query_pulse_archive_questions(
     if to_day:
         clauses.append("COALESCE(active_from_day_key, '') <= ?")
         params.append(to_day.strip())
+    if mine_only:
+        viewer_username_clean = (viewer_username or "").strip().lower().lstrip("@")
+        if viewer_user_id is not None:
+            clauses.append("user_id = ?")
+            params.append(int(viewer_user_id))
+        elif viewer_username_clean:
+            clauses.append("LOWER(COALESCE(username, '')) = ?")
+            params.append(viewer_username_clean)
     where_sql = " AND ".join(clauses)
     offset = max(0, (max(1, page) - 1) * max(1, min(limit, 200)))
     row_limit = max(1, min(limit, 200))
+    order_sql = pulse_archive_question_order_sql(sort)
     with sqlite3.connect(STATE_DB_PATH) as conn:
         total = int(conn.execute(
             f"SELECT COUNT(*) FROM pulse_archive_questions WHERE {where_sql}",
@@ -911,7 +986,7 @@ def query_pulse_archive_questions(
                    submitted_at, reviewed_at, user_id, username, display_name, source, archived_at
             FROM pulse_archive_questions
             WHERE {where_sql}
-            ORDER BY COALESCE(active_from_day_key, submitted_at, archived_at) DESC, suggestion_id DESC
+            ORDER BY {order_sql}
             LIMIT ? OFFSET ?
             """,
             [*params, row_limit, offset],
@@ -978,6 +1053,537 @@ def pulse_archive_answers_csv(filters: dict) -> str:
         ])
         page += 1
     return buffer.getvalue()
+
+
+def sanitize_member_pulse_answer(entry: dict, viewer: dict) -> dict:
+    owner = {
+        "user_id": entry.get("question_owner_user_id"),
+        "username": entry.get("question_owner_username"),
+    }
+    sender = {
+        "user_id": entry.get("sender_user_id"),
+        "username": entry.get("sender_username"),
+    }
+    is_my_answer = bool(viewer and pulse_identities_match(viewer, sender))
+    is_my_question = bool(viewer and pulse_identities_match(viewer, owner))
+    payload = {
+        "archive_id": entry.get("archive_id"),
+        "pulse_id": entry.get("pulse_id"),
+        "suggestion_id": entry.get("suggestion_id"),
+        "day_key": entry.get("day_key"),
+        "day_label": entry.get("day_label"),
+        "pool": entry.get("pool"),
+        "category": entry.get("category"),
+        "question": entry.get("question"),
+        "answer": entry.get("answer"),
+        "responded_at": entry.get("responded_at") or entry.get("sent_at"),
+        "is_my_answer": is_my_answer,
+        "is_my_question": is_my_question,
+    }
+    return payload
+
+
+def sanitize_member_pulse_question(entry: dict, viewer: dict, answers: list[dict] | None = None) -> dict:
+    owner = {
+        "user_id": entry.get("user_id"),
+        "username": entry.get("username"),
+    }
+    is_my_question = bool(viewer and pulse_identities_match(viewer, owner))
+    sanitized_answers = [sanitize_member_pulse_answer(answer, viewer) for answer in (answers or [])]
+    return {
+        "archive_id": entry.get("archive_id"),
+        "suggestion_id": entry.get("suggestion_id"),
+        "pool": entry.get("pool"),
+        "question": entry.get("question"),
+        "category": entry.get("category"),
+        "status": entry.get("status"),
+        "active_from_day_key": entry.get("active_from_day_key"),
+        "active_from_label": entry.get("active_from_label"),
+        "submitted_at": entry.get("submitted_at"),
+        "answers_count": entry.get("answers_count") or len(sanitized_answers),
+        "is_my_question": is_my_question,
+        "answers": sanitized_answers,
+    }
+
+
+def pulse_archive_answers_for_question(question: str, pool: str | None = None, limit: int = 200) -> list[dict]:
+    result = query_pulse_archive_answers(
+        q=question,
+        pool=pool,
+        page=1,
+        limit=limit,
+        sort="date_desc",
+    )
+    return result.get("entries") or []
+
+
+def build_member_pulse_archive_payload(
+    *,
+    viewer: dict,
+    view: str = "questions",
+    pool: str | None = None,
+    q: str | None = None,
+    from_day: str | None = None,
+    to_day: str | None = None,
+    sort: str | None = None,
+    mine_only: bool = False,
+    page: int = 1,
+    limit: int = 50,
+) -> dict:
+    viewer_user_id = viewer.get("user_id")
+    viewer_username = viewer.get("username")
+    stats = pulse_archive_stats_payload()
+    payload = {
+        "stats": {
+            "question_count": stats.get("question_count", 0),
+            "answer_count": stats.get("answer_count", 0),
+            "first_day_label": stats.get("first_day_label"),
+            "last_day_label": stats.get("last_day_label"),
+        },
+    }
+    view_key = (view or "questions").strip().lower()
+    if view_key in {"questions", "all"}:
+        question_result = query_pulse_archive_questions(
+            pool=pool,
+            q=q,
+            from_day=from_day,
+            to_day=to_day,
+            sort=sort,
+            mine_only=mine_only,
+            viewer_user_id=viewer_user_id,
+            viewer_username=viewer_username,
+            page=page,
+            limit=limit,
+        )
+        questions = []
+        for entry in question_result.get("entries") or []:
+            answers = pulse_archive_answers_for_question(entry.get("question") or "", entry.get("pool"))
+            if q:
+                needle = (q or "").strip().lower()
+                answers = [
+                    answer for answer in answers
+                    if needle in (answer.get("question") or "").lower()
+                    or needle in (answer.get("answer") or "").lower()
+                ]
+            if mine_only:
+                answers = [
+                    answer for answer in answers
+                    if pulse_identities_match(viewer, {
+                        "user_id": answer.get("sender_user_id"),
+                        "username": answer.get("sender_username"),
+                    })
+                    or pulse_identities_match(viewer, {
+                        "user_id": answer.get("question_owner_user_id"),
+                        "username": answer.get("question_owner_username"),
+                    })
+                ]
+            questions.append(sanitize_member_pulse_question(entry, viewer, answers))
+        payload["questions"] = questions
+        payload["questions_total"] = question_result.get("total", 0)
+        payload["questions_page"] = question_result.get("page", 1)
+        payload["questions_pages"] = question_result.get("pages", 1)
+    if view_key in {"answers", "all"}:
+        answer_result = query_pulse_archive_answers(
+            pool=pool,
+            q=q,
+            from_day=from_day,
+            to_day=to_day,
+            sort=sort,
+            mine_only=mine_only,
+            viewer_user_id=viewer_user_id,
+            viewer_username=viewer_username,
+            page=page,
+            limit=limit,
+        )
+        payload["answers"] = [
+            sanitize_member_pulse_answer(entry, viewer)
+            for entry in (answer_result.get("entries") or [])
+        ]
+        payload["answers_total"] = answer_result.get("total", 0)
+        payload["answers_page"] = answer_result.get("page", 1)
+        payload["answers_pages"] = answer_result.get("pages", 1)
+    if view_key == "questions":
+        payload["entries"] = payload.get("questions", [])
+        payload["total"] = payload.get("questions_total", 0)
+        payload["page"] = payload.get("questions_page", 1)
+        payload["pages"] = payload.get("questions_pages", 1)
+    elif view_key == "answers":
+        payload["entries"] = payload.get("answers", [])
+        payload["total"] = payload.get("answers_total", 0)
+        payload["page"] = payload.get("answers_page", 1)
+        payload["pages"] = payload.get("answers_pages", 1)
+    return payload
+
+
+def ensure_spotlight_archive_store() -> None:
+    ensure_state_store()
+    with sqlite3.connect(STATE_DB_PATH) as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS spotlight_archive (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                spotlight_id INTEGER UNIQUE NOT NULL,
+                nominee_user_id INTEGER,
+                nominee_username TEXT,
+                nominee_display_name TEXT,
+                nominator_user_id INTEGER,
+                nominator_username TEXT,
+                nominator_display_name TEXT,
+                reason TEXT NOT NULL,
+                edited_reason TEXT,
+                style TEXT NOT NULL,
+                day_key TEXT,
+                published_at TEXT NOT NULL,
+                archived_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_spotlight_archive_published ON spotlight_archive(published_at)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_spotlight_archive_style ON spotlight_archive(style)"
+        )
+        conn.commit()
+
+
+def archive_published_spotlight(entry: dict) -> None:
+    if not entry or entry.get("status") != "approved" or not entry.get("published_at"):
+        return
+    spotlight_id = entry.get("id")
+    if spotlight_id is None:
+        return
+    reason = (entry.get("edited_reason") or entry.get("reason") or "").strip()
+    if not reason:
+        return
+    ensure_spotlight_archive_store()
+    archived_at = now_iso()
+    with sqlite3.connect(STATE_DB_PATH) as conn:
+        conn.execute(
+            """
+            INSERT INTO spotlight_archive (
+                spotlight_id, nominee_user_id, nominee_username, nominee_display_name,
+                nominator_user_id, nominator_username, nominator_display_name,
+                reason, edited_reason, style, day_key, published_at, archived_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(spotlight_id) DO UPDATE SET
+                nominee_user_id = excluded.nominee_user_id,
+                nominee_username = excluded.nominee_username,
+                nominee_display_name = excluded.nominee_display_name,
+                nominator_user_id = excluded.nominator_user_id,
+                nominator_username = excluded.nominator_username,
+                nominator_display_name = excluded.nominator_display_name,
+                reason = excluded.reason,
+                edited_reason = excluded.edited_reason,
+                style = excluded.style,
+                day_key = excluded.day_key,
+                published_at = excluded.published_at,
+                archived_at = excluded.archived_at
+            """,
+            (
+                int(spotlight_id),
+                entry.get("nominee_user_id"),
+                entry.get("nominee_username"),
+                entry.get("nominee_display_name"),
+                entry.get("nominator_user_id"),
+                entry.get("nominator_username"),
+                entry.get("nominator_display_name"),
+                reason,
+                entry.get("edited_reason"),
+                (entry.get("style") or "gold").strip().lower(),
+                entry.get("day_key"),
+                entry.get("published_at"),
+                archived_at,
+            ),
+        )
+        conn.commit()
+
+
+def backfill_spotlight_archive_from_runtime() -> None:
+    for entry in spotlight_entries:
+        if entry.get("status") == "approved" and entry.get("published_at"):
+            archive_published_spotlight(entry)
+
+
+def spotlight_archive_row_to_payload(row: tuple) -> dict:
+    keys = (
+        "archive_id", "spotlight_id", "nominee_user_id", "nominee_username", "nominee_display_name",
+        "nominator_user_id", "nominator_username", "nominator_display_name", "reason", "edited_reason",
+        "style", "day_key", "published_at", "archived_at",
+    )
+    payload = dict(zip(keys, row))
+    payload["reason"] = (payload.get("edited_reason") or payload.get("reason") or "").strip()
+    payload["day_label"] = pulse_day_label(payload.get("day_key")) if payload.get("day_key") else None
+    return payload
+
+
+def query_spotlight_archive(
+    *,
+    style: str | None = None,
+    nominator: str | None = None,
+    nominee: str | None = None,
+    from_day: str | None = None,
+    to_day: str | None = None,
+    sort: str | None = None,
+    mine: str | None = None,
+    viewer_user_id: int | None = None,
+    viewer_username: str | None = None,
+    page: int = 1,
+    limit: int = 50,
+) -> dict:
+    backfill_spotlight_archive_from_runtime()
+    ensure_spotlight_archive_store()
+    clauses = ["1=1"]
+    params: list = []
+    styles = parse_archive_pool_filter(style)
+    if styles:
+        if len(styles) == 1:
+            clauses.append("LOWER(style) = ?")
+            params.append(styles[0])
+        else:
+            clauses.append(f"LOWER(style) IN ({','.join('?' * len(styles))})")
+            params.extend(styles)
+    nominator_needle = (nominator or "").strip().lower().lstrip("@")
+    if nominator_needle:
+        clauses.append(
+            "(LOWER(COALESCE(nominator_username, '')) LIKE ? OR LOWER(COALESCE(nominator_display_name, '')) LIKE ?)"
+        )
+        params.extend([f"%{nominator_needle}%", f"%{nominator_needle}%"])
+    nominee_needle = (nominee or "").strip().lower().lstrip("@")
+    if nominee_needle:
+        clauses.append(
+            "(LOWER(COALESCE(nominee_username, '')) LIKE ? OR LOWER(COALESCE(nominee_display_name, '')) LIKE ?)"
+        )
+        params.extend([f"%{nominee_needle}%", f"%{nominee_needle}%"])
+    if from_day:
+        clauses.append("COALESCE(day_key, '') >= ?")
+        params.append(from_day.strip())
+    if to_day:
+        clauses.append("COALESCE(day_key, '') <= ?")
+        params.append(to_day.strip())
+    mine_key = (mine or "").strip().lower()
+    viewer_username_clean = (viewer_username or "").strip().lower().lstrip("@")
+    if mine_key == "sent":
+        if viewer_user_id is not None:
+            clauses.append("nominator_user_id = ?")
+            params.append(int(viewer_user_id))
+        elif viewer_username_clean:
+            clauses.append("LOWER(COALESCE(nominator_username, '')) = ?")
+            params.append(viewer_username_clean)
+    elif mine_key == "awarded":
+        if viewer_user_id is not None:
+            clauses.append("nominee_user_id = ?")
+            params.append(int(viewer_user_id))
+        elif viewer_username_clean:
+            clauses.append("LOWER(COALESCE(nominee_username, '')) = ?")
+            params.append(viewer_username_clean)
+    elif mine_key == "any" and (viewer_user_id is not None or viewer_username_clean):
+        if viewer_user_id is not None:
+            clauses.append("(nominator_user_id = ? OR nominee_user_id = ?)")
+            params.extend([int(viewer_user_id), int(viewer_user_id)])
+        elif viewer_username_clean:
+            clauses.append(
+                "(LOWER(COALESCE(nominator_username, '')) = ? OR LOWER(COALESCE(nominee_username, '')) = ?)"
+            )
+            params.extend([viewer_username_clean, viewer_username_clean])
+    where_sql = " AND ".join(clauses)
+    sort_key = (sort or "date_desc").strip().lower()
+    if sort_key == "date_asc":
+        order_sql = "published_at ASC, spotlight_id ASC"
+    elif sort_key == "nominee_az":
+        order_sql = "LOWER(COALESCE(nominee_display_name, nominee_username, '')) ASC, published_at DESC"
+    elif sort_key == "nominee_za":
+        order_sql = "LOWER(COALESCE(nominee_display_name, nominee_username, '')) DESC, published_at DESC"
+    else:
+        order_sql = "published_at DESC, spotlight_id DESC"
+    offset = max(0, (max(1, page) - 1) * max(1, min(limit, 200)))
+    row_limit = max(1, min(limit, 200))
+    with sqlite3.connect(STATE_DB_PATH) as conn:
+        total = int(conn.execute(
+            f"SELECT COUNT(*) FROM spotlight_archive WHERE {where_sql}",
+            params,
+        ).fetchone()[0] or 0)
+        rows = conn.execute(
+            f"""
+            SELECT id, spotlight_id, nominee_user_id, nominee_username, nominee_display_name,
+                   nominator_user_id, nominator_username, nominator_display_name,
+                   reason, edited_reason, style, day_key, published_at, archived_at
+            FROM spotlight_archive
+            WHERE {where_sql}
+            ORDER BY {order_sql}
+            LIMIT ? OFFSET ?
+            """,
+            [*params, row_limit, offset],
+        ).fetchall()
+    return {
+        "entries": [spotlight_archive_row_to_payload(row) for row in rows],
+        "total": total,
+        "page": max(1, page),
+        "limit": row_limit,
+        "pages": max(1, (total + row_limit - 1) // row_limit),
+    }
+
+
+def sanitize_member_spotlight_entry(entry: dict, viewer: dict) -> dict:
+    nominator = {
+        "user_id": entry.get("nominator_user_id"),
+        "username": entry.get("nominator_username"),
+    }
+    nominee = {
+        "user_id": entry.get("nominee_user_id"),
+        "username": entry.get("nominee_username"),
+    }
+    return {
+        "spotlight_id": entry.get("spotlight_id"),
+        "nominee_display_name": entry.get("nominee_display_name") or entry.get("nominee_username"),
+        "nominator_display_name": entry.get("nominator_display_name") or entry.get("nominator_username"),
+        "reason": entry.get("reason"),
+        "style": entry.get("style"),
+        "published_at": entry.get("published_at"),
+        "day_key": entry.get("day_key"),
+        "day_label": entry.get("day_label"),
+        "is_sent_by_me": bool(viewer and pulse_identities_match(viewer, nominator)),
+        "is_awarded_to_me": bool(viewer and pulse_identities_match(viewer, nominee)),
+    }
+
+
+def wheel_archive_reviews_for_entry(entry: dict) -> list[dict]:
+    entry_id = entry.get("id")
+    embedded = entry.get("reviews")
+    if isinstance(embedded, list) and embedded:
+        return embedded
+    reviews = []
+    for review in wheel_review_history:
+        try:
+            if int(review.get("video_entry_id") or 0) != int(entry_id or 0):
+                continue
+        except Exception:
+            continue
+        reviews.append(review)
+    return reviews
+
+
+def wheel_archive_day_key(entry: dict) -> str:
+    stamp = entry.get("played_at") or entry.get("archived_at") or entry.get("time") or ""
+    return str(stamp)[:10]
+
+
+def normalize_wheel_archive_entry(entry: dict, viewer: dict | None = None) -> dict:
+    data = entry.get("data") or {}
+    reviews = wheel_archive_reviews_for_entry(entry)
+    ratings = [float(review.get("rating") or 0) for review in reviews if review.get("rating")]
+    average_rating = entry.get("average_rating")
+    if average_rating is None and ratings:
+        average_rating = round(sum(ratings) / len(ratings), 2)
+    sanitized_reviews = []
+    for review in reviews:
+        reviewer = {
+            "user_id": review.get("user_id"),
+            "username": review.get("username"),
+        }
+        sanitized_reviews.append({
+            "rating": review.get("rating"),
+            "review": review.get("review"),
+            "display_name": review.get("display_name") or "Anonymous",
+            "time": review.get("time"),
+            "is_my_review": bool(viewer and pulse_identities_match(viewer, reviewer)),
+        })
+    return {
+        "id": entry.get("id"),
+        "video_title": data.get("video_title") or data.get("link") or "Untitled video",
+        "submitted_url": entry.get("submitted_url") or data.get("link"),
+        "submitted_by": data.get("display_name") or "Unknown",
+        "source_domain": entry.get("source_domain"),
+        "played_at": entry.get("played_at"),
+        "archived_at": entry.get("archived_at"),
+        "day_key": wheel_archive_day_key(entry),
+        "average_rating": float(average_rating or 0),
+        "review_count": entry.get("review_count") or len(sanitized_reviews),
+        "reviews": sanitized_reviews,
+        "is_my_submission": bool(
+            viewer and wheel_entry_matches_submitter(
+                entry,
+                telegram_id=viewer.get("user_id"),
+                username=viewer.get("username"),
+                display_name=viewer.get("display_name"),
+            )
+        ),
+    }
+
+
+def query_archive_wheel_entries(
+    *,
+    q: str | None = None,
+    submitted_by: str | None = None,
+    min_rating: float | None = None,
+    from_day: str | None = None,
+    to_day: str | None = None,
+    sort: str | None = None,
+    mine_only: bool = False,
+    viewer: dict | None = None,
+    page: int = 1,
+    limit: int = 50,
+) -> dict:
+    normalized = [normalize_wheel_archive_entry(entry, viewer) for entry in archived_wheel_entries]
+    needle = (q or "").strip().lower()
+    submitter_needle = (submitted_by or "").strip().lower()
+    filtered = []
+    for entry in normalized:
+        if needle and needle not in (entry.get("video_title") or "").lower():
+            continue
+        if submitter_needle and submitter_needle not in (entry.get("submitted_by") or "").lower():
+            continue
+        if min_rating is not None and float(entry.get("average_rating") or 0) < float(min_rating):
+            continue
+        day_key = entry.get("day_key") or ""
+        if from_day and day_key and day_key < from_day.strip():
+            continue
+        if to_day and day_key and day_key > to_day.strip():
+            continue
+        if mine_only and not entry.get("is_my_submission"):
+            continue
+        filtered.append(entry)
+    sort_key = (sort or "date_desc").strip().lower()
+    if sort_key == "date_asc":
+        filtered.sort(key=lambda item: (item.get("archived_at") or item.get("played_at") or "", item.get("id") or 0))
+    elif sort_key == "title_az":
+        filtered.sort(key=lambda item: ((item.get("video_title") or "").lower(), item.get("archived_at") or ""))
+    elif sort_key == "title_za":
+        filtered.sort(key=lambda item: ((item.get("video_title") or "").lower(), item.get("archived_at") or ""), reverse=True)
+    elif sort_key == "rating_desc":
+        filtered.sort(key=lambda item: (float(item.get("average_rating") or 0), item.get("archived_at") or ""), reverse=True)
+    elif sort_key == "rating_asc":
+        filtered.sort(key=lambda item: (float(item.get("average_rating") or 0), item.get("archived_at") or ""))
+    else:
+        filtered.sort(key=lambda item: (item.get("archived_at") or item.get("played_at") or "", item.get("id") or 0), reverse=True)
+    total = len(filtered)
+    row_limit = max(1, min(limit, 200))
+    offset = max(0, (max(1, page) - 1) * row_limit)
+    page_entries = filtered[offset:offset + row_limit]
+    return {
+        "entries": page_entries,
+        "total": total,
+        "page": max(1, page),
+        "limit": row_limit,
+        "pages": max(1, (total + row_limit - 1) // row_limit),
+    }
+
+
+def archive_summary_payload(viewer: dict | None = None) -> dict:
+    pulse_stats = pulse_archive_stats_payload()
+    backfill_spotlight_archive_from_runtime()
+    ensure_spotlight_archive_store()
+    with sqlite3.connect(STATE_DB_PATH) as conn:
+        spotlight_count = int(conn.execute("SELECT COUNT(*) FROM spotlight_archive").fetchone()[0] or 0)
+    wheel_result = query_archive_wheel_entries(viewer=viewer, page=1, limit=1)
+    return {
+        "pulse": {
+            "question_count": pulse_stats.get("question_count", 0),
+            "answer_count": pulse_stats.get("answer_count", 0),
+        },
+        "spotlight": {"award_count": spotlight_count},
+        "wheel": {"entry_count": wheel_result.get("total", 0)},
+    }
 
 
 def runtime_entry_day(entry: dict) -> str:
@@ -5587,6 +6193,126 @@ def admin_pulse_archive_export(
     )
 
 
+@app.get("/api/archive/summary")
+def member_archive_summary(user_id: int | None = None, username: str | None = None):
+    if not user_id and not username:
+        return {"status": "error", "message": "Could not identify this Archive user."}
+    viewer = archive_viewer_identity(user_id, username)
+    return {"status": "ok", "summary": archive_summary_payload(viewer)}
+
+
+@app.get("/api/archive/pulse")
+def member_archive_pulse(
+    user_id: int | None = None,
+    username: str | None = None,
+    view: str = "questions",
+    pool: str | None = None,
+    q: str | None = None,
+    from_day: str | None = None,
+    to_day: str | None = None,
+    sort: str = "date_desc",
+    mine_only: bool = False,
+    page: int = 1,
+    limit: int = 50,
+):
+    if not user_id and not username:
+        return {"status": "error", "message": "Could not identify this Archive user."}
+    viewer = archive_viewer_identity(user_id, username)
+    return {
+        "status": "ok",
+        **build_member_pulse_archive_payload(
+            viewer=viewer,
+            view=view,
+            pool=pool,
+            q=q,
+            from_day=from_day,
+            to_day=to_day,
+            sort=sort,
+            mine_only=mine_only,
+            page=page,
+            limit=limit,
+        ),
+    }
+
+
+@app.get("/api/archive/spotlight")
+def member_archive_spotlight(
+    user_id: int | None = None,
+    username: str | None = None,
+    style: str | None = None,
+    nominator: str | None = None,
+    nominee: str | None = None,
+    from_day: str | None = None,
+    to_day: str | None = None,
+    sort: str = "date_desc",
+    mine: str | None = None,
+    page: int = 1,
+    limit: int = 50,
+):
+    if not user_id and not username:
+        return {"status": "error", "message": "Could not identify this Archive user."}
+    viewer = archive_viewer_identity(user_id, username)
+    result = query_spotlight_archive(
+        style=style,
+        nominator=nominator,
+        nominee=nominee,
+        from_day=from_day,
+        to_day=to_day,
+        sort=sort,
+        mine=mine,
+        viewer_user_id=viewer.get("user_id"),
+        viewer_username=viewer.get("username"),
+        page=page,
+        limit=limit,
+    )
+    entries = [sanitize_member_spotlight_entry(entry, viewer) for entry in result.get("entries") or []]
+    return {
+        "status": "ok",
+        "entries": entries,
+        "total": result.get("total", 0),
+        "page": result.get("page", 1),
+        "pages": result.get("pages", 1),
+        "limit": result.get("limit", limit),
+        "stats": {"award_count": result.get("total", 0)},
+    }
+
+
+@app.get("/api/archive/wheel")
+def member_archive_wheel(
+    user_id: int | None = None,
+    username: str | None = None,
+    q: str | None = None,
+    submitted_by: str | None = None,
+    min_rating: float | None = None,
+    from_day: str | None = None,
+    to_day: str | None = None,
+    sort: str = "date_desc",
+    mine_only: bool = False,
+    page: int = 1,
+    limit: int = 50,
+):
+    if not user_id and not username:
+        return {"status": "error", "message": "Could not identify this Archive user."}
+    viewer = archive_viewer_identity(user_id, username)
+    result = query_archive_wheel_entries(
+        q=q,
+        submitted_by=submitted_by,
+        min_rating=min_rating,
+        from_day=from_day,
+        to_day=to_day,
+        sort=sort,
+        mine_only=mine_only,
+        viewer=viewer,
+        page=page,
+        limit=limit,
+    )
+    return {
+        "status": "ok",
+        **result,
+        "stats": {"entry_count": result.get("total", 0)},
+    }
+
+
 @app.get("/api/admin/group-activity/summary")
 def admin_group_activity_summary(admin_secret: str, period: str = "today"):
     verify_admin_secret(admin_secret)
@@ -7348,15 +8074,18 @@ def archive_wheel_entry(entry_id: int):
 
             archived = dict(entry)
             archived["archived_at"] = now_iso()
+            related_reviews = [
+                review for review in video_reviews
+                if int(review.get("video_entry_id") or 0) == int(entry_id)
+            ]
+            ratings = [float(review.get("rating") or 0) for review in related_reviews if review.get("rating")]
+            archived["reviews"] = related_reviews
+            archived["review_count"] = len(related_reviews)
+            archived["average_rating"] = round(sum(ratings) / len(ratings), 2) if ratings else 0.0
             archived_wheel_entries.append(archived)
 
             if archive_path:
                 metadata_path = os.path.splitext(archive_path)[0] + ".json"
-                related_reviews = [
-                    review for review in video_reviews
-                    if int(review.get("video_entry_id") or 0) == int(entry_id)
-                ]
-                ratings = [float(review.get("rating") or 0) for review in related_reviews if review.get("rating")]
                 metadata = {
                     "entry_id": entry.get("id"),
                     "title": (entry.get("data") or {}).get("video_title"),
@@ -7366,8 +8095,8 @@ def archive_wheel_entry(entry_id: int):
                     "played_at": entry.get("played_at"),
                     "archived_at": archived.get("archived_at"),
                     "local_filename": entry.get("local_filename"),
-                    "average_rating": round(sum(ratings) / len(ratings), 2) if ratings else 0.0,
-                    "review_count": len(related_reviews),
+                    "average_rating": archived.get("average_rating"),
+                    "review_count": archived.get("review_count"),
                     "reviews": related_reviews,
                 }
                 try:
@@ -7605,6 +8334,8 @@ def bot_update_spotlight(entry_id: int, payload: SpotlightReviewUpdate, x_bot_sy
         entry["published_at"] = payload.published_at
     if payload.status == "approved" and not entry.get("published_at"):
         entry["publish_pending"] = True
+    if entry.get("published_at") and entry.get("status") == "approved":
+        archive_published_spotlight(entry)
     save_runtime_state()
 
     return {"status": "ok", "entry": entry}
