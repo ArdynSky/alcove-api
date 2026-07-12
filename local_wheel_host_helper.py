@@ -12,6 +12,7 @@ import time
 import base64
 import hashlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from obs_ws_bridge import obs_request, obs_status
 from pathlib import Path
 from datetime import datetime
 from urllib.error import HTTPError
@@ -1542,11 +1543,13 @@ class HelperHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         global CURRENT_STREAM_STATE, CURRENT_VIDEO_INTRO_STATE
         if self.path == "/api/health":
+            obs_probe = obs_status()
             return json_response(
                 self,
                 200,
                 {
                     "status": "ok",
+                    "obs": obs_probe,
                     "downloads_dir": str(DOWNLOADS_DIR),
                     "ready_dir": str(READY_DIR),
                     "playout_file": str(CURRENT_PICK_PATH),
@@ -1567,6 +1570,25 @@ class HelperHandler(BaseHTTPRequestHandler):
                         "debug_port": AUTH_BROWSER_PORT,
                         "preferred_browser": str(browser_executable(prefer_brave=True) or ""),
                     },
+                },
+            )
+        if self.path.startswith("/api/obs/status"):
+            parsed = urlparse(self.path)
+            params = parse_qs(parsed.query)
+            host = str((params.get("host") or ["127.0.0.1"])[0] or "127.0.0.1").strip()
+            port = int((params.get("port") or ["4455"])[0] or 4455)
+            password = str((params.get("password") or [""])[0] or "")
+            probe = obs_status(host=host, port=port, password=password)
+            return json_response(
+                self,
+                200,
+                {
+                    "status": "ok",
+                    "connected": bool(probe.get("connected")),
+                    "current_scene": probe.get("current_scene") or "",
+                    "host": probe.get("host") or host,
+                    "port": probe.get("port") or port,
+                    "message": probe.get("message") or "",
                 },
             )
         if self.path.startswith("/api/auth-browser/open"):
@@ -1674,6 +1696,33 @@ class HelperHandler(BaseHTTPRequestHandler):
             payload = json.loads(raw.decode("utf-8") or "{}")
         except Exception:
             return json_response(self, 400, {"status": "error", "message": "Invalid JSON payload"})
+
+        if self.path == "/api/obs/request":
+            request_type = str(payload.get("requestType") or "").strip()
+            if not request_type:
+                return json_response(self, 200, {"status": "error", "message": "requestType is required."})
+            request_data = payload.get("requestData")
+            if request_data is None:
+                request_data = {}
+            if not isinstance(request_data, dict):
+                return json_response(self, 200, {"status": "error", "message": "requestData must be an object."})
+            host = str(payload.get("host") or "127.0.0.1").strip() or "127.0.0.1"
+            try:
+                port = int(payload.get("port") or 4455)
+            except (TypeError, ValueError):
+                port = 4455
+            password = str(payload.get("password") or "")
+            try:
+                response_data = obs_request(
+                    request_type,
+                    request_data,
+                    host=host,
+                    port=port,
+                    password=password,
+                )
+            except Exception as exc:
+                return json_response(self, 200, {"status": "error", "message": str(exc)})
+            return json_response(self, 200, {"status": "ok", "responseData": response_data})
 
         if self.path == "/api/stream/current":
             if payload.get("clear"):
