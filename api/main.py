@@ -295,9 +295,14 @@ poll_history = []
 active_poll = None
 room_media_submissions = []
 now_showing_media = None
+room_game = None
+team_feeds = {}
 _next_room_qa_id_seq = 1
 _next_poll_id_seq = 1
 _next_media_id_seq = 1
+_next_team_msg_id_seq = 1
+ROOM_GAME_MAX_SIZES = {2, 3, 4, 5}
+ROOM_GAME_MODES = {"display", "collaborate"}
 
 notification_feed = []
 
@@ -1731,15 +1736,19 @@ def live_room_state_payload() -> dict:
         "poll_history": poll_history,
         "room_media_submissions": room_media_submissions,
         "now_showing_media": now_showing_media,
+        "room_game": room_game,
+        "team_feeds": team_feeds,
         "next_room_qa_id_seq": _next_room_qa_id_seq,
         "next_poll_id_seq": _next_poll_id_seq,
         "next_media_id_seq": _next_media_id_seq,
+        "next_team_msg_id_seq": _next_team_msg_id_seq,
     }
 
 
 def apply_live_room_payload(payload: dict) -> None:
     global active_poll, room_qa_items, room_qa_archive, poll_history, room_media_submissions, now_showing_media
-    global _next_room_qa_id_seq, _next_poll_id_seq, _next_media_id_seq
+    global room_game, team_feeds
+    global _next_room_qa_id_seq, _next_poll_id_seq, _next_media_id_seq, _next_team_msg_id_seq
 
     if not isinstance(payload, dict):
         return
@@ -1758,12 +1767,18 @@ def apply_live_room_payload(payload: dict) -> None:
         room_media_submissions = payload["room_media_submissions"]
     if "now_showing_media" in payload:
         now_showing_media = payload.get("now_showing_media")
+    if "room_game" in payload:
+        room_game = payload.get("room_game")
+    if isinstance(payload.get("team_feeds"), dict):
+        team_feeds = payload["team_feeds"]
     if isinstance(payload.get("next_room_qa_id_seq"), int) and payload["next_room_qa_id_seq"] > 0:
         _next_room_qa_id_seq = payload["next_room_qa_id_seq"]
     if isinstance(payload.get("next_poll_id_seq"), int) and payload["next_poll_id_seq"] > 0:
         _next_poll_id_seq = payload["next_poll_id_seq"]
     if isinstance(payload.get("next_media_id_seq"), int) and payload["next_media_id_seq"] > 0:
         _next_media_id_seq = payload["next_media_id_seq"]
+    if isinstance(payload.get("next_team_msg_id_seq"), int) and payload["next_team_msg_id_seq"] > 0:
+        _next_team_msg_id_seq = payload["next_team_msg_id_seq"]
 
 
 def save_live_room_state() -> None:
@@ -2003,6 +2018,36 @@ class RoomPollCreate(BaseModel):
 class RoomPollVote(BaseModel):
     user_id: int | None = None
     option_id: str
+
+
+class RoomGameStart(BaseModel):
+    title: str = "Teams"
+    mode: str = "display"
+    max_size: int = 4
+
+
+class RoomGameJoin(BaseModel):
+    user_id: int | None = None
+    username: str | None = None
+    display_name: str
+
+
+class RoomGameConfig(BaseModel):
+    title: str | None = None
+    mode: str | None = None
+    max_size: int | None = None
+
+
+class RoomGameOverlay(BaseModel):
+    visible: bool = True
+
+
+class RoomTeamMessage(BaseModel):
+    user_id: int | None = None
+    username: str | None = None
+    display_name: str
+    team_id: str
+    text: str
 
 
 class ModuleStateUpdate(BaseModel):
@@ -5351,6 +5396,7 @@ def get_ready_unplayed_entries(round_number: int):
 def reset_wheel_session_state() -> None:
     global current_winner, current_now_playing, current_wheel_reaction, latest_review_overlay
     global active_poll, room_media_submissions, now_showing_media, room_qa_items, room_qa_archive, poll_history
+    global room_game, team_feeds
 
     wheel_entries.clear()
     archived_wheel_entries.clear()
@@ -5392,6 +5438,8 @@ def reset_wheel_session_state() -> None:
     active_poll = None
     room_media_submissions.clear()
     now_showing_media = None
+    room_game = None
+    team_feeds.clear()
     save_live_room_state()
 
 
@@ -5921,6 +5969,8 @@ def get_app_state():
         "poll_history": poll_history[-20:],
         "media_submissions": room_media_submissions,
         "now_showing_media": now_showing_media,
+        "room_game": room_game,
+        "team_feeds": team_feeds if (room_game or {}).get("mode") == "collaborate" else {},
     }
 
 
@@ -8036,6 +8086,355 @@ def get_room_media_file(media_id: int):
     }
     ext = Path(path).suffix.lower()
     return FileResponse(path, media_type=media_types.get(ext, "application/octet-stream"))
+
+
+# ---------------------------------
+# Live Room — team games
+# ---------------------------------
+
+def _next_team_msg_id() -> int:
+    global _next_team_msg_id_seq
+    value = _next_team_msg_id_seq
+    _next_team_msg_id_seq += 1
+    return value
+
+
+def room_game_payload() -> dict | None:
+    return room_game
+
+
+def empty_room_game(title: str, mode: str, max_size: int) -> dict:
+    return {
+        "game_id": f"game_{uuid.uuid4().hex[:12]}",
+        "title": title,
+        "mode": mode,
+        "max_size": max_size,
+        "status": "pooling",
+        "pool": [],
+        "teams": [],
+        "overlay_visible": False,
+        "created_at": now_iso(),
+        "assigned_at": None,
+        "ended_at": None,
+    }
+
+
+def team_label(index: int) -> str:
+    letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    if index < len(letters):
+        return f"Team {letters[index]}"
+    return f"Team {index + 1}"
+
+
+def split_players_into_teams(players: list, max_size: int) -> list[list]:
+    """Fill as many max-size groups as possible; remainder becomes a smaller group.
+    Avoid leaving a single player alone by borrowing from the previous group."""
+    if max_size < 2:
+        max_size = 2
+    shuffled = list(players)
+    random.shuffle(shuffled)
+    n = len(shuffled)
+    if n == 0:
+        return []
+    if n <= max_size:
+        return [shuffled]
+
+    sizes = []
+    remaining = n
+    while remaining > max_size:
+        sizes.append(max_size)
+        remaining -= max_size
+    if remaining:
+        sizes.append(remaining)
+
+    # Avoid a lonely remainder of 1 when possible
+    if len(sizes) >= 2 and sizes[-1] == 1:
+        sizes[-2] -= 1
+        sizes[-1] = 2
+
+    teams = []
+    cursor = 0
+    for size in sizes:
+        teams.append(shuffled[cursor:cursor + size])
+        cursor += size
+    return teams
+
+
+def find_player_team(user_id) -> dict | None:
+    if not room_game:
+        return None
+    key = str(user_id or "")
+    for team in room_game.get("teams") or []:
+        for member in team.get("members") or []:
+            if str(member.get("user_id") or "") == key:
+                return team
+    return None
+
+
+@app.post("/api/room-game/start")
+def start_room_game(payload: RoomGameStart):
+    global room_game, team_feeds
+    mode = (payload.mode or "display").strip().lower()
+    if mode not in ROOM_GAME_MODES:
+        return {"status": "error", "message": "Mode must be display or collaborate."}
+    max_size = int(payload.max_size)
+    if max_size not in ROOM_GAME_MAX_SIZES:
+        return {"status": "error", "message": "Max group size must be 2, 3, 4, or 5."}
+    title = (payload.title or "Teams").strip() or "Teams"
+    room_game = empty_room_game(title, mode, max_size)
+    team_feeds = {}
+    add_notification("system", f"Game open: {title}", True)
+    persist_live_room()
+    return {"status": "ok", "room_game": room_game}
+
+
+@app.post("/api/room-game/config")
+def configure_room_game(payload: RoomGameConfig):
+    global room_game
+    if not room_game or room_game.get("status") not in {"pooling", "assigned"}:
+        return {"status": "error", "message": "Start a game first."}
+    if room_game.get("status") == "assigned" and payload.max_size is not None:
+        return {"status": "error", "message": "Teams already assigned. End the game to change size."}
+    if payload.title is not None:
+        room_game["title"] = (payload.title or "").strip() or room_game.get("title") or "Teams"
+    if payload.mode is not None:
+        mode = payload.mode.strip().lower()
+        if mode not in ROOM_GAME_MODES:
+            return {"status": "error", "message": "Mode must be display or collaborate."}
+        room_game["mode"] = mode
+    if payload.max_size is not None:
+        max_size = int(payload.max_size)
+        if max_size not in ROOM_GAME_MAX_SIZES:
+            return {"status": "error", "message": "Max group size must be 2, 3, 4, or 5."}
+        room_game["max_size"] = max_size
+    persist_live_room()
+    return {"status": "ok", "room_game": room_game}
+
+
+@app.post("/api/room-game/join")
+def join_room_game(payload: RoomGameJoin):
+    global room_game
+    if not room_game or room_game.get("status") != "pooling":
+        return {"status": "error", "message": "No open join pool right now."}
+    display_name = (payload.display_name or "Viewer").strip() or "Viewer"
+    user_key = str(payload.user_id or "").strip()
+    if not user_key:
+        return {"status": "error", "message": "User identity required."}
+    pool = room_game.setdefault("pool", [])
+    for player in pool:
+        if str(player.get("user_id") or "") == user_key:
+            player["display_name"] = display_name
+            player["username"] = payload.username
+            persist_live_room()
+            return {"status": "ok", "room_game": room_game, "already_joined": True}
+    pool.append({
+        "user_id": payload.user_id,
+        "username": payload.username,
+        "display_name": display_name,
+        "joined_at": now_iso(),
+    })
+    persist_live_room()
+    return {"status": "ok", "room_game": room_game}
+
+
+@app.post("/api/room-game/leave")
+def leave_room_game(payload: RoomGameJoin):
+    global room_game
+    if not room_game or room_game.get("status") != "pooling":
+        return {"status": "error", "message": "No open join pool right now."}
+    user_key = str(payload.user_id or "").strip()
+    pool = room_game.setdefault("pool", [])
+    room_game["pool"] = [player for player in pool if str(player.get("user_id") or "") != user_key]
+    persist_live_room()
+    return {"status": "ok", "room_game": room_game}
+
+
+@app.post("/api/room-game/clear-pool")
+def clear_room_game_pool():
+    global room_game
+    if not room_game or room_game.get("status") != "pooling":
+        return {"status": "error", "message": "Pool is not open."}
+    room_game["pool"] = []
+    persist_live_room()
+    return {"status": "ok", "room_game": room_game}
+
+
+@app.post("/api/room-game/assign")
+def assign_room_game_teams():
+    global room_game, team_feeds
+    if not room_game or room_game.get("status") != "pooling":
+        return {"status": "error", "message": "Open a join pool and wait for players first."}
+    pool = list(room_game.get("pool") or [])
+    if len(pool) < 2:
+        return {"status": "error", "message": "Need at least 2 people in the pool."}
+    max_size = int(room_game.get("max_size") or 4)
+    chunks = split_players_into_teams(pool, max_size)
+    teams = []
+    feeds = {}
+    for index, members in enumerate(chunks):
+        team_id = f"team_{index + 1}"
+        teams.append({
+            "id": team_id,
+            "label": team_label(index),
+            "members": members,
+        })
+        feeds[team_id] = []
+    room_game["teams"] = teams
+    room_game["status"] = "assigned"
+    room_game["assigned_at"] = now_iso()
+    room_game["overlay_visible"] = True
+    team_feeds = feeds
+    add_notification("system", f"Teams assigned ({len(teams)} groups)", True)
+    persist_live_room()
+    return {"status": "ok", "room_game": room_game}
+
+
+@app.post("/api/room-game/overlay")
+def set_room_game_overlay(payload: RoomGameOverlay):
+    global room_game
+    if not room_game or room_game.get("status") != "assigned":
+        return {"status": "error", "message": "Assign teams before showing overlay."}
+    room_game["overlay_visible"] = bool(payload.visible)
+    persist_live_room()
+    return {"status": "ok", "room_game": room_game}
+
+
+@app.post("/api/room-game/end")
+def end_room_game():
+    global room_game, team_feeds
+    if not room_game:
+        return {"status": "error", "message": "No active game."}
+    room_game = {
+        **room_game,
+        "status": "ended",
+        "overlay_visible": False,
+        "ended_at": now_iso(),
+    }
+    add_notification("system", "Game ended", True)
+    persist_live_room()
+    return {"status": "ok", "room_game": room_game}
+
+
+@app.post("/api/room-game/reset")
+def reset_room_game():
+    global room_game, team_feeds
+    room_game = None
+    team_feeds = {}
+    persist_live_room()
+    return {"status": "ok", "room_game": None}
+
+
+@app.post("/api/room-game/team-message")
+def post_team_message(payload: RoomTeamMessage):
+    global team_feeds
+    if not room_game or room_game.get("status") != "assigned":
+        return {"status": "error", "message": "Teams are not active."}
+    if room_game.get("mode") != "collaborate":
+        return {"status": "error", "message": "This game has no team chat."}
+    team_id = (payload.team_id or "").strip()
+    team = next((t for t in (room_game.get("teams") or []) if t.get("id") == team_id), None)
+    if not team:
+        return {"status": "error", "message": "Team not found."}
+    user_key = str(payload.user_id or "").strip()
+    member_keys = {str(m.get("user_id") or "") for m in team.get("members") or []}
+    if user_key not in member_keys:
+        return {"status": "error", "message": "You are not in this team."}
+    text = (payload.text or "").strip()
+    if not text:
+        return {"status": "error", "message": "Message cannot be empty."}
+    if len(text) > 400:
+        return {"status": "error", "message": "Message must be 400 characters or fewer."}
+    message = {
+        "id": _next_team_msg_id(),
+        "team_id": team_id,
+        "user_id": payload.user_id,
+        "username": payload.username,
+        "display_name": (payload.display_name or "Viewer").strip() or "Viewer",
+        "text": text,
+        "kind": "text",
+        "created_at": now_iso(),
+    }
+    feed = team_feeds.setdefault(team_id, [])
+    feed.append(message)
+    team_feeds[team_id] = feed[-100:]
+    persist_live_room()
+    return {"status": "ok", "message": message}
+
+
+@app.post("/api/room-game/team-media")
+async def upload_team_media(
+    user_id: int = Form(...),
+    display_name: str = Form("Viewer"),
+    team_id: str = Form(...),
+    text: str = Form(""),
+    file: UploadFile = File(...),
+):
+    global team_feeds, room_media_submissions
+    if not room_game or room_game.get("status") != "assigned":
+        return {"status": "error", "message": "Teams are not active."}
+    if room_game.get("mode") != "collaborate":
+        return {"status": "error", "message": "This game has no team chat."}
+    team = next((t for t in (room_game.get("teams") or []) if t.get("id") == team_id), None)
+    if not team:
+        return {"status": "error", "message": "Team not found."}
+    user_key = str(user_id or "").strip()
+    member_keys = {str(m.get("user_id") or "") for m in team.get("members") or []}
+    if user_key not in member_keys:
+        return {"status": "error", "message": "You are not in this team."}
+    original_name = Path(file.filename or "upload.bin").name
+    ext = Path(original_name).suffix.lower()
+    if ext not in ROOM_MEDIA_ALLOWED_EXTENSIONS:
+        return {"status": "error", "message": "Unsupported file type. Use a picture or video."}
+    media_id = _next_media_id()
+    stored_name = f"team_{media_id}{ext}"
+    stored_path = os.path.join(ROOM_MEDIA_DIR, stored_name)
+    total = 0
+    try:
+        with open(stored_path, "wb") as out:
+            while True:
+                chunk = await file.read(1024 * 1024)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > ROOM_MEDIA_MAX_BYTES:
+                    out.close()
+                    os.remove(stored_path)
+                    return {"status": "error", "message": "File too large (max 100 MB)."}
+                out.write(chunk)
+    except OSError:
+        return {"status": "error", "message": "Could not save upload."}
+    kind = "video" if ext in {".mp4", ".mov", ".webm", ".m4v"} else "image"
+    message = {
+        "id": _next_team_msg_id(),
+        "team_id": team_id,
+        "user_id": user_id,
+        "display_name": (display_name or "Viewer").strip() or "Viewer",
+        "text": (text or "").strip()[:220],
+        "kind": kind,
+        "media_id": media_id,
+        "url": f"/api/room-media/file/{media_id}",
+        "filename": stored_name,
+        "created_at": now_iso(),
+    }
+    # Ensure file lookup via find_room_media works for team uploads too
+    room_media_submissions.append({
+        "id": media_id,
+        "discussion_id": None,
+        "discussion_title": "",
+        "user_id": user_id,
+        "display_name": message["display_name"],
+        "anonymous": False,
+        "caption": message["text"],
+        "filename": stored_name,
+        "kind": kind,
+        "status": "team",
+        "created_at": now_iso(),
+    })
+    feed = team_feeds.setdefault(team_id, [])
+    feed.append(message)
+    team_feeds[team_id] = feed[-100:]
+    persist_live_room()
+    return {"status": "ok", "message": message}
 
 
 # ---------------------------------
