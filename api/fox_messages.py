@@ -131,6 +131,18 @@ def default_template_settings() -> dict:
             "text": "Tap Open Alcove to launch the Mini App.",
             "link_url": "",
             "link_label": "Open Alcove Mini App",
+            "link_style": "",
+        },
+        "help_terminal": {
+            "enabled": True,
+            "buttons": {
+                "rules": {"label": "🔵 ┃ Group Rules", "style": "primary"},
+                "ardyn": {"label": "🟣 ┃ Message from Ardyn", "style": ""},
+                "guide": {"label": "🟢 ┃ Mini App Guide", "style": "success"},
+                "faq": {"label": "🟠 ┃ F.A.Q.'s", "style": ""},
+                "back": {"label": "↩ ┃ Back to menu", "style": ""},
+                "launch": {"label": "▶ ┃ LAUNCH APP", "style": "primary"},
+            },
         },
     }
 
@@ -190,6 +202,37 @@ FOX_TEMPLATE_EDITORS = [
             {"key": "text", "type": "textarea", "label": "Caption text"},
             {"key": "link_url", "type": "text", "label": "Button link (optional override)"},
             {"key": "link_label", "type": "text", "label": "Button label"},
+            {
+                "key": "link_style",
+                "type": "button_style",
+                "label": "Button colour",
+                "help": "Telegram colours only: default, blue (primary), green (success), red (danger).",
+            },
+        ],
+    },
+    {
+        "id": "help_terminal",
+        "title": "Help terminal (/help)",
+        "description": (
+            "Inline menu opened by /help, /terminal, or /foxhelp. "
+            "Edit button text (emoji welcome) and Telegram button colours. "
+            "Colours are limited by Telegram to default, blue, green, or red."
+        ),
+        "fields": [
+            {"key": "enabled", "type": "bool", "label": "Enabled"},
+            {
+                "key": "buttons",
+                "type": "tg_buttons",
+                "label": "Menu buttons",
+                "buttons": [
+                    {"id": "rules", "title": "Group Rules"},
+                    {"id": "ardyn", "title": "Message from Ardyn"},
+                    {"id": "guide", "title": "Mini App Guide"},
+                    {"id": "faq", "title": "F.A.Q.'s"},
+                    {"id": "back", "title": "Back to menu"},
+                    {"id": "launch", "title": "LAUNCH APP"},
+                ],
+            },
         ],
     },
 ]
@@ -206,7 +249,36 @@ MEDIA_KIND_HINTS = {
     "fox_verify.png": "join_verification",
     "pulse_test.png": "group_app_launcher",
     "fox_banner.png": "group_app_launcher",
+    "help_terminal_banner.png": "help_terminal",
 }
+
+HELP_TERMINAL_BUTTON_IDS = ("rules", "ardyn", "guide", "faq", "back", "launch")
+BUTTON_STYLES = frozenset({"", "primary", "success", "danger"})
+
+
+def normalize_button_style(value) -> str:
+    style = str(value or "").strip().lower()
+    if style in {"default", "none", "neutral"}:
+        return ""
+    return style if style in BUTTON_STYLES else ""
+
+
+def normalize_help_terminal_buttons(raw_buttons, defaults: dict) -> dict:
+    incoming = raw_buttons if isinstance(raw_buttons, dict) else {}
+    normalized = {}
+    for button_id in HELP_TERMINAL_BUTTON_IDS:
+        default_button = defaults.get(button_id) or {"label": button_id.title(), "style": ""}
+        patch = incoming.get(button_id) if isinstance(incoming.get(button_id), dict) else {}
+        label = str(patch.get("label") if patch.get("label") is not None else default_button.get("label") or button_id).strip()
+        if not label:
+            label = str(default_button.get("label") or button_id)
+        normalized[button_id] = {
+            "label": label[:64],
+            "style": normalize_button_style(
+                patch.get("style") if "style" in patch else default_button.get("style")
+            ),
+        }
+    return normalized
 
 DEFAULT_SELF_CARE_MESSAGES = [
     "Water. Now.",
@@ -277,6 +349,17 @@ FOX_MESSAGE_CATALOG = [
         "schedule_label": "Once when F.O.X starts",
         "default_banner": "assets/pulse_test.png",
         "content_source": "Editable below (Event templates)",
+    },
+    {
+        "id": "help_terminal",
+        "title": "Help terminal (/help)",
+        "category": "interactive",
+        "controllable": True,
+        "target": "main_group_or_dm",
+        "topic_label": "Wherever /help is used",
+        "schedule_label": "On demand",
+        "default_banner": "assets/help_terminal_banner.png",
+        "content_source": "Editable button labels + Telegram button colours",
     },
     {
         "id": "join_verification",
@@ -368,7 +451,15 @@ def normalize_templates(raw: dict | None = None) -> dict:
             entry["text"] = str(entry.get("text") or default["text"]).strip()
             entry["link_url"] = str(entry.get("link_url") or "").strip()
             entry["link_label"] = str(entry.get("link_label") or default["link_label"]).strip()
+            entry["link_style"] = normalize_button_style(
+                entry.get("link_style") if "link_style" in entry else default.get("link_style")
+            )
             entry["banner"] = str(entry.get("banner") or default["banner"]).strip()
+        elif template_id == "help_terminal":
+            entry["buttons"] = normalize_help_terminal_buttons(
+                entry.get("buttons"),
+                default.get("buttons") or {},
+            )
         merged[template_id] = entry
     return merged
 
@@ -383,6 +474,16 @@ def merge_template_update(current: dict, template_id: str, patch: dict) -> dict:
             **templates[template_id].get("templates", {}),
             **{str(k): str(v).strip() for k, v in patch["templates"].items() if str(v).strip()},
         }
+    if template_id == "help_terminal" and isinstance(patch.get("buttons"), dict):
+        current_buttons = templates[template_id].get("buttons") or {}
+        patched_buttons = {}
+        for button_id in HELP_TERMINAL_BUTTON_IDS:
+            base = dict(current_buttons.get(button_id) or {})
+            incoming = patch["buttons"].get(button_id)
+            if isinstance(incoming, dict):
+                base.update(incoming)
+            patched_buttons[button_id] = base
+        merged_patch["buttons"] = patched_buttons
     templates[template_id] = normalize_templates({template_id: merged_patch})[template_id]
     return templates
 
