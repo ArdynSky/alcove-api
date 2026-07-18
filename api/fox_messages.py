@@ -36,13 +36,24 @@ DEFAULT_ADMIN_WARN_TEMPLATES = {
 }
 
 DEFAULT_VERIFIED_WELCOME_MESSAGES = [
-    "{name}\n\nWelcome to The Alcove. Settle in, say hi, and share the sticker you received from me.",
-    "{name}\n\nThe door is open. Come in gently, say hello, and drop your welcome sticker when you are ready.",
-    "{name}\n\nWelcome in. The room is better with you here. Say hi and show us the sticker you picked.",
-    "{name}\n\nYou made it through. Welcome to The Alcove. Say hello, get comfortable, and share your sticker.",
+    "{name}\n\nWelcome to The Alcove. Settle in, say hi, and make yourself at home.",
+    "{name}\n\nThe door is open. Come in gently, say hello, and get comfortable.",
+    "{name}\n\nWelcome in. The room is better with you here. Come say hi and introduce yourself.",
+    "{name}\n\nYou made it through. Welcome to The Alcove. Say hello and get comfortable.",
     "{name}\n\nF.O.X has opened the door. Welcome to The Alcove. Come say hi and let the room meet you.",
-    "{name}\n\nA new resident has arrived. Welcome to The Alcove. Say hi and share your sticker with us.",
+    "{name}\n\nA new resident has arrived. Welcome to The Alcove. Say hi and introduce yourself.",
 ]
+
+LEGACY_VERIFIED_WELCOME_REPLACEMENTS = {
+    "{name}\n\nWelcome to The Alcove. Settle in, say hi, and share the sticker you received from me.": DEFAULT_VERIFIED_WELCOME_MESSAGES[0],
+    "{name}\n\nThe door is open. Come in gently, say hello, and drop your welcome sticker when you are ready.": DEFAULT_VERIFIED_WELCOME_MESSAGES[1],
+    "{name}\n\nWelcome in. The room is better with you here. Say hi and show us the sticker you picked.": DEFAULT_VERIFIED_WELCOME_MESSAGES[2],
+    "{name}\n\nYou made it through. Welcome to The Alcove. Say hello, get comfortable, and share your sticker.": DEFAULT_VERIFIED_WELCOME_MESSAGES[3],
+    "{name}\n\nA new resident has arrived. Welcome to The Alcove. Say hi and share your sticker with us.": DEFAULT_VERIFIED_WELCOME_MESSAGES[5],
+    "{name}\n\nSay hi and please share your sticker you received from me.": (
+        "{name}\n\nSay hi and introduce yourself — we're glad you're here."
+    ),
+}
 
 FOX_VERIFICATION_DM_REFERENCE = [
     {
@@ -98,7 +109,7 @@ def default_template_settings() -> dict:
             "enabled": True,
             "banner": "assets/fox_welcome.png",
             "headline": "Welcome our newest resident. 👋",
-            "body": "{name}\n\nSay hi and please share your sticker you received from me.",
+            "body": "{name}\n\nSay hi and introduce yourself — we're glad you're here.",
             "messages": list(DEFAULT_VERIFIED_WELCOME_MESSAGES),
         },
         "join_verification": {
@@ -432,9 +443,24 @@ def normalize_templates(raw: dict | None = None) -> dict:
             if not isinstance(messages, list) or not messages:
                 entry["messages"] = list(default.get("messages") or DEFAULT_VERIFIED_WELCOME_MESSAGES)
             else:
-                entry["messages"] = [str(line).strip() for line in messages if str(line).strip()][:40]
+                migrated = []
+                for line in messages:
+                    text = str(line).strip()
+                    if not text:
+                        continue
+                    text = LEGACY_VERIFIED_WELCOME_REPLACEMENTS.get(text, text)
+                    if "sticker" in text.lower():
+                        continue
+                    migrated.append(text)
+                entry["messages"] = migrated[:40] or list(
+                    default.get("messages") or DEFAULT_VERIFIED_WELCOME_MESSAGES
+                )
             entry["headline"] = str(entry.get("headline") or default["headline"]).strip()
-            entry["body"] = str(entry.get("body") or default["body"]).strip()
+            body = str(entry.get("body") or default["body"]).strip()
+            body = LEGACY_VERIFIED_WELCOME_REPLACEMENTS.get(body, body)
+            if "sticker" in body.lower():
+                body = default["body"]
+            entry["body"] = body
             entry["banner"] = str(entry.get("banner") or default["banner"]).strip()
         elif template_id == "join_verification":
             for key in ("request_text", "direct_join_text", "dm_failed_text"):
