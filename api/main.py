@@ -1989,6 +1989,7 @@ class StreamComment(BaseModel):
     username: str | None = None
     display_name: str
     text: str
+    feed_style: dict | None = None
 
 
 class WheelReaction(BaseModel):
@@ -7562,8 +7563,8 @@ def submit_stream_comment(comment: StreamComment):
     text = comment.text.strip()
     if len(text) == 0:
         return {"status": "error", "message": "Comment cannot be empty."}
-    if len(text) > 220:
-        return {"status": "error", "message": "Comments must be 220 characters or fewer."}
+    if len(text) > 600:
+        return {"status": "error", "message": "Comments must be 600 characters or fewer."}
 
     display_name = (comment.display_name or "Viewer").strip() or "Viewer"
     if display_name.lower() in muted_users:
@@ -7583,6 +7584,7 @@ def submit_stream_comment(comment: StreamComment):
             if seconds_since < 4:
                 return {"status": "error", "message": "Please wait a moment before sending another comment."}
 
+    feed_style = comment.feed_style if isinstance(comment.feed_style, dict) else None
     approved_comments.append(
         {
             "comment_id": get_next_comment_id(),
@@ -7592,6 +7594,7 @@ def submit_stream_comment(comment: StreamComment):
             "text": text,
             "time": now_iso(),
             "approved": True,
+            "feed_style": feed_style,
         }
     )
     add_notification("comment", f"{display_name}: {text}", False)
