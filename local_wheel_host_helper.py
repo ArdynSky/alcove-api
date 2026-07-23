@@ -12,13 +12,50 @@ import time
 import base64
 import hashlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from obs_ws_bridge import obs_request, obs_status
 from pathlib import Path
 from datetime import datetime
 from urllib.error import HTTPError
 from urllib.parse import parse_qs, quote, urljoin, urlencode, urlparse, urlunparse
 from urllib.request import Request, urlopen
-from yt_dlp import YoutubeDL
-from yt_dlp.networking.impersonate import ImpersonateTarget
+
+_YTDLP = None
+_YTDLP_ERROR = None
+
+
+def ytdlp_available() -> bool:
+    try:
+        _ensure_ytdlp()
+        return True
+    except RuntimeError:
+        return False
+
+
+def _ensure_ytdlp():
+    global _YTDLP, _YTDLP_ERROR
+    if _YTDLP is not None:
+        return _YTDLP
+    if _YTDLP_ERROR is not None:
+        raise RuntimeError(_YTDLP_ERROR)
+    try:
+        from yt_dlp import YoutubeDL
+        from yt_dlp.networking.impersonate import ImpersonateTarget
+    except ImportError as exc:
+        _YTDLP_ERROR = (
+            "yt-dlp is not installed. Run: pip install yt-dlp "
+            "(needed for downloads/stream resolve; viewer open and video intro work without it)."
+        )
+        raise RuntimeError(_YTDLP_ERROR) from exc
+    _YTDLP = {"YoutubeDL": YoutubeDL, "ImpersonateTarget": ImpersonateTarget}
+    return _YTDLP
+
+
+def get_youtube_dl():
+    return _ensure_ytdlp()["YoutubeDL"]
+
+
+def get_impersonate_target():
+    return _ensure_ytdlp()["ImpersonateTarget"]
 
 
 HOST = "127.0.0.1"
@@ -76,7 +113,10 @@ ALLOWED_ORIGINS = {
     "null",
     "http://127.0.0.1:5500",
     "http://localhost:5500",
+    "http://127.0.0.1:8765",
+    "http://localhost:8765",
     "https://thealcove.netlify.app",
+    "https://euphonious-banoffee-1c8215.netlify.app",
     "https://ardyn-alcove.com",
     "https://www.ardyn-alcove.com",
 }
@@ -437,7 +477,7 @@ def download_low_res_video(url: str, entry_id: int) -> tuple[Path, str | None]:
         "progress_with_newline": False,
         **impersonate_options(os.getenv("ALCOVE_YTDLP_IMPERSONATE") or YTDLP_IMPERSONATE_TARGETS[0]),
     }
-    with YoutubeDL(options) as ydl:
+    with get_youtube_dl()(options) as ydl:
         info = ydl.extract_info(url, download=True)
     title = str(info.get("title") or "").strip() or None
     prefix = f"alcove_{entry_id}_"
@@ -465,7 +505,7 @@ def fetch_video_title(url: str | None) -> str | None:
         "logger": QuietYDLLogger(),
         "verbose": False,
     }
-    with YoutubeDL(options) as ydl:
+    with get_youtube_dl()(options) as ydl:
         info = ydl.extract_info(source, download=False)
     title = str(info.get("title") or "").strip()
     return title or None
@@ -492,7 +532,7 @@ def impersonate_options(target: str, referer: str | None = None) -> dict:
     if referer:
         headers["Referer"] = referer
     options = {
-        "impersonate": ImpersonateTarget.from_str(target),
+        "impersonate": get_impersonate_target().from_str(target),
         "extractor_args": {"generic": {"impersonate": [""]}},
     }
     if headers:
@@ -1543,7 +1583,7 @@ def browser_capture_media(source: str) -> dict:
 
 
 def extract_info(source: str, extra_options: dict | None = None) -> dict:
-    with YoutubeDL(build_extract_options(extra_options)) as ydl:
+    with get_youtube_dl()(build_extract_options(extra_options)) as ydl:
         info = ydl.extract_info(source, download=False)
     if not isinstance(info, dict):
         raise RuntimeError("Could not extract media details from that page.")
@@ -1686,17 +1726,20 @@ class HelperHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         global CURRENT_STREAM_STATE, CURRENT_VIDEO_INTRO_STATE
         if self.path == "/api/health":
+            obs_probe = obs_status()
             return json_response(
                 self,
                 200,
                 {
                     "status": "ok",
+                    "obs": obs_probe,
                     "downloads_dir": str(DOWNLOADS_DIR),
                     "ready_dir": str(READY_DIR),
                     "playout_file": str(CURRENT_PICK_PATH),
                     "download_mode": "yt-dlp direct low-res",
                     "ffmpeg_path": str(FFMPEG_EXE),
                     "ffmpeg_available": ffmpeg_available(),
+                    "ytdlp_available": ytdlp_available(),
                     "compression_profile": {
                         "height": TARGET_VIDEO_HEIGHT,
                         "video_bitrate": TARGET_VIDEO_BITRATE,
@@ -1710,6 +1753,25 @@ class HelperHandler(BaseHTTPRequestHandler):
                         "debug_port": AUTH_BROWSER_PORT,
                         "preferred_browser": str(browser_executable(prefer_brave=True) or ""),
                     },
+                },
+            )
+        if self.path.startswith("/api/obs/status"):
+            parsed = urlparse(self.path)
+            params = parse_qs(parsed.query)
+            host = str((params.get("host") or ["127.0.0.1"])[0] or "127.0.0.1").strip()
+            port = int((params.get("port") or ["4455"])[0] or 4455)
+            password = str((params.get("password") or [""])[0] or "")
+            probe = obs_status(host=host, port=port, password=password)
+            return json_response(
+                self,
+                200,
+                {
+                    "status": "ok",
+                    "connected": bool(probe.get("connected")),
+                    "current_scene": probe.get("current_scene") or "",
+                    "host": probe.get("host") or host,
+                    "port": probe.get("port") or port,
+                    "message": probe.get("message") or "",
                 },
             )
         if self.path.startswith("/api/auth-browser/open"):
@@ -1817,6 +1879,33 @@ class HelperHandler(BaseHTTPRequestHandler):
             payload = json.loads(raw.decode("utf-8") or "{}")
         except Exception:
             return json_response(self, 400, {"status": "error", "message": "Invalid JSON payload"})
+
+        if self.path == "/api/obs/request":
+            request_type = str(payload.get("requestType") or "").strip()
+            if not request_type:
+                return json_response(self, 200, {"status": "error", "message": "requestType is required."})
+            request_data = payload.get("requestData")
+            if request_data is None:
+                request_data = {}
+            if not isinstance(request_data, dict):
+                return json_response(self, 200, {"status": "error", "message": "requestData must be an object."})
+            host = str(payload.get("host") or "127.0.0.1").strip() or "127.0.0.1"
+            try:
+                port = int(payload.get("port") or 4455)
+            except (TypeError, ValueError):
+                port = 4455
+            password = str(payload.get("password") or "")
+            try:
+                response_data = obs_request(
+                    request_type,
+                    request_data,
+                    host=host,
+                    port=port,
+                    password=password,
+                )
+            except Exception as exc:
+                return json_response(self, 200, {"status": "error", "message": str(exc)})
+            return json_response(self, 200, {"status": "ok", "responseData": response_data})
 
         if self.path == "/api/stream/current":
             if payload.get("clear"):
@@ -2206,5 +2295,9 @@ class HelperHandler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
+    ytdlp_status = "available" if ytdlp_available() else "missing (viewer open + video intro still work)"
     print(f"Starting Alcove local wheel host helper on http://{HOST}:{PORT}/api/health")
+    print(f"yt-dlp: {ytdlp_status}")
+    if not ytdlp_available():
+        print("Install optional downloads support with: pip install yt-dlp")
     ThreadingHTTPServer((HOST, PORT), HelperHandler).serve_forever()
