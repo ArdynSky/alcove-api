@@ -376,6 +376,22 @@ def now_iso() -> str:
     return datetime.datetime.utcnow().isoformat() + "Z"
 
 
+def parse_iso_utc(value) -> datetime.datetime | None:
+    """Parse API timestamps into naive UTC datetimes safe to compare with utcnow()."""
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    if raw.endswith("Z"):
+        raw = raw[:-1] + "+00:00"
+    try:
+        parsed = datetime.datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    if parsed.tzinfo is not None:
+        parsed = parsed.astimezone(datetime.timezone.utc).replace(tzinfo=None)
+    return parsed
+
+
 def runtime_state_payload() -> dict:
     payload = {
         "spotlight_entries": spotlight_entries,
@@ -1989,6 +2005,7 @@ class StreamComment(BaseModel):
     username: str | None = None
     display_name: str
     text: str
+    feed_style: dict | None = None
 
 
 class WheelReaction(BaseModel):
@@ -7569,8 +7586,8 @@ def submit_stream_comment(comment: StreamComment):
     text = comment.text.strip()
     if len(text) == 0:
         return {"status": "error", "message": "Comment cannot be empty."}
-    if len(text) > 220:
-        return {"status": "error", "message": "Comments must be 220 characters or fewer."}
+    if len(text) > 600:
+        return {"status": "error", "message": "Comments must be 600 characters or fewer."}
 
     display_name = (comment.display_name or "Viewer").strip() or "Viewer"
     if display_name.lower() in muted_users:
@@ -7584,12 +7601,14 @@ def submit_stream_comment(comment: StreamComment):
             if str(c.get("user_id") or c.get("display_name") or "").strip() == user_identifier
         ]
         if recent_comments:
-            latest = sorted(recent_comments, key=lambda x: x["time"], reverse=True)[0]
-            latest_time = datetime.datetime.fromisoformat(latest["time"])
-            seconds_since = (datetime.datetime.utcnow() - latest_time).total_seconds()
-            if seconds_since < 4:
-                return {"status": "error", "message": "Please wait a moment before sending another comment."}
+            latest = sorted(recent_comments, key=lambda x: str(x.get("time") or ""), reverse=True)[0]
+            latest_time = parse_iso_utc(latest.get("time"))
+            if latest_time is not None:
+                seconds_since = (datetime.datetime.utcnow() - latest_time).total_seconds()
+                if seconds_since < 4:
+                    return {"status": "error", "message": "Please wait a moment before sending another comment."}
 
+    feed_style = comment.feed_style if isinstance(comment.feed_style, dict) else None
     approved_comments.append(
         {
             "comment_id": get_next_comment_id(),
@@ -7599,6 +7618,7 @@ def submit_stream_comment(comment: StreamComment):
             "text": text,
             "time": now_iso(),
             "approved": True,
+            "feed_style": feed_style,
         }
     )
     add_notification("comment", f"{display_name}: {text}", False)
