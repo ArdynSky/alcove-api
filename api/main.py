@@ -1,4 +1,4 @@
-﻿from fastapi import FastAPI
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel
@@ -348,6 +348,32 @@ PULSE_RED_UNLOCK_NOTIFY_USERNAMES_RAW = os.getenv(
     "Ardyn_Sky,The_Alcove",
 ).strip()
 UK_TZ = ZoneInfo("Europe/London")
+
+
+def env_int(name: str, default: int, minimum: int, maximum: int) -> int:
+    raw = os.getenv(name)
+    try:
+        value = int(raw) if raw is not None else default
+    except (TypeError, ValueError):
+        return default
+    return max(minimum, min(value, maximum))
+
+
+MAX_NOTIFICATION_FEED = env_int("ALCOVE_MAX_NOTIFICATION_FEED", 250, 50, 2000)
+MAX_APPROVED_COMMENTS = env_int("ALCOVE_MAX_APPROVED_COMMENTS", 500, 50, 4000)
+MAX_PENDING_COMMENTS = env_int("ALCOVE_MAX_PENDING_COMMENTS", 200, 20, 2000)
+MAX_VIDEO_REVIEWS = env_int("ALCOVE_MAX_VIDEO_REVIEWS", 2000, 100, 10000)
+MAX_SPOTLIGHT_ENTRIES = env_int("ALCOVE_MAX_SPOTLIGHT_ENTRIES", 1500, 100, 10000)
+MAX_PULSE_ENTRIES = env_int("ALCOVE_MAX_PULSE_ENTRIES", 5000, 500, 20000)
+MAX_PULSE_RECEIPTS = env_int("ALCOVE_MAX_PULSE_RECEIPTS", 5000, 500, 20000)
+MAX_PULSE_RED_ACTIVATIONS = env_int("ALCOVE_MAX_PULSE_RED_ACTIVATIONS", 3000, 200, 20000)
+MAX_PULSE_QUESTION_SUGGESTIONS = env_int("ALCOVE_MAX_PULSE_QUESTION_SUGGESTIONS", 2000, 100, 10000)
+MAX_PULSE_DAILY_SUMMARY_POSTS = env_int("ALCOVE_MAX_PULSE_DAILY_SUMMARY_POSTS", 1000, 100, 5000)
+MAX_PULSE_DISABLED_QUESTIONS = env_int("ALCOVE_MAX_PULSE_DISABLED_QUESTIONS", 1000, 100, 5000)
+MAX_MINIAPP_VERIFICATIONS = env_int("ALCOVE_MAX_MINIAPP_VERIFICATIONS", 2000, 100, 10000)
+MAX_WHEEL_REACTION_HISTORY = env_int("ALCOVE_MAX_WHEEL_REACTION_HISTORY", 2000, 100, 10000)
+MAX_WHEEL_REVIEW_HISTORY = env_int("ALCOVE_MAX_WHEEL_REVIEW_HISTORY", 2000, 100, 10000)
+
 _last_saved_runtime_fingerprint: str | None = None
 _last_pulse_prune_day: str | None = None
 
@@ -426,6 +452,33 @@ def runtime_state_payload() -> dict:
     return payload
 
 
+
+def trim_list_in_place(items: list, limit: int) -> None:
+    if limit <= 0:
+        items.clear()
+        return
+    overflow = len(items) - limit
+    if overflow > 0:
+        del items[:overflow]
+
+
+def trim_runtime_state_collections() -> None:
+    trim_list_in_place(spotlight_entries, MAX_SPOTLIGHT_ENTRIES)
+    trim_list_in_place(pulse_entries, MAX_PULSE_ENTRIES)
+    trim_list_in_place(pulse_receipts, MAX_PULSE_RECEIPTS)
+    trim_list_in_place(pulse_red_activations, MAX_PULSE_RED_ACTIVATIONS)
+    trim_list_in_place(pulse_question_suggestions, MAX_PULSE_QUESTION_SUGGESTIONS)
+    trim_list_in_place(pulse_daily_summary_posts, MAX_PULSE_DAILY_SUMMARY_POSTS)
+    trim_list_in_place(pulse_disabled_questions, MAX_PULSE_DISABLED_QUESTIONS)
+    trim_list_in_place(miniapp_verifications, MAX_MINIAPP_VERIFICATIONS)
+    trim_list_in_place(wheel_reaction_history, MAX_WHEEL_REACTION_HISTORY)
+    trim_list_in_place(wheel_review_history, MAX_WHEEL_REVIEW_HISTORY)
+    trim_list_in_place(notification_feed, MAX_NOTIFICATION_FEED)
+    trim_list_in_place(approved_comments, MAX_APPROVED_COMMENTS)
+    trim_list_in_place(pending_comments, MAX_PENDING_COMMENTS)
+    trim_list_in_place(video_reviews, MAX_VIDEO_REVIEWS)
+
+
 def ensure_state_store() -> None:
     directory = os.path.dirname(STATE_DB_PATH)
     if directory:
@@ -480,6 +533,8 @@ def apply_runtime_payload(payload: dict) -> None:
     synced_alcove_users = payload.get("synced_alcove_users") if isinstance(payload.get("synced_alcove_users"), list) else []
     last_bot_sync_at = payload.get("last_bot_sync_at") if isinstance(payload.get("last_bot_sync_at"), str) else None
     admin_jobs = payload.get("admin_jobs") if isinstance(payload.get("admin_jobs"), dict) else {}
+
+    trim_runtime_state_collections()
 
 
 def get_admin_job(name: str) -> dict:
@@ -1705,6 +1760,7 @@ def ensure_cards_api_enabled():
 def save_runtime_state(force: bool = False) -> bool:
     global _last_saved_runtime_fingerprint
 
+    trim_runtime_state_collections()
     prune_stats = prune_pulse_runtime_data()
     payload = runtime_state_payload()
     fingerprint = json.dumps(payload, separators=(",", ":"), sort_keys=True)
@@ -5140,15 +5196,17 @@ def build_group_activity_flood_flags(period: str, limit: int = 60):
 
 
 def add_notification(kind: str, text: str, public: bool = True):
+    next_id = int(notification_feed[-1].get("id") or 0) + 1 if notification_feed else 1
     notification_feed.append(
         {
-            "id": len(notification_feed) + 1,
+            "id": next_id,
             "kind": kind,
             "text": text,
             "public": public,
             "time": now_iso(),
         }
     )
+    trim_list_in_place(notification_feed, MAX_NOTIFICATION_FEED)
     ws_broadcast("notifications", notification_feed)
 
 
@@ -7514,7 +7572,7 @@ def submit_review(review: VideoReview):
     }
     video_reviews.append(review_record)
     wheel_review_history.append(dict(review_record))
-    wheel_review_history[:] = wheel_review_history[-2000:]
+    trim_list_in_place(wheel_review_history, MAX_WHEEL_REVIEW_HISTORY)
     stats = ensure_wheel_user_engagement(
         user_id=review.user_id,
         username=review.username,
@@ -7639,6 +7697,7 @@ def submit_stream_comment(comment: StreamComment):
             "feed_style": feed_style,
         }
     )
+    trim_list_in_place(approved_comments, MAX_APPROVED_COMMENTS)
     add_notification("comment", f"{display_name}: {text}", False)
     ws_broadcast_bundle()
     return {"status": "ok", "message": "Message sent."}
@@ -7662,6 +7721,7 @@ def approve_comment(comment_id: int):
             approved["approved"] = True
             approved["approved_at"] = now_iso()
             approved_comments.append(approved)
+            trim_list_in_place(approved_comments, MAX_APPROVED_COMMENTS)
             add_notification("comment", f"{approved['display_name']}: {approved['text']}", True)
             del pending_comments[index]
             return {"status": "ok"}
@@ -7712,7 +7772,7 @@ def submit_wheel_reaction(payload: WheelReaction):
         "user_id": payload.user_id,
         "time": current_wheel_reaction["time"],
     })
-    wheel_reaction_history[:] = wheel_reaction_history[-2000:]
+    trim_list_in_place(wheel_reaction_history, MAX_WHEEL_REACTION_HISTORY)
     save_runtime_state()
     ws_broadcast_bundle()
     return {"status": "ok", "reaction": current_wheel_reaction}
