@@ -83,6 +83,8 @@ ALLOWED_ORIGINS = {
 CURRENT_STREAM_STATE: dict | None = None
 CURRENT_VIDEO_INTRO_STATE: dict | None = None
 AUTH_BROWSER_PROCESS: subprocess.Popen | None = None
+VIEWER_TARGET_ID: str | None = None
+VIEWER_WINDOW_TITLE = "Alcove Now Playing"
 
 
 class QuietYDLLogger:
@@ -1158,6 +1160,187 @@ def auth_browser_running() -> bool:
         return False
 
 
+def list_auth_browser_pages() -> list[dict]:
+    try:
+        data = chrome_devtools_json("/json/list", port=AUTH_BROWSER_PORT)
+    except Exception:
+        return []
+    if not isinstance(data, list):
+        return []
+    return [item for item in data if isinstance(item, dict) and item.get("type") == "page"]
+
+
+def cdp_call(ws_url: str, method: str, params: dict | None = None, timeout: float = 8.0) -> dict:
+    parsed_ws = urlparse(ws_url)
+    sock = socket.create_connection((parsed_ws.hostname, parsed_ws.port), timeout=timeout)
+    try:
+        if parsed_ws.scheme == "wss":
+            context = ssl.create_default_context()
+            sock = context.wrap_socket(sock, server_hostname=parsed_ws.hostname)
+        websocket_handshake(sock, parsed_ws.netloc, parsed_ws.path)
+        payload = {"id": 1, "method": method}
+        if params:
+            payload["params"] = params
+        websocket_send_text(sock, json.dumps(payload))
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            message = websocket_recv_text(sock, timeout=0.75)
+            if not message:
+                continue
+            try:
+                data = json.loads(message)
+            except json.JSONDecodeError:
+                continue
+            if data.get("id") == 1:
+                if "error" in data:
+                    raise RuntimeError(str(data["error"]))
+                return data.get("result") or {}
+        raise RuntimeError(f"Timed out waiting for CDP response: {method}")
+    finally:
+        try:
+            sock.close()
+        except Exception:
+            pass
+
+
+def find_viewer_page() -> dict | None:
+    global VIEWER_TARGET_ID
+    pages = list_auth_browser_pages()
+    if not pages:
+        return None
+
+    if VIEWER_TARGET_ID:
+        for page in pages:
+            if str(page.get("id") or "") == VIEWER_TARGET_ID:
+                return page
+
+    for page in pages:
+        title = str(page.get("title") or "")
+        if VIEWER_WINDOW_TITLE.lower() in title.lower():
+            VIEWER_TARGET_ID = str(page.get("id") or "") or None
+            return page
+
+    # Prefer a non-devtools page; keep reusing the first page so Window Capture stays stable.
+    page = pages[0]
+    VIEWER_TARGET_ID = str(page.get("id") or "") or None
+    return page
+
+
+def prepare_viewer_window(viewer_url: str, *, fullscreen: bool = True) -> dict:
+    """Reuse one dedicated browser window/tab for winner playback (stable OBS Window Capture)."""
+    global VIEWER_TARGET_ID
+    target_url = str(viewer_url or "").strip() or "about:blank"
+    if auth_browser_running():
+        start_result = {
+            "status": "ok",
+            "already_running": True,
+            "browser_path": str(browser_executable(prefer_brave=True) or ""),
+            "profile_dir": str(AUTH_BROWSER_PROFILE_DIR),
+            "debug_port": AUTH_BROWSER_PORT,
+            "start_url": target_url,
+        }
+    else:
+        start_result = start_auth_browser(target_url)
+
+    page = find_viewer_page()
+    if page is None:
+        created = chrome_devtools_json(
+            f"/json/new?{quote(target_url, safe=':/?&=%#')}",
+            method="PUT",
+            port=AUTH_BROWSER_PORT,
+        )
+        VIEWER_TARGET_ID = str(created.get("id") or "").strip() or None
+        page = created if isinstance(created, dict) else find_viewer_page()
+    if not page:
+        raise RuntimeError("Could not open or find the Alcove viewer browser tab.")
+
+    VIEWER_TARGET_ID = str(page.get("id") or VIEWER_TARGET_ID or "").strip() or VIEWER_TARGET_ID
+    ws_url = str(page.get("webSocketDebuggerUrl") or "").strip()
+    if not ws_url and VIEWER_TARGET_ID:
+        # Refresh page metadata after creation/navigation.
+        for candidate in list_auth_browser_pages():
+            if str(candidate.get("id") or "") == VIEWER_TARGET_ID:
+                page = candidate
+                ws_url = str(candidate.get("webSocketDebuggerUrl") or "").strip()
+                break
+    if not ws_url:
+        raise RuntimeError("Viewer browser tab has no DevTools websocket URL.")
+
+    # Navigate the same tab so OBS Window Capture keeps the same window.
+    cdp_call(ws_url, "Page.enable", {})
+    try:
+        cdp_call(ws_url, "Page.bringToFront", {})
+    except Exception:
+        pass
+    cdp_call(ws_url, "Page.navigate", {"url": target_url})
+    time.sleep(0.8)
+    cdp_call(
+        ws_url,
+        "Runtime.evaluate",
+        {
+            "expression": f"document.title = {json.dumps(VIEWER_WINDOW_TITLE)};",
+            "returnByValue": True,
+        },
+    )
+
+    fullscreen_applied = False
+    if fullscreen:
+        try:
+            window = cdp_call(ws_url, "Browser.getWindowForTarget", {"targetId": VIEWER_TARGET_ID})
+            window_id = window.get("windowId")
+            if window_id is not None:
+                cdp_call(
+                    ws_url,
+                    "Browser.setWindowBounds",
+                    {"windowId": window_id, "bounds": {"windowState": "fullscreen"}},
+                )
+                fullscreen_applied = True
+        except Exception:
+            try:
+                cdp_call(
+                    ws_url,
+                    "Runtime.evaluate",
+                    {
+                        "expression": "document.documentElement.requestFullscreen().then(() => 'ok').catch((e) => String(e))",
+                        "awaitPromise": True,
+                        "returnByValue": True,
+                    },
+                )
+                fullscreen_applied = True
+            except Exception:
+                fullscreen_applied = False
+
+    # Keep rewriting the title after the page settles so Window Capture match stays stable.
+    try:
+        time.sleep(0.5)
+        cdp_call(
+            ws_url,
+            "Runtime.evaluate",
+            {
+                "expression": f"document.title = {json.dumps(VIEWER_WINDOW_TITLE)};",
+                "returnByValue": True,
+            },
+        )
+    except Exception:
+        pass
+
+    return {
+        "status": "ok",
+        "viewer_url": target_url,
+        "window_title": VIEWER_WINDOW_TITLE,
+        "target_id": VIEWER_TARGET_ID,
+        "fullscreen": fullscreen_applied,
+        "already_running": bool(start_result.get("already_running")),
+        "browser_path": start_result.get("browser_path"),
+        "profile_dir": start_result.get("profile_dir"),
+        "debug_port": start_result.get("debug_port") or AUTH_BROWSER_PORT,
+        "capture_hint": (
+            f'In OBS NOW PLAYING, set Window Capture to match window title "{VIEWER_WINDOW_TITLE}" '
+            "(exact / contains). Load Winner always reuses this same browser window."
+        ),
+    }
+
+
 def start_auth_browser(start_url: str | None = None) -> dict:
     global AUTH_BROWSER_PROCESS
     browser = browser_executable(prefer_brave=True)
@@ -1660,8 +1843,11 @@ class HelperHandler(BaseHTTPRequestHandler):
             if not submitted_url:
                 return json_response(self, 200, {"status": "error", "message": "No submitted URL was supplied."})
             viewer_url = build_viewer_url_with_clip(submitted_url, payload.get("clip_start_seconds"))
+            want_fullscreen = payload.get("fullscreen")
+            if want_fullscreen is None:
+                want_fullscreen = True
             try:
-                result = start_auth_browser(viewer_url)
+                result = prepare_viewer_window(viewer_url, fullscreen=bool(want_fullscreen))
             except Exception as exc:
                 return json_response(self, 200, {"status": "error", "message": str(exc)})
             return json_response(self, 200, {
