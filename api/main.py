@@ -329,6 +329,15 @@ PULSE_UNLIMITED_QUESTION_SUBMIT = os.getenv(
 ).strip().lower() in {"1", "true", "yes", "on"}
 PULSE_DAILY_QUESTION_LIMIT = 2
 PULSE_DAILY_REJECTION_REPLACEMENT_LIMIT = 1
+PULSE_MAX_QUESTION_LENGTH = 360
+
+
+def pulse_question_too_long(text: str) -> str | None:
+    if len(text) > PULSE_MAX_QUESTION_LENGTH:
+        return f"Pulse question must be {PULSE_MAX_QUESTION_LENGTH} characters or fewer."
+    return None
+
+
 PULSE_RETENTION_DAYS = max(
     7,
     int(os.getenv("PULSE_RETENTION_DAYS", "14" if LEAN_MODE else "30") or (14 if LEAN_MODE else 30)),
@@ -3182,6 +3191,9 @@ def apply_admin_pulse_question_action(
         text = (edited_question or "").strip()
         if not text:
             raise HTTPException(status_code=400, detail="Edited question text is required.")
+        too_long = pulse_question_too_long(text)
+        if too_long:
+            raise HTTPException(status_code=400, detail=too_long)
         entry["edited_question"] = text
         entry["status"] = "pending_review"
         entry["needs_admin_notify"] = True
@@ -3212,6 +3224,9 @@ def apply_admin_pulse_question_action(
             )
         text = (edited_question or "").strip()
         if text and text != (entry.get("question") or "").strip():
+            too_long = pulse_question_too_long(text)
+            if too_long:
+                raise HTTPException(status_code=400, detail=too_long)
             entry["edited_question"] = text
         apply_pulse_suggestion_schedule(entry, action, approve=True)
         ensure_single_red_slot(entry)
@@ -3240,6 +3255,9 @@ def create_admin_pulse_question(
         raise HTTPException(status_code=400, detail="Pool must be green or red.")
     if len(question) < 8:
         raise HTTPException(status_code=400, detail="Question must be at least 8 characters.")
+    too_long = pulse_question_too_long(question)
+    if too_long:
+        raise HTTPException(status_code=400, detail=too_long)
 
     schedule = normalize_pulse_schedule_mode(schedule_mode)
     if pool == "red" and schedule == "reserve":
@@ -8915,6 +8933,10 @@ def submit_pulse_question_suggestion(payload: PulseQuestionSuggestion):
     if len(question) < 8:
         print(f"[{now_iso()}] pulse question submit rejected: question too short", flush=True)
         return {"status": "error", "message": "Please add a little more detail before submitting your Pulse."}
+    too_long = pulse_question_too_long(question)
+    if too_long:
+        print(f"[{now_iso()}] pulse question submit rejected: question too long", flush=True)
+        return {"status": "error", "message": too_long}
 
     schedule_mode = normalize_pulse_schedule_mode(payload.schedule_mode) if payload.schedule_mode else None
     entry = {
