@@ -376,6 +376,22 @@ def now_iso() -> str:
     return datetime.datetime.utcnow().isoformat() + "Z"
 
 
+def parse_iso_utc(value) -> datetime.datetime | None:
+    """Parse API timestamps into naive UTC datetimes safe to compare with utcnow()."""
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    if raw.endswith("Z"):
+        raw = raw[:-1] + "+00:00"
+    try:
+        parsed = datetime.datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    if parsed.tzinfo is not None:
+        parsed = parsed.astimezone(datetime.timezone.utc).replace(tzinfo=None)
+    return parsed
+
+
 def runtime_state_payload() -> dict:
     payload = {
         "spotlight_entries": spotlight_entries,
@@ -7578,11 +7594,12 @@ def submit_stream_comment(comment: StreamComment):
             if str(c.get("user_id") or c.get("display_name") or "").strip() == user_identifier
         ]
         if recent_comments:
-            latest = sorted(recent_comments, key=lambda x: x["time"], reverse=True)[0]
-            latest_time = datetime.datetime.fromisoformat(latest["time"])
-            seconds_since = (datetime.datetime.utcnow() - latest_time).total_seconds()
-            if seconds_since < 4:
-                return {"status": "error", "message": "Please wait a moment before sending another comment."}
+            latest = sorted(recent_comments, key=lambda x: str(x.get("time") or ""), reverse=True)[0]
+            latest_time = parse_iso_utc(latest.get("time"))
+            if latest_time is not None:
+                seconds_since = (datetime.datetime.utcnow() - latest_time).total_seconds()
+                if seconds_since < 4:
+                    return {"status": "error", "message": "Please wait a moment before sending another comment."}
 
     feed_style = comment.feed_style if isinstance(comment.feed_style, dict) else None
     approved_comments.append(
