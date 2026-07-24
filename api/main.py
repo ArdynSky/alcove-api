@@ -5461,6 +5461,7 @@ def get_wheel_spin_pool(round_number: int):
         if entry.get("round_id") == round_number
         and entry_is_approved(entry)
         and not entry.get("played", False)
+        and not entry.get("reserved", False)
     ]
 
 
@@ -6141,10 +6142,30 @@ def start_spin():
     return {"status": "ok", "message": f"Round {current_round} spin started", "winner": current_winner}
 
 
+def move_unplayed_round_entries_to_reserve(round_number: int) -> int:
+    """Park pending/approved unplayed videos in Reserve when a round ends."""
+    moved = 0
+    stamped = now_iso()
+    for entry in wheel_entries:
+        if entry.get("round_id") != round_number:
+            continue
+        if entry.get("played", False):
+            continue
+        if entry.get("approval_status") not in {"pending", "approved"}:
+            continue
+        if entry.get("reserved"):
+            continue
+        entry["reserved"] = True
+        entry["reserved_at"] = stamped
+        moved += 1
+    return moved
+
+
 @app.post("/api/round/end")
 def end_round():
     global current_winner, current_now_playing
     current_round = state["current_round"]
+    reserved_count = move_unplayed_round_entries_to_reserve(current_round)
     state["round_status"] = "closed"
     state["winner_intro_loaded"] = False
     state["review_prompt_open"] = False
@@ -6154,11 +6175,18 @@ def end_round():
     current_now_playing = None
     video_reviews.clear()
     add_notification("system", f"Round {current_round} ended", True)
+    if reserved_count:
+        add_notification(
+            "system",
+            f"{reserved_count} unplayed video{'s' if reserved_count != 1 else ''} moved to Reserve",
+            False,
+        )
     state["current_round"] += 1
     wheel_submission_limits.clear()
     return {
         "status": "ok",
         "message": f"Round {current_round} ended. Round {state['current_round']} ready.",
+        "reserved_count": reserved_count,
     }
 
 
@@ -7021,6 +7049,8 @@ def submit_wheel(entry: WheelEntry):
         "approval_status": "pending",
         "approval_time": None,
         "rejection_time": None,
+        "reserved": False,
+        "reserved_at": None,
     }
 
     wheel_entries.append(new_entry)
@@ -7068,6 +7098,8 @@ def list_wheel_entries_host():
             "approval_status": entry.get("approval_status", "pending"),
             "approval_time": entry.get("approval_time"),
             "rejection_time": entry.get("rejection_time"),
+            "reserved": bool(entry.get("reserved")),
+            "reserved_at": entry.get("reserved_at"),
             "data": entry.get("data"),
         }
         for entry in wheel_entries
@@ -7077,6 +7109,50 @@ def list_wheel_entries_host():
 @app.get("/api/wheel-entries-archived")
 def list_archived_wheel_entries():
     return archived_wheel_entries
+
+
+@app.post("/api/wheel-entry/resubmit/{entry_id}")
+def resubmit_wheel_entry(entry_id: int):
+    """Put a Reserve entry back onto the current wheel round."""
+    for entry in wheel_entries:
+        if int(entry.get("id") or 0) != int(entry_id):
+            continue
+        if entry.get("played", False):
+            return {"status": "error", "message": "Played videos cannot be resubmitted to the wheel."}
+        entry["reserved"] = False
+        entry["reserved_at"] = None
+        entry["round_id"] = state["current_round"]
+        entry["approval_status"] = "approved"
+        if not entry.get("approval_time"):
+            entry["approval_time"] = now_iso()
+        if state["round_status"] == "closed":
+            state["round_status"] = "locked"
+        ws_broadcast_bundle()
+        return {
+            "status": "ok",
+            "entry_id": entry_id,
+            "round_id": entry["round_id"],
+            "message": "Entry returned to the current wheel.",
+        }
+    return {"status": "error", "message": "Entry not found."}
+
+
+@app.post("/api/wheel-entry/delete/{entry_id}")
+def delete_wheel_entry(entry_id: int):
+    """Remove an entry completely without archiving it."""
+    global current_winner, current_now_playing
+    for i, entry in enumerate(wheel_entries):
+        if int(entry.get("id") or 0) != int(entry_id):
+            continue
+        if current_now_playing and int(current_now_playing.get("id") or 0) == int(entry_id):
+            current_now_playing = None
+            video_reviews.clear()
+        if current_winner and int(current_winner.get("entry_id") or 0) == int(entry_id):
+            current_winner = None
+        del wheel_entries[i]
+        ws_broadcast_bundle()
+        return {"status": "ok", "entry_id": entry_id, "message": "Entry deleted."}
+    return {"status": "error", "message": "Entry not found."}
 
 
 @app.get("/api/current-round-ready-entries")
