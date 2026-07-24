@@ -7554,11 +7554,24 @@ def submit_review(review: VideoReview):
     current_data = current_now_playing["data"]
     video_title = current_data.get("video_title", "") or "No video title set yet"
     chosen_by = current_data.get("display_name", "") or "Unknown"
+    video_entry_id = current_now_playing.get("id")
+
+    # One review per viewer per video — blocks refresh re-submits.
+    reviewer_id = review.user_id
+    if reviewer_id is not None and video_entry_id is not None:
+        for existing in video_reviews:
+            if int(existing.get("video_entry_id") or 0) != int(video_entry_id):
+                continue
+            if int(existing.get("user_id") or 0) == int(reviewer_id):
+                return {
+                    "status": "error",
+                    "message": "You already submitted a review for this video.",
+                }
 
     real_display_name = (review.display_name or "").strip() or "Unknown"
     reviewer_name = "Anonymous" if review.anonymous else real_display_name
     review_record = {
-        "video_entry_id": current_now_playing.get("id"),
+        "video_entry_id": video_entry_id,
         "video_title": video_title,
         "chosen_by": chosen_by,
         "rating": review.rating,
