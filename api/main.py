@@ -17,6 +17,7 @@ import io
 import json
 import random
 import sqlite3
+import threading
 import uuid
 import zipfile
 from html import escape
@@ -263,6 +264,7 @@ archived_wheel_entries = []
 asmr_entries = []
 story_entries = []
 spotlight_entries = []
+spotlight_submit_lock = threading.Lock()
 pulse_entries = []
 pulse_receipts = []
 pulse_red_activations = []
@@ -4430,6 +4432,10 @@ def spotlight_today_exists(nominator_user_id=None, nominator_username=None):
     return False
 
 
+def next_spotlight_id() -> int:
+    return max((int(entry.get("id") or 0) for entry in spotlight_entries), default=0) + 1
+
+
 def get_spotlight_entry(entry_id: int):
     for entry in spotlight_entries:
         if int(entry.get("id") or 0) == int(entry_id):
@@ -6860,29 +6866,35 @@ def admin_pulse_question_action(suggestion_id: int, payload: AdminPulseQuestionA
 @app.post("/api/admin/spotlights/{entry_id}")
 def admin_spotlight_action(entry_id: int, payload: AdminSpotlightAction):
     verify_admin_secret(payload.admin_secret)
-    entry = get_spotlight_entry(entry_id)
-    if not entry:
-        return {"status": "error", "message": "Spotlight not found."}
-    action = (payload.action or "").strip().lower()
-    if action == "amend":
-        text = (payload.edited_reason or "").strip()
-        if not text:
-            raise HTTPException(status_code=400, detail="Edited Spotlight text is required.")
-        entry["edited_reason"] = text
-        entry["status"] = "pending_review"
-        entry["review_message_sent"] = False
-    elif action == "reject":
-        entry["status"] = "rejected"
-        entry["reviewed_at"] = now_iso()
-        entry["publish_pending"] = False
-    elif action == "approve":
-        entry["status"] = "approved"
-        entry["reviewed_at"] = now_iso()
-        entry["publish_pending"] = True
-    else:
-        raise HTTPException(status_code=400, detail="Unknown Spotlight action.")
-    save_runtime_state()
-    return {"status": "ok", "entry": entry}
+    with spotlight_submit_lock:
+        entry = get_spotlight_entry(entry_id)
+        if not entry:
+            return {"status": "error", "message": "Spotlight not found."}
+        action = (payload.action or "").strip().lower()
+        current_status = (entry.get("status") or "").strip().lower()
+        if action == "amend":
+            text = (payload.edited_reason or "").strip()
+            if not text:
+                raise HTTPException(status_code=400, detail="Edited Spotlight text is required.")
+            entry["edited_reason"] = text
+            entry["status"] = "pending_review"
+            entry["review_message_sent"] = False
+        elif action == "reject":
+            if current_status == "approved" and entry.get("published_at"):
+                return {"status": "error", "message": "Spotlight is already approved and published.", "entry": entry}
+            entry["status"] = "rejected"
+            entry["reviewed_at"] = now_iso()
+            entry["publish_pending"] = False
+        elif action == "approve":
+            if current_status == "approved":
+                return {"status": "ok", "entry": entry, "already_done": True}
+            entry["status"] = "approved"
+            entry["reviewed_at"] = now_iso()
+            entry["publish_pending"] = True
+        else:
+            raise HTTPException(status_code=400, detail="Unknown Spotlight action.")
+        save_runtime_state()
+        return {"status": "ok", "entry": entry}
 
 
 @app.post("/api/admin/verify-all-group-members")
@@ -8806,41 +8818,43 @@ def submit_spotlight(entry: SpotlightEntry):
         )
         return {"status": "error", "message": "You cannot nominate yourself."}
 
-    if spotlight_today_exists(entry.nominator_user_id, entry.nominator_username):
-        print(
-            f"[{now_iso()}] spotlight submit rejected: already submitted today "
-            f"nominator_user_id={entry.nominator_user_id} nominator_username={entry.nominator_username!r}",
-            flush=True,
-        )
-        return {"status": "error", "message": "You have already submitted a Spotlight today."}
+    with spotlight_submit_lock:
+        if spotlight_today_exists(entry.nominator_user_id, entry.nominator_username):
+            print(
+                f"[{now_iso()}] spotlight submit rejected: already submitted today "
+                f"nominator_user_id={entry.nominator_user_id} nominator_username={entry.nominator_username!r}",
+                flush=True,
+            )
+            return {"status": "error", "message": "You have already submitted a Spotlight today."}
 
-    data = entry.dict()
-    data["id"] = len(spotlight_entries) + 1
-    data["time"] = now_iso()
-    data["day_key"] = pulse_day_key()
-    data["status"] = "pending_review"
-    data["edited_reason"] = None
-    data["review_message_sent"] = False
-    data["reviewed_by"] = None
-    data["reviewed_at"] = None
-    data["publish_pending"] = False
-    data["published_at"] = None
-    data["nominee_user_id"] = nominee.get("user_id")
-    data["nominee_username"] = nominee.get("username")
-    data["nominee_display_name"] = nominee.get("display_name") or nominee.get("label")
-    if nominator:
-        data["nominator_user_id"] = nominator.get("user_id")
-        data["nominator_username"] = nominator.get("username")
-        data["nominator_display_name"] = nominator.get("display_name") or nominator.get("label")
-    else:
-        data["nominator_user_id"] = entry.nominator_user_id
-        data["nominator_username"] = (entry.nominator_username or "").lstrip("@") or None
-        data["nominator_display_name"] = (
-            entry.nominator_display_name
-            or (f"@{entry.nominator_username.lstrip('@')}" if entry.nominator_username else None)
-        )
-    spotlight_entries.append(data)
-    save_runtime_state()
+        data = entry.dict()
+        data["id"] = next_spotlight_id()
+        data["time"] = now_iso()
+        data["day_key"] = pulse_day_key()
+        data["status"] = "pending_review"
+        data["edited_reason"] = None
+        data["review_message_sent"] = False
+        data["reviewed_by"] = None
+        data["reviewed_at"] = None
+        data["publish_pending"] = False
+        data["published_at"] = None
+        data["nominee_user_id"] = nominee.get("user_id")
+        data["nominee_username"] = nominee.get("username")
+        data["nominee_display_name"] = nominee.get("display_name") or nominee.get("label")
+        if nominator:
+            data["nominator_user_id"] = nominator.get("user_id")
+            data["nominator_username"] = nominator.get("username")
+            data["nominator_display_name"] = nominator.get("display_name") or nominator.get("label")
+        else:
+            data["nominator_user_id"] = entry.nominator_user_id
+            data["nominator_username"] = (entry.nominator_username or "").lstrip("@") or None
+            data["nominator_display_name"] = (
+                entry.nominator_display_name
+                or (f"@{entry.nominator_username.lstrip('@')}" if entry.nominator_username else None)
+            )
+        spotlight_entries.append(data)
+        save_runtime_state()
+
     telegram_admin_notify(
         "\n".join([
             "<b>New Spotlight submitted</b>",
@@ -8907,31 +8921,66 @@ def bot_publish_pending_spotlights(x_bot_sync_secret: str | None = Header(defaul
 @app.post("/api/bot-sync/spotlights/{entry_id}")
 def bot_update_spotlight(entry_id: int, payload: SpotlightReviewUpdate, x_bot_sync_secret: str | None = Header(default=None)):
     verify_bot_sync_secret(x_bot_sync_secret)
-    entry = get_spotlight_entry(entry_id)
-    if not entry:
-        return {"status": "error", "message": "Spotlight not found"}
+    with spotlight_submit_lock:
+        entry = get_spotlight_entry(entry_id)
+        if not entry:
+            return {"status": "error", "message": "Spotlight not found"}
 
-    if payload.status is not None:
-        entry["status"] = payload.status
-    if payload.edited_reason is not None:
-        entry["edited_reason"] = payload.edited_reason
-    if payload.review_message_sent is not None:
-        entry["review_message_sent"] = payload.review_message_sent
-    if payload.reviewed_by is not None:
-        entry["reviewed_by"] = payload.reviewed_by
-    if payload.reviewed_at is not None:
-        entry["reviewed_at"] = payload.reviewed_at
-    if payload.publish_pending is not None:
-        entry["publish_pending"] = bool(payload.publish_pending)
-    if payload.published_at is not None:
-        entry["published_at"] = payload.published_at
-    if payload.status == "approved" and not entry.get("published_at"):
-        entry["publish_pending"] = True
-    if entry.get("published_at") and entry.get("status") == "approved":
-        archive_published_spotlight(entry)
-    save_runtime_state()
+        if payload.status is not None:
+            current_status = (entry.get("status") or "").strip().lower()
+            next_status = (payload.status or "").strip().lower()
+            if current_status in {"approved", "rejected"} and next_status and next_status != current_status:
+                return {
+                    "status": "error",
+                    "message": f"Spotlight is already {current_status}.",
+                    "entry": entry,
+                }
+            if current_status == "approved" and next_status == "approved" and entry.get("published_at"):
+                return {"status": "ok", "entry": entry, "already_done": True}
+            entry["status"] = payload.status
+        if payload.edited_reason is not None:
+            entry["edited_reason"] = payload.edited_reason
+        if payload.review_message_sent is not None:
+            requested_sent = bool(payload.review_message_sent)
+            if requested_sent and entry.get("review_message_sent"):
+                return {"status": "ok", "entry": entry, "already_done": True}
+            entry["review_message_sent"] = requested_sent
+        if payload.reviewed_by is not None:
+            entry["reviewed_by"] = payload.reviewed_by
+        if payload.reviewed_at is not None:
+            entry["reviewed_at"] = payload.reviewed_at
 
-    return {"status": "ok", "entry": entry}
+        claimed_publish = None
+        if payload.publish_pending is not None:
+            requested_pending = bool(payload.publish_pending)
+            # Atomic claim: first writer to clear publish_pending wins the publish slot.
+            if (
+                requested_pending is False
+                and payload.published_at is None
+                and payload.status is None
+            ):
+                if entry.get("published_at"):
+                    return {"status": "ok", "entry": entry, "already_done": True, "claimed": False}
+                if not entry.get("publish_pending"):
+                    return {"status": "ok", "entry": entry, "already_done": True, "claimed": False}
+                entry["publish_pending"] = False
+                claimed_publish = True
+            else:
+                entry["publish_pending"] = requested_pending
+
+        if payload.published_at is not None:
+            entry["published_at"] = payload.published_at
+        if payload.status == "approved" and not entry.get("published_at"):
+            entry["publish_pending"] = True
+        if entry.get("published_at") and entry.get("status") == "approved":
+            entry["publish_pending"] = False
+            archive_published_spotlight(entry)
+        save_runtime_state()
+
+        result = {"status": "ok", "entry": entry}
+        if claimed_publish is not None:
+            result["claimed"] = claimed_publish
+        return result
 
 
 @app.get("/api/pulse-questions")
