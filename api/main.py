@@ -152,6 +152,16 @@ STATE_DB_PATH = os.getenv(
 )
 
 ROOM_MEDIA_DIR = os.path.join(_PERSISTENT_DATA_DIR, "room-media")
+REWARD_ASSETS_DIR = os.getenv(
+    "REWARD_ASSETS_DIR",
+    os.path.join(_PERSISTENT_DATA_DIR, "reward-assets"),
+)
+REWARD_ASSETS_MANIFEST_PATH = os.getenv(
+    "REWARD_ASSETS_MANIFEST_PATH",
+    os.path.join(_PERSISTENT_DATA_DIR, "reward_assets.json"),
+)
+REWARD_ASSET_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
+REWARD_ASSET_MAX_BYTES = 5 * 1024 * 1024
 LIVE_ROOM_STATE_PATH = os.getenv(
     "ALCOVE_LIVE_ROOM_STATE_PATH",
     os.path.join(_PERSISTENT_DATA_DIR, "live_room_state.json"),
@@ -160,7 +170,7 @@ ROOM_MEDIA_ALLOWED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".mp4", ".mov
 ROOM_MEDIA_MAX_BYTES = 100 * 1024 * 1024
 ROOM_DISCUSSION_DURATIONS = {5, 10, 20, 30, 45, 60}
 
-for path in [DOWNLOADS_DIR, READY_DIR, ARCHIVE_DIR, PLAYOUT_DIR, ROOM_MEDIA_DIR]:
+for path in [DOWNLOADS_DIR, READY_DIR, ARCHIVE_DIR, PLAYOUT_DIR, ROOM_MEDIA_DIR, REWARD_ASSETS_DIR]:
     os.makedirs(path, exist_ok=True)
 
 
@@ -3177,6 +3187,46 @@ def verify_bot_sync_secret(x_bot_sync_secret: str | None):
 
 def verify_admin_secret(admin_secret: str | None):
     verify_bot_sync_secret(admin_secret)
+
+
+def load_reward_assets_manifest() -> dict:
+    try:
+        if os.path.exists(REWARD_ASSETS_MANIFEST_PATH):
+            with open(REWARD_ASSETS_MANIFEST_PATH, "r", encoding="utf-8") as handle:
+                data = json.load(handle)
+                if isinstance(data, dict):
+                    return data
+    except Exception:
+        pass
+    return {"assets": []}
+
+
+def save_reward_assets_manifest(data: dict) -> None:
+    directory = os.path.dirname(REWARD_ASSETS_MANIFEST_PATH)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    with open(REWARD_ASSETS_MANIFEST_PATH, "w", encoding="utf-8") as handle:
+        json.dump(data, handle, indent=2)
+
+
+def sanitize_reward_asset_stem(original_name: str) -> str:
+    stem = Path(original_name or "reward").stem
+    cleaned = re.sub(r"[^a-zA-Z0-9_-]+", "-", stem).strip("-_").lower()
+    return (cleaned or "reward")[:48]
+
+
+def reward_asset_public_url(filename: str) -> str:
+    return f"/api/reward-assets/{filename}"
+
+
+def resolve_reward_asset_file(filename: str) -> str:
+    name = Path(filename or "").name
+    if not name or name != filename or ".." in name:
+        raise ValueError("Invalid filename")
+    path = os.path.join(REWARD_ASSETS_DIR, name)
+    if not os.path.isfile(path):
+        raise FileNotFoundError(name)
+    return path
 
 
 def telegram_admin_notify(text: str, topic_id: int | None = None) -> bool:
@@ -6838,6 +6888,94 @@ def admin_fox_banner_delete(banner_id: str, admin_secret: str):
         raise HTTPException(status_code=404, detail="Banner not found")
     fox_messages_store.save_fox_messages_state(state)
     return {"status": "ok", **fox_messages_store.admin_payload(state)}
+
+
+@app.get("/api/reward-assets/{filename}")
+def public_reward_asset_file(filename: str):
+    try:
+        file_path = resolve_reward_asset_file(filename)
+    except (ValueError, FileNotFoundError):
+        raise HTTPException(status_code=404, detail="Reward asset not found")
+    media_type = "image/png"
+    lower = filename.lower()
+    if lower.endswith((".jpg", ".jpeg")):
+        media_type = "image/jpeg"
+    elif lower.endswith(".webp"):
+        media_type = "image/webp"
+    elif lower.endswith(".gif"):
+        media_type = "image/gif"
+    return FileResponse(file_path, media_type=media_type)
+
+
+@app.get("/api/admin/reward-assets")
+def admin_list_reward_assets(admin_secret: str):
+    verify_admin_secret(admin_secret)
+    manifest = load_reward_assets_manifest()
+    assets = list(reversed(manifest.get("assets") or []))
+    return {"status": "ok", "assets": assets}
+
+
+@app.post("/api/admin/reward-assets/upload")
+async def admin_reward_asset_upload(
+    admin_secret: str = Form(...),
+    file: UploadFile = File(...),
+    label: str = Form(""),
+    kind: str = Form("icon"),
+):
+    verify_admin_secret(admin_secret)
+    content = await file.read()
+    if not content:
+        raise HTTPException(status_code=400, detail="Empty file")
+    if len(content) > REWARD_ASSET_MAX_BYTES:
+        raise HTTPException(status_code=400, detail="File too large (max 5 MB)")
+    ext = Path(file.filename or "icon.png").suffix.lower()
+    if ext not in REWARD_ASSET_EXTENSIONS:
+        raise HTTPException(status_code=400, detail="Use PNG, JPEG, WebP, or GIF")
+    stem = sanitize_reward_asset_stem(file.filename or label or "reward")
+    filename = f"{stem}-{uuid.uuid4().hex[:8]}{ext}"
+    file_path = os.path.join(REWARD_ASSETS_DIR, filename)
+    with open(file_path, "wb") as handle:
+        handle.write(content)
+    entry = {
+        "id": uuid.uuid4().hex[:12],
+        "filename": filename,
+        "label": str(label or stem).strip()[:80] or filename,
+        "kind": str(kind or "icon").strip().lower()[:32] or "icon",
+        "url": reward_asset_public_url(filename),
+        "uploaded_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "size_bytes": len(content),
+    }
+    manifest = load_reward_assets_manifest()
+    assets = list(manifest.get("assets") or [])
+    assets.append(entry)
+    manifest["assets"] = assets[-200:]
+    save_reward_assets_manifest(manifest)
+    return {"status": "ok", "asset": entry, "assets": list(reversed(manifest["assets"]))}
+
+
+@app.delete("/api/admin/reward-assets/{asset_id}")
+def admin_reward_asset_delete(asset_id: str, admin_secret: str):
+    verify_admin_secret(admin_secret)
+    manifest = load_reward_assets_manifest()
+    assets = list(manifest.get("assets") or [])
+    kept = []
+    deleted = None
+    for entry in assets:
+        if entry.get("id") == asset_id:
+            deleted = entry
+            filename = str(entry.get("filename") or "").strip()
+            if filename:
+                try:
+                    os.remove(os.path.join(REWARD_ASSETS_DIR, Path(filename).name))
+                except OSError:
+                    pass
+            continue
+        kept.append(entry)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Asset not found")
+    manifest["assets"] = kept
+    save_reward_assets_manifest(manifest)
+    return {"status": "ok", "assets": list(reversed(kept))}
 
 
 @app.get("/api/bot-sync/fox-banners/{filename}")
