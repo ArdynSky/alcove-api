@@ -160,6 +160,10 @@ REWARD_ASSETS_MANIFEST_PATH = os.getenv(
     "REWARD_ASSETS_MANIFEST_PATH",
     os.path.join(_PERSISTENT_DATA_DIR, "reward_assets.json"),
 )
+REWARD_CATALOG_PATH = os.getenv(
+    "REWARD_CATALOG_PATH",
+    os.path.join(_PERSISTENT_DATA_DIR, "reward_catalog.json"),
+)
 REWARD_ASSET_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
 REWARD_ASSET_MAX_BYTES = 5 * 1024 * 1024
 LIVE_ROOM_STATE_PATH = os.getenv(
@@ -2280,6 +2284,12 @@ class FeatureFlagsUpdate(BaseModel):
     admin_secret: str | None = None
 
 
+class RewardCatalogUpdate(BaseModel):
+    admin_secret: str
+    level_packs: dict[str, dict] | None = None
+    achievements: list[dict] | None = None
+
+
 class AdminSecretQuery(BaseModel):
     admin_secret: str
 
@@ -3227,6 +3237,132 @@ def resolve_reward_asset_file(filename: str) -> str:
     if not os.path.isfile(path):
         raise FileNotFoundError(name)
     return path
+
+
+def _normalize_reward_pack_item(item) -> dict | None:
+    if not isinstance(item, dict):
+        return None
+    item_id = str(item.get("id") or "").strip()
+    item_type = str(item.get("type") or "").strip().lower()
+    if not item_id or not item_type:
+        return None
+    entry = {
+        "type": item_type,
+        "id": item_id,
+    }
+    name = str(item.get("name") or item.get("label") or "").strip()
+    if name:
+        entry["name"] = name
+    image = str(item.get("image") or item.get("icon") or item.get("src") or "").strip()
+    if image:
+        entry["image"] = image
+    swatch = str(item.get("swatch") or "").strip()
+    if swatch:
+        entry["swatch"] = swatch
+    return entry
+
+
+def normalize_level_packs(raw) -> dict:
+    if not isinstance(raw, dict):
+        return {}
+    packs: dict[str, dict] = {}
+    for key, value in raw.items():
+        if not isinstance(value, dict):
+            continue
+        pack_key = str(key or "").strip()
+        if not pack_key:
+            continue
+        if not pack_key.startswith("level_"):
+            level_num = str(value.get("level") or "").strip()
+            if level_num.isdigit():
+                pack_key = f"level_{level_num}"
+            else:
+                continue
+        level_part = pack_key.replace("level_", "", 1)
+        if not level_part.isdigit():
+            continue
+        items = []
+        for item in value.get("items") or []:
+            normalized = _normalize_reward_pack_item(item)
+            if normalized:
+                items.append(normalized)
+        packs[pack_key] = {
+            "id": str(value.get("id") or pack_key).strip() or pack_key,
+            "title": str(value.get("title") or f"Level {level_part} Pack").strip(),
+            "copy": str(value.get("copy") or "").strip(),
+            "image": str(value.get("image") or "").strip(),
+            "items": items,
+        }
+    return packs
+
+
+def normalize_reward_achievements(raw) -> list[dict]:
+    if not isinstance(raw, list):
+        return []
+    achievements: list[dict] = []
+    for entry in raw:
+        if not isinstance(entry, dict):
+            continue
+        items = []
+        for item in entry.get("items") or []:
+            normalized = _normalize_reward_pack_item(item)
+            if normalized:
+                items.append(normalized)
+        achievements.append(
+            {
+                "id": str(entry.get("id") or "").strip(),
+                "name": str(entry.get("name") or "").strip(),
+                "description": str(entry.get("description") or "").strip(),
+                "condition": str(entry.get("condition") or "").strip(),
+                "icon": str(entry.get("icon") or "").strip(),
+                "boxArt": str(entry.get("boxArt") or entry.get("box_art") or "").strip(),
+                "profileId": str(entry.get("profileId") or entry.get("profile_id") or "").strip(),
+                "packTitle": str(entry.get("packTitle") or entry.get("pack_title") or "").strip(),
+                "packCopy": str(entry.get("packCopy") or entry.get("pack_copy") or "").strip(),
+                "items": items,
+            }
+        )
+    return achievements
+
+
+def empty_reward_catalog() -> dict:
+    return {
+        "level_packs": {},
+        "achievements": [],
+        "updated_at": None,
+    }
+
+
+def load_reward_catalog() -> dict:
+    catalog = empty_reward_catalog()
+    try:
+        if os.path.exists(REWARD_CATALOG_PATH):
+            with open(REWARD_CATALOG_PATH, "r", encoding="utf-8") as handle:
+                data = json.load(handle)
+                if isinstance(data, dict):
+                    catalog["level_packs"] = normalize_level_packs(data.get("level_packs"))
+                    catalog["achievements"] = normalize_reward_achievements(
+                        data.get("achievements")
+                    )
+                    updated = data.get("updated_at")
+                    catalog["updated_at"] = str(updated).strip() if updated else None
+    except Exception:
+        pass
+    return catalog
+
+
+def save_reward_catalog(catalog: dict) -> dict:
+    payload = {
+        "level_packs": normalize_level_packs(catalog.get("level_packs")),
+        "achievements": normalize_reward_achievements(catalog.get("achievements")),
+        "updated_at": now_iso(),
+    }
+    directory = os.path.dirname(REWARD_CATALOG_PATH)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    with open(REWARD_CATALOG_PATH, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2)
+    return payload
 
 
 def telegram_admin_notify(text: str, topic_id: int | None = None) -> bool:
@@ -6888,6 +7024,24 @@ def admin_fox_banner_delete(banner_id: str, admin_secret: str):
         raise HTTPException(status_code=404, detail="Banner not found")
     fox_messages_store.save_fox_messages_state(state)
     return {"status": "ok", **fox_messages_store.admin_payload(state)}
+
+
+@app.get("/api/reward-catalog")
+def get_reward_catalog():
+    catalog = load_reward_catalog()
+    return {"status": "ok", **catalog}
+
+
+@app.post("/api/admin/reward-catalog")
+def admin_update_reward_catalog(payload: RewardCatalogUpdate):
+    verify_admin_secret(payload.admin_secret)
+    current = load_reward_catalog()
+    if payload.level_packs is not None:
+        current["level_packs"] = normalize_level_packs(payload.level_packs)
+    if payload.achievements is not None:
+        current["achievements"] = normalize_reward_achievements(payload.achievements)
+    saved = save_reward_catalog(current)
+    return {"status": "ok", **saved}
 
 
 @app.get("/api/reward-assets/{filename}")
