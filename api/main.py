@@ -3296,11 +3296,18 @@ def normalize_level_packs(raw) -> dict:
     return packs
 
 
+def _slugify_achievement_id(value: str, fallback: str = "achievement") -> str:
+    cleaned = re.sub(r"[^a-zA-Z0-9]+", "_", str(value or "").strip().lower())
+    cleaned = re.sub(r"_+", "_", cleaned).strip("_")
+    return cleaned or fallback
+
+
 def normalize_reward_achievements(raw) -> list[dict]:
     if not isinstance(raw, list):
         return []
     achievements: list[dict] = []
-    for entry in raw:
+    used_ids: set[str] = set()
+    for index, entry in enumerate(raw):
         if not isinstance(entry, dict):
             continue
         items = []
@@ -3308,17 +3315,43 @@ def normalize_reward_achievements(raw) -> list[dict]:
             normalized = _normalize_reward_pack_item(item)
             if normalized:
                 items.append(normalized)
+        name = str(entry.get("name") or "").strip()
+        profile_id = str(entry.get("profileId") or entry.get("profile_id") or "").strip()
+        ach_id = str(entry.get("id") or "").strip()
+        if not ach_id:
+            ach_id = _slugify_achievement_id(profile_id or name or f"achievement_{index + 1}")
+        # Keep ids unique within the published catalog.
+        base_id = ach_id
+        suffix = 2
+        while ach_id in used_ids:
+            ach_id = f"{base_id}_{suffix}"
+            suffix += 1
+        used_ids.add(ach_id)
+
+        target_raw = entry.get("target")
+        try:
+            target = int(target_raw) if target_raw not in (None, "") else 0
+        except (TypeError, ValueError):
+            target = 0
+
         achievements.append(
             {
-                "id": str(entry.get("id") or "").strip(),
-                "name": str(entry.get("name") or "").strip(),
+                "id": ach_id,
+                "name": name,
+                "shortName": str(entry.get("shortName") or entry.get("short_name") or name).strip(),
                 "description": str(entry.get("description") or "").strip(),
                 "condition": str(entry.get("condition") or "").strip(),
+                "stat": str(entry.get("stat") or "").strip(),
+                "target": max(0, target),
+                "trophyColor": str(entry.get("trophyColor") or entry.get("trophy_color") or "").strip(),
+                "progressVerb": str(entry.get("progressVerb") or entry.get("progress_verb") or "").strip(),
                 "icon": str(entry.get("icon") or "").strip(),
                 "boxArt": str(entry.get("boxArt") or entry.get("box_art") or "").strip(),
-                "profileId": str(entry.get("profileId") or entry.get("profile_id") or "").strip(),
+                "profileId": profile_id,
                 "packTitle": str(entry.get("packTitle") or entry.get("pack_title") or "").strip(),
                 "packCopy": str(entry.get("packCopy") or entry.get("pack_copy") or "").strip(),
+                "prize": str(entry.get("prize") or "").strip(),
+                "prizeLabel": str(entry.get("prizeLabel") or entry.get("prize_label") or "").strip(),
                 "items": items,
             }
         )
