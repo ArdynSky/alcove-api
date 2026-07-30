@@ -4479,12 +4479,76 @@ def get_spotlight_entry(entry_id: int):
     return None
 
 
+def spotlight_awards_for_user(user_id=None, username=None):
+    """Published Spotlight awards for this resident (nominee), newest first."""
+    viewer = archive_viewer_identity(user_id, username)
+    awards = []
+    seen = set()
+
+    try:
+        archived = query_spotlight_archive(
+            mine="awarded",
+            viewer_user_id=viewer.get("user_id"),
+            viewer_username=viewer.get("username"),
+            page=1,
+            limit=50,
+            sort="date_desc",
+        )
+    except Exception:
+        archived = {"entries": []}
+
+    for entry in archived.get("entries") or []:
+        sid = entry.get("spotlight_id")
+        if sid is None or sid in seen:
+            continue
+        seen.add(sid)
+        awards.append(
+            {
+                "spotlight_id": sid,
+                "published_at": entry.get("published_at"),
+                "style": entry.get("style"),
+                "day_key": entry.get("day_key"),
+                "nominee_display_name": entry.get("nominee_display_name") or entry.get("nominee_username"),
+                "nominator_display_name": entry.get("nominator_display_name") or entry.get("nominator_username"),
+            }
+        )
+
+    # Also include live published entries (covers brief window before archive sync).
+    for entry in spotlight_entries:
+        if entry.get("status") != "approved" or not entry.get("published_at"):
+            continue
+        nominee = {
+            "user_id": entry.get("nominee_user_id"),
+            "username": entry.get("nominee_username"),
+        }
+        if not pulse_identities_match(viewer, nominee):
+            continue
+        sid = entry.get("id")
+        if sid is None or sid in seen:
+            continue
+        seen.add(sid)
+        awards.append(
+            {
+                "spotlight_id": sid,
+                "published_at": entry.get("published_at"),
+                "style": entry.get("style"),
+                "day_key": entry.get("day_key"),
+                "nominee_display_name": entry.get("nominee_display_name") or entry.get("nominee_username"),
+                "nominator_display_name": entry.get("nominator_display_name") or entry.get("nominator_username"),
+            }
+        )
+
+    awards.sort(key=lambda row: str(row.get("published_at") or ""), reverse=True)
+    return awards
+
+
 def spotlight_status_payload(nominator_user_id=None, nominator_username=None):
     submitted = spotlight_today_exists(nominator_user_id, nominator_username)
     return {
         "submitted_today": submitted,
         "reset_seconds": seconds_until_next_uk_midnight(),
         "reset_label": "midnight UK time",
+        "awards": spotlight_awards_for_user(nominator_user_id, nominator_username),
     }
 
 
