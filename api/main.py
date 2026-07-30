@@ -2266,6 +2266,7 @@ class SpotlightReviewUpdate(BaseModel):
 class FeatureFlagsUpdate(BaseModel):
     pages: dict[str, bool] | None = None
     wellbeing: dict[str, bool] | None = None
+    tester_usernames: list[str] | None = None
     admin_secret: str | None = None
 
 
@@ -3547,26 +3548,67 @@ def merged_feature_flags(saved: dict | None = None) -> dict:
     return flags
 
 
-def load_feature_flags() -> dict:
-    saved = None
+def load_feature_flags_raw() -> dict:
     if os.path.exists(FEATURE_FLAGS_PATH):
         try:
             with open(FEATURE_FLAGS_PATH, "r", encoding="utf-8") as handle:
                 saved = json.load(handle)
+                if isinstance(saved, dict):
+                    return saved
         except (OSError, json.JSONDecodeError):
-            saved = None
+            pass
+    return {}
+
+
+def normalize_tester_usernames(values) -> list[str]:
+    if not isinstance(values, list):
+        return []
+    seen: set[str] = set()
+    result: list[str] = []
+    for value in values:
+        username = str(value or "").strip().lstrip("@").lower()
+        if username and username not in seen:
+            seen.add(username)
+            result.append(username)
+    return sorted(result)
+
+
+def load_tester_usernames() -> list[str]:
+    return normalize_tester_usernames(load_feature_flags_raw().get("tester_usernames"))
+
+
+def load_feature_flags() -> dict:
+    saved = load_feature_flags_raw()
     flags = merged_feature_flags(saved)
-    if flags != saved:
+    saved_pages = saved.get("pages") if isinstance(saved.get("pages"), dict) else None
+    saved_wellbeing = saved.get("wellbeing") if isinstance(saved.get("wellbeing"), dict) else None
+    needs_save = (
+        not isinstance(saved.get("pages"), dict)
+        or not isinstance(saved.get("wellbeing"), dict)
+        or saved_pages != flags.get("pages")
+        or saved_wellbeing != flags.get("wellbeing")
+    )
+    if needs_save:
         save_feature_flags(flags)
     return flags
 
 
-def save_feature_flags(flags: dict) -> None:
+def save_feature_flags(flags: dict, tester_usernames: list[str] | None = None) -> None:
+    raw = load_feature_flags_raw()
+    payload = {
+        group: flags[group]
+        for group in DEFAULT_FEATURE_FLAGS
+        if group in flags
+    }
+    if tester_usernames is not None:
+        payload["tester_usernames"] = normalize_tester_usernames(tester_usernames)
+    elif "tester_usernames" in raw:
+        payload["tester_usernames"] = normalize_tester_usernames(raw.get("tester_usernames"))
     directory = os.path.dirname(FEATURE_FLAGS_PATH)
     if directory:
         os.makedirs(directory, exist_ok=True)
     with open(FEATURE_FLAGS_PATH, "w", encoding="utf-8") as handle:
-        json.dump(flags, handle, indent=2, sort_keys=True)
+        json.dump(payload, handle, indent=2, sort_keys=True)
 
 
 DEFAULT_SAFETY_SETTINGS = {
@@ -4443,12 +4485,76 @@ def get_spotlight_entry(entry_id: int):
     return None
 
 
+def spotlight_awards_for_user(user_id=None, username=None):
+    """Published Spotlight awards for this resident (nominee), newest first."""
+    viewer = archive_viewer_identity(user_id, username)
+    awards = []
+    seen = set()
+
+    try:
+        archived = query_spotlight_archive(
+            mine="awarded",
+            viewer_user_id=viewer.get("user_id"),
+            viewer_username=viewer.get("username"),
+            page=1,
+            limit=50,
+            sort="date_desc",
+        )
+    except Exception:
+        archived = {"entries": []}
+
+    for entry in archived.get("entries") or []:
+        sid = entry.get("spotlight_id")
+        if sid is None or sid in seen:
+            continue
+        seen.add(sid)
+        awards.append(
+            {
+                "spotlight_id": sid,
+                "published_at": entry.get("published_at"),
+                "style": entry.get("style"),
+                "day_key": entry.get("day_key"),
+                "nominee_display_name": entry.get("nominee_display_name") or entry.get("nominee_username"),
+                "nominator_display_name": entry.get("nominator_display_name") or entry.get("nominator_username"),
+            }
+        )
+
+    # Also include live published entries (covers brief window before archive sync).
+    for entry in spotlight_entries:
+        if entry.get("status") != "approved" or not entry.get("published_at"):
+            continue
+        nominee = {
+            "user_id": entry.get("nominee_user_id"),
+            "username": entry.get("nominee_username"),
+        }
+        if not pulse_identities_match(viewer, nominee):
+            continue
+        sid = entry.get("id")
+        if sid is None or sid in seen:
+            continue
+        seen.add(sid)
+        awards.append(
+            {
+                "spotlight_id": sid,
+                "published_at": entry.get("published_at"),
+                "style": entry.get("style"),
+                "day_key": entry.get("day_key"),
+                "nominee_display_name": entry.get("nominee_display_name") or entry.get("nominee_username"),
+                "nominator_display_name": entry.get("nominator_display_name") or entry.get("nominator_username"),
+            }
+        )
+
+    awards.sort(key=lambda row: str(row.get("published_at") or ""), reverse=True)
+    return awards
+
+
 def spotlight_status_payload(nominator_user_id=None, nominator_username=None):
     submitted = spotlight_today_exists(nominator_user_id, nominator_username)
     return {
         "submitted_today": submitted,
         "reset_seconds": seconds_until_next_uk_midnight(),
         "reset_label": "midnight UK time",
+        "awards": spotlight_awards_for_user(nominator_user_id, nominator_username),
     }
 
 
@@ -6216,6 +6322,7 @@ def get_feature_flags():
     return {
         "status": "ok",
         "features": load_feature_flags(),
+        "tester_usernames": load_tester_usernames(),
         "schema": feature_flag_schema_payload(),
     }
 
@@ -6225,16 +6332,23 @@ def update_feature_flags(payload: FeatureFlagsUpdate, x_bot_sync_secret: str | N
     verify_bot_sync_secret(x_bot_sync_secret or payload.admin_secret)
     flags = load_feature_flags()
     incoming = payload.dict(exclude_none=True)
+    tester_usernames = None
     for group, values in incoming.items():
-        if group == "admin_secret" or group not in flags or not isinstance(values, dict):
+        if group == "admin_secret":
+            continue
+        if group == "tester_usernames":
+            tester_usernames = normalize_tester_usernames(values)
+            continue
+        if group not in flags or not isinstance(values, dict):
             continue
         for key, value in values.items():
             if key in flags[group]:
                 flags[group][key] = bool(value)
-    save_feature_flags(flags)
+    save_feature_flags(flags, tester_usernames)
     return {
         "status": "ok",
         "features": flags,
+        "tester_usernames": load_tester_usernames(),
         "schema": feature_flag_schema_payload(),
     }
 
