@@ -2288,6 +2288,14 @@ class RewardCatalogUpdate(BaseModel):
     admin_secret: str
     level_packs: dict[str, dict] | None = None
     achievements: list[dict] | None = None
+    verification_packs: dict[str, dict] | None = None
+    verification_packs_active: bool | None = None
+
+
+class VerificationPackEligibilityPayload(BaseModel):
+    init_data: str | None = None
+    user_id: int | None = None
+    username: str | None = None
 
 
 class AdminSecretQuery(BaseModel):
@@ -3262,6 +3270,83 @@ def _normalize_reward_pack_item(item) -> dict | None:
     return entry
 
 
+VERIFICATION_PACK_KEYS = ("biker", "dancer", "daddy", "pup")
+
+DEFAULT_VERIFICATION_PACK_IMAGES = {
+    "biker": "assets/icons/fox-pack-biker.png",
+    "dancer": "assets/icons/fox-pack-dancer.png",
+    "daddy": "assets/icons/fox-pack-daddy.png",
+    "pup": "assets/icons/fox-pack-pup.png",
+}
+
+DEFAULT_VERIFICATION_PACKS = {
+    "biker": {
+        "id": "biker",
+        "title": "Biker Welcome Pack",
+        "copy": "Your verification gift for Appearance — two colours, stickers, skins, and backdrops.",
+        "image": DEFAULT_VERIFICATION_PACK_IMAGES["biker"],
+        "items": [
+            {"type": "color", "id": "green"},
+            {"type": "color", "id": "blue"},
+            {"type": "sticker", "id": "heart"},
+            {"type": "sticker", "id": "fox"},
+            {"type": "skin", "id": "spotlight"},
+            {"type": "skin", "id": "basechat"},
+            {"type": "backdrop", "id": "asmr"},
+            {"type": "backdrop", "id": "stage"},
+        ],
+    },
+    "dancer": {
+        "id": "dancer",
+        "title": "Dancer Welcome Pack",
+        "copy": "Your verification gift for Appearance — two colours, stickers, skins, and backdrops.",
+        "image": DEFAULT_VERIFICATION_PACK_IMAGES["dancer"],
+        "items": [
+            {"type": "color", "id": "rose"},
+            {"type": "color", "id": "violet"},
+            {"type": "sticker", "id": "star"},
+            {"type": "sticker", "id": "heart"},
+            {"type": "skin", "id": "pulse"},
+            {"type": "skin", "id": "foxlove"},
+            {"type": "backdrop", "id": "pulse"},
+            {"type": "backdrop", "id": "spotlight"},
+        ],
+    },
+    "daddy": {
+        "id": "daddy",
+        "title": "Daddy Welcome Pack",
+        "copy": "Your verification gift for Appearance — two colours, stickers, skins, and backdrops.",
+        "image": DEFAULT_VERIFICATION_PACK_IMAGES["daddy"],
+        "items": [
+            {"type": "color", "id": "gold"},
+            {"type": "color", "id": "rose"},
+            {"type": "sticker", "id": "fox"},
+            {"type": "sticker", "id": "star"},
+            {"type": "skin", "id": "foxlove"},
+            {"type": "skin", "id": "spotlight"},
+            {"type": "backdrop", "id": "wheel"},
+            {"type": "backdrop", "id": "asmr"},
+        ],
+    },
+    "pup": {
+        "id": "pup",
+        "title": "Pup Welcome Pack",
+        "copy": "Your verification gift for Appearance — two colours, stickers, skins, and backdrops.",
+        "image": DEFAULT_VERIFICATION_PACK_IMAGES["pup"],
+        "items": [
+            {"type": "color", "id": "gold"},
+            {"type": "color", "id": "green"},
+            {"type": "sticker", "id": "star"},
+            {"type": "sticker", "id": "heart"},
+            {"type": "skin", "id": "foxlove"},
+            {"type": "skin", "id": "pulse"},
+            {"type": "backdrop", "id": "wheel"},
+            {"type": "backdrop", "id": "pulse"},
+        ],
+    },
+}
+
+
 def normalize_level_packs(raw) -> dict:
     if not isinstance(raw, dict):
         return {}
@@ -3294,6 +3379,111 @@ def normalize_level_packs(raw) -> dict:
             "items": items,
         }
     return packs
+
+
+def normalize_verification_pack_key(raw) -> str | None:
+    key = str(raw or "").strip().lower()
+    if key in VERIFICATION_PACK_KEYS:
+        return key
+    return None
+
+
+def normalize_verification_packs(raw) -> dict:
+    source = raw if isinstance(raw, dict) else {}
+    packs: dict[str, dict] = {}
+    for key in VERIFICATION_PACK_KEYS:
+        defaults = DEFAULT_VERIFICATION_PACKS[key]
+        value = source.get(key) if isinstance(source.get(key), dict) else {}
+        items = []
+        for item in value.get("items") or defaults.get("items") or []:
+            normalized = _normalize_reward_pack_item(item)
+            if normalized:
+                items.append(normalized)
+        if not items:
+            for item in defaults.get("items") or []:
+                normalized = _normalize_reward_pack_item(item)
+                if normalized:
+                    items.append(normalized)
+        packs[key] = {
+            "id": key,
+            "title": str(value.get("title") or defaults.get("title") or f"{key.title()} Welcome Pack").strip(),
+            "copy": str(value.get("copy") or defaults.get("copy") or "").strip(),
+            "image": str(
+                value.get("image")
+                or defaults.get("image")
+                or DEFAULT_VERIFICATION_PACK_IMAGES.get(key)
+                or ""
+            ).strip(),
+            "items": items,
+        }
+    return packs
+
+
+def normalize_verification_packs_active(raw) -> bool:
+    if isinstance(raw, bool):
+        return raw
+    if isinstance(raw, (int, float)):
+        return bool(raw)
+    return str(raw or "").strip().lower() in {"1", "true", "yes", "on", "active"}
+
+
+def find_user_verification_pack_key(user_id: int | None = None, username: str | None = None) -> str | None:
+    username_key = (username or "").strip().lstrip("@").lower()
+    matches = []
+    for entry in miniapp_verifications:
+        if not isinstance(entry, dict):
+            continue
+        same_user = user_id and int(entry.get("user_id") or 0) == int(user_id)
+        same_username = username_key and (entry.get("username") or "").strip().lstrip("@").lower() == username_key
+        if not (same_user or same_username):
+            continue
+        pack_key = normalize_verification_pack_key(entry.get("selected_pack"))
+        if not pack_key:
+            continue
+        matches.append((
+            1 if (entry.get("status") or "").strip().lower() == "completed" else 0,
+            entry.get("completed_at") or entry.get("last_seen_at") or entry.get("requested_at") or "",
+            pack_key,
+        ))
+    if matches:
+        matches.sort(reverse=True)
+        return matches[0][2]
+
+    if user_id:
+        rows = fox_db_rows(
+            "SELECT choice_label FROM fox_votes WHERE user_id = ? LIMIT 1",
+            (int(user_id),),
+        )
+        if rows:
+            pack_key = normalize_verification_pack_key(rows[0].get("choice_label"))
+            if pack_key:
+                return pack_key
+        reward_rows = fox_db_rows(
+            "SELECT reward_label FROM user_rewards WHERE user_id = ? LIMIT 1",
+            (int(user_id),),
+        )
+        if reward_rows:
+            pack_key = normalize_verification_pack_key(reward_rows[0].get("reward_label"))
+            if pack_key:
+                return pack_key
+    return None
+
+
+def verification_pack_eligibility(user_id: int | None = None, username: str | None = None) -> dict:
+    catalog = load_reward_catalog()
+    active = bool(catalog.get("verification_packs_active"))
+    packs = catalog.get("verification_packs") or normalize_verification_packs({})
+    pack_key = find_user_verification_pack_key(user_id, username)
+    pack = packs.get(pack_key) if pack_key else None
+    return {
+        "status": "ok",
+        "active": active,
+        "activated_at": catalog.get("verification_packs_activated_at"),
+        "pack_key": pack_key,
+        "eligible": bool(active and pack),
+        "source_key": "verification_pack",
+        "pack": pack,
+    }
 
 
 def _slugify_achievement_id(value: str, fallback: str = "achievement") -> str:
@@ -3362,6 +3552,9 @@ def empty_reward_catalog() -> dict:
     return {
         "level_packs": {},
         "achievements": [],
+        "verification_packs": normalize_verification_packs({}),
+        "verification_packs_active": False,
+        "verification_packs_activated_at": None,
         "updated_at": None,
     }
 
@@ -3377,6 +3570,16 @@ def load_reward_catalog() -> dict:
                     catalog["achievements"] = normalize_reward_achievements(
                         data.get("achievements")
                     )
+                    catalog["verification_packs"] = normalize_verification_packs(
+                        data.get("verification_packs")
+                    )
+                    catalog["verification_packs_active"] = normalize_verification_packs_active(
+                        data.get("verification_packs_active")
+                    )
+                    activated = data.get("verification_packs_activated_at")
+                    catalog["verification_packs_activated_at"] = (
+                        str(activated).strip() if activated else None
+                    )
                     updated = data.get("updated_at")
                     catalog["updated_at"] = str(updated).strip() if updated else None
     except Exception:
@@ -3385,9 +3588,18 @@ def load_reward_catalog() -> dict:
 
 
 def save_reward_catalog(catalog: dict) -> dict:
+    active = normalize_verification_packs_active(catalog.get("verification_packs_active"))
+    activated_at = catalog.get("verification_packs_activated_at")
+    if active and not activated_at:
+        activated_at = now_iso()
+    if not active:
+        activated_at = None
     payload = {
         "level_packs": normalize_level_packs(catalog.get("level_packs")),
         "achievements": normalize_reward_achievements(catalog.get("achievements")),
+        "verification_packs": normalize_verification_packs(catalog.get("verification_packs")),
+        "verification_packs_active": active,
+        "verification_packs_activated_at": str(activated_at).strip() if activated_at else None,
         "updated_at": now_iso(),
     }
     directory = os.path.dirname(REWARD_CATALOG_PATH)
@@ -4066,6 +4278,30 @@ def ensure_fox_read_tables(conn):
             user_id INTEGER,
             attempt_time TEXT,
             success INTEGER
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS fox_votes (
+            user_id INTEGER PRIMARY KEY,
+            choice_number INTEGER,
+            choice_label TEXT,
+            voted_at TEXT
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS user_rewards (
+            user_id INTEGER PRIMARY KEY,
+            reward_type TEXT,
+            reward_label TEXT,
+            reward_link TEXT,
+            status TEXT,
+            awarded_at TEXT,
+            claimed_at TEXT,
+            source TEXT
         )
         """
     )
@@ -7073,8 +7309,40 @@ def admin_update_reward_catalog(payload: RewardCatalogUpdate):
         current["level_packs"] = normalize_level_packs(payload.level_packs)
     if payload.achievements is not None:
         current["achievements"] = normalize_reward_achievements(payload.achievements)
+    if payload.verification_packs is not None:
+        current["verification_packs"] = normalize_verification_packs(payload.verification_packs)
+    if payload.verification_packs_active is not None:
+        was_active = bool(current.get("verification_packs_active"))
+        current["verification_packs_active"] = bool(payload.verification_packs_active)
+        if current["verification_packs_active"] and not was_active:
+            current["verification_packs_activated_at"] = now_iso()
+        if not current["verification_packs_active"]:
+            current["verification_packs_activated_at"] = None
     saved = save_reward_catalog(current)
     return {"status": "ok", **saved}
+
+
+@app.get("/api/verification-pack/eligibility")
+def get_verification_pack_eligibility(
+    user_id: int | None = None,
+    username: str | None = None,
+):
+    return verification_pack_eligibility(user_id, username)
+
+
+@app.post("/api/verification-pack/eligibility")
+def post_verification_pack_eligibility(payload: VerificationPackEligibilityPayload | None = None):
+    payload = payload or VerificationPackEligibilityPayload()
+    user_id = payload.user_id
+    username = payload.username
+    if payload.init_data:
+        try:
+            user = verify_telegram_init_data(payload.init_data)
+            user_id = int(user.get("id") or 0) or user_id
+            username = user.get("username") or username
+        except Exception:
+            pass
+    return verification_pack_eligibility(user_id, username)
 
 
 @app.get("/api/reward-assets/{filename}")
