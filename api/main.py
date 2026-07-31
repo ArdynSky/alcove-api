@@ -2760,7 +2760,7 @@ def resubmit_rejected_pulse_question(user_id: int | None, username: str | None, 
     entry["reviewed_by"] = None
     entry["needs_admin_notify"] = True
     entry["review_message_sent"] = False
-    pulse_close_other_rejection_resubmits(user_id, username)
+    pulse_consume_rejection_replacement(user_id, username, keep_entry_id=entry.get("id"))
     submitter = entry.get("display_name") or entry.get("username") or entry.get("user_id")
     pulse_admin_notify(
         "\n".join([
@@ -9790,6 +9790,30 @@ def pulse_close_other_rejection_resubmits(user_id=None, username=None, keep_entr
         save_runtime_state()
 
 
+def pulse_consume_rejection_replacement(user_id=None, username=None, *, keep_entry_id=None) -> None:
+    """Mark today's one replacement as used and close any other open amend slots."""
+    changed = False
+    stamped = now_iso()
+    for existing in pulse_question_submissions_for_user_today(user_id, username):
+        if (existing.get("status") or "").strip().lower() != "rejected":
+            continue
+        if keep_entry_id is not None and existing.get("id") == keep_entry_id:
+            if existing.get("resubmit_allowed"):
+                existing["resubmit_allowed"] = False
+                changed = True
+            continue
+        if existing.get("resubmit_allowed"):
+            existing["resubmit_allowed"] = False
+            changed = True
+        if not existing.get("resubmitted_at"):
+            # Consuming the daily replacement even when the member submits a fresh
+            # question instead of amending the rejected row in place.
+            existing["resubmitted_at"] = stamped
+            changed = True
+    if changed:
+        save_runtime_state()
+
+
 def pulse_max_submissions_allowed_today(user_id=None, username=None) -> int:
     extra = (
         PULSE_DAILY_REJECTION_REPLACEMENT_LIMIT
@@ -9852,7 +9876,6 @@ def submit_pulse_question_suggestion(payload: PulseQuestionSuggestion):
     using_replacement_slot = (
         not pulse_unlimited_question_submit()
         and pulse_rejection_replacement_available(user_id, username)
-        and pulse_question_submissions_total_today(user_id, username) >= PULSE_DAILY_QUESTION_LIMIT
     )
 
     pool = (payload.pool or "green").strip().lower()
@@ -9875,6 +9898,36 @@ def submit_pulse_question_suggestion(payload: PulseQuestionSuggestion):
         return {"status": "error", "message": too_long}
 
     schedule_mode = normalize_pulse_schedule_mode(payload.schedule_mode) if payload.schedule_mode else None
+
+    # If a rejected question still has today's one replace attempt, amend that row
+    # instead of creating another free submission.
+    if using_replacement_slot:
+        result = resubmit_rejected_pulse_question(user_id, username, question)
+        if result.get("status") != "ok":
+            return result
+        entry = result.get("entry") or {}
+        entry["pool"] = pool
+        entry["category"] = category
+        if schedule_mode:
+            entry["schedule_mode"] = schedule_mode
+        save_runtime_state()
+        submissions_today = pulse_question_submissions_today_count(user_id, username)
+        can_submit_another = pulse_can_submit_another_question(user_id, username)
+        return {
+            "status": "ok",
+            "message": (
+                "Thanks — your replacement Pulse question is with F.O.X for review. "
+                "That uses today's one amendment."
+            ),
+            "entry": entry,
+            "submissions_today": submissions_today,
+            "submissions_total_today": pulse_question_submissions_total_today(user_id, username),
+            "can_submit_another": can_submit_another,
+            "replacement_available": False,
+            "replacement_used_today": True,
+            "daily_limit": PULSE_DAILY_QUESTION_LIMIT,
+        }
+
     entry = {
         "id": len(pulse_question_suggestions) + 1,
         "pool": pool,
@@ -9895,8 +9948,6 @@ def submit_pulse_question_suggestion(payload: PulseQuestionSuggestion):
         "active_from_day_key": None,
     }
     pulse_question_suggestions.append(entry)
-    if using_replacement_slot:
-        pulse_close_other_rejection_resubmits(user_id, username)
     save_runtime_state()
     submitter = entry.get("display_name") or entry.get("username") or entry.get("user_id")
     pulse_admin_notify(
@@ -9955,6 +10006,8 @@ def pulse_question_suggestion_status(user_id: int | None = None, username: str |
             "submissions_today": 0,
             "submissions_total_today": 0,
             "can_submit_another": False,
+            "replacement_available": False,
+            "replacement_used_today": pulse_rejection_replacement_used_today(user_id, username),
             "daily_limit": PULSE_DAILY_QUESTION_LIMIT,
             "message": "Submit today's Pulse question to unlock the game.",
         }
@@ -9987,6 +10040,8 @@ def pulse_question_suggestion_status(user_id: int | None = None, username: str |
         "submissions_today": submissions_today,
         "submissions_total_today": submissions_total_today,
         "can_submit_another": can_submit_another,
+        "replacement_available": pulse_rejection_replacement_available(user_id, username),
+        "replacement_used_today": pulse_rejection_replacement_used_today(user_id, username),
         "daily_limit": PULSE_DAILY_QUESTION_LIMIT,
         "review_status": latest_entry.get("status") if latest_entry else None,
         "message": message,
