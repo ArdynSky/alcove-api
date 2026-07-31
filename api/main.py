@@ -4704,6 +4704,34 @@ def get_spotlight_entry(entry_id: int):
     return None
 
 
+def spotlight_nominations_for_user(user_id=None, username=None):
+    """Spotlight nominations submitted by this resident (nominator), newest first."""
+    viewer = archive_viewer_identity(user_id, username)
+    nominations = []
+    for entry in spotlight_entries:
+        nominator = {
+            "user_id": entry.get("nominator_user_id"),
+            "username": entry.get("nominator_username"),
+        }
+        if not pulse_identities_match(viewer, nominator):
+            continue
+        sid = entry.get("id")
+        if sid is None:
+            continue
+        nominations.append(
+            {
+                "spotlight_id": sid,
+                "status": entry.get("status"),
+                "published_at": entry.get("published_at"),
+                "day_key": entry.get("day_key"),
+                "style": entry.get("style"),
+                "nominee_display_name": entry.get("nominee_display_name") or entry.get("nominee_username"),
+            }
+        )
+    nominations.sort(key=lambda row: int(row.get("spotlight_id") or 0), reverse=True)
+    return nominations
+
+
 def spotlight_awards_for_user(user_id=None, username=None):
     """Published Spotlight awards for this resident (nominee), newest first."""
     viewer = archive_viewer_identity(user_id, username)
@@ -4774,6 +4802,7 @@ def spotlight_status_payload(nominator_user_id=None, nominator_username=None):
         "reset_seconds": seconds_until_next_uk_midnight(),
         "reset_label": "midnight UK time",
         "awards": spotlight_awards_for_user(nominator_user_id, nominator_username),
+        "nominations": spotlight_nominations_for_user(nominator_user_id, nominator_username),
     }
 
 
@@ -9318,6 +9347,8 @@ def submit_spotlight(entry: SpotlightEntry):
         "status": "ok",
         "spotlight_id": data["id"],
         "spotlights": len(spotlight_entries),
+        "nominator_user_id": data.get("nominator_user_id"),
+        "nominator_username": data.get("nominator_username"),
         "spotlight_status": spotlight_status_payload(data.get("nominator_user_id"), data.get("nominator_username")),
     }
 
