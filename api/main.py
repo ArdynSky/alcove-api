@@ -10350,6 +10350,7 @@ def bot_pending_pulse_question_review_notifications(x_bot_sync_secret: str | Non
             "active_from_day_key": item.get("active_from_day_key"),
             "availability_copy": item.get("availability_copy"),
             "rejection_reason": item.get("rejection_reason"),
+            "resubmit_allowed": bool(item.get("resubmit_allowed")),
             "created_at": item.get("created_at"),
         }
         for item in pulse_question_review_notifications
