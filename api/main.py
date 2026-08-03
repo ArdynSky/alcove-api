@@ -4954,6 +4954,7 @@ def spotlight_nominations_for_user(user_id=None, username=None):
         sid = entry.get("id")
         if sid is None:
             continue
+        reason = (entry.get("edited_reason") or entry.get("reason") or "").strip()
         nominations.append(
             {
                 "spotlight_id": sid,
@@ -4962,6 +4963,8 @@ def spotlight_nominations_for_user(user_id=None, username=None):
                 "day_key": entry.get("day_key"),
                 "style": entry.get("style"),
                 "nominee_display_name": entry.get("nominee_display_name") or entry.get("nominee_username"),
+                "nominator_display_name": entry.get("nominator_display_name") or entry.get("nominator_username"),
+                "reason": reason,
             }
         )
     nominations.sort(key=lambda row: int(row.get("spotlight_id") or 0), reverse=True)
@@ -4997,8 +5000,11 @@ def spotlight_awards_for_user(user_id=None, username=None):
                 "published_at": entry.get("published_at"),
                 "style": entry.get("style"),
                 "day_key": entry.get("day_key"),
+                "day_label": entry.get("day_label"),
                 "nominee_display_name": entry.get("nominee_display_name") or entry.get("nominee_username"),
                 "nominator_display_name": entry.get("nominator_display_name") or entry.get("nominator_username"),
+                "reason": (entry.get("reason") or "").strip(),
+                "status": "approved",
             }
         )
 
@@ -5016,6 +5022,7 @@ def spotlight_awards_for_user(user_id=None, username=None):
         if sid is None or sid in seen:
             continue
         seen.add(sid)
+        reason = (entry.get("edited_reason") or entry.get("reason") or "").strip()
         awards.append(
             {
                 "spotlight_id": sid,
@@ -5024,6 +5031,8 @@ def spotlight_awards_for_user(user_id=None, username=None):
                 "day_key": entry.get("day_key"),
                 "nominee_display_name": entry.get("nominee_display_name") or entry.get("nominee_username"),
                 "nominator_display_name": entry.get("nominator_display_name") or entry.get("nominator_username"),
+                "reason": reason,
+                "status": "approved",
             }
         )
 
