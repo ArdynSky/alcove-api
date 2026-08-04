@@ -3705,6 +3705,14 @@ def apply_admin_pulse_question_action(
         entry["reviewed_at"] = now_iso()
         queue_pulse_question_review_notification(entry, "question_rejected", rejection_reason=reason)
         return
+    if action == "delete":
+        # Silent remove — no rejection form, no F.O.X DM, hidden from member app.
+        entry["status"] = "deleted"
+        entry["rejection_reason"] = None
+        entry["resubmit_allowed"] = False
+        entry["needs_admin_notify"] = False
+        entry["reviewed_at"] = now_iso()
+        return
     if action in {"today", "tomorrow", "reserve"}:
         pool = (entry.get("pool") or "green").strip().lower()
         if pool == "red" and action == "reserve":
@@ -6394,7 +6402,7 @@ async def cards_startup_tasks():
 def root():
     return {
         "status": "Alcove API running",
-        "api_revision": "live-feed-msg-cap-20260804",
+        "api_revision": "pulse-admin-delete-20260804",
         "lean_mode": LEAN_MODE,
         "pulse_admin_notify_enabled": PULSE_ADMIN_NOTIFY_ENABLED,
         "pulse_admin_telegram_suppressed": PULSE_ADMIN_TELEGRAM_SUPPRESSED,
