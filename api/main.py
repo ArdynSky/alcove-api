@@ -8506,11 +8506,12 @@ def list_reviews():
 
 @app.post("/api/stream-comment")
 def submit_stream_comment(comment: StreamComment):
-    text = comment.text.strip()
+    # Live Feed copy is single-line and capped to ~3 wrapped lines at max bubble width.
+    text = " ".join(str(comment.text or "").split())
     if len(text) == 0:
         return {"status": "error", "message": "Comment cannot be empty."}
-    if len(text) > 600:
-        return {"status": "error", "message": "Comments must be 600 characters or fewer."}
+    if len(text) > 140:
+        return {"status": "error", "message": "Comments must be 140 characters or fewer."}
 
     display_name = (comment.display_name or "Viewer").strip() or "Viewer"
     if display_name.lower() in muted_users:
