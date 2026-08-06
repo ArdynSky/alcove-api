@@ -2514,6 +2514,29 @@ def pulse_suggestion_submitter_user_id(entry: dict) -> int | None:
     return user_id or None
 
 
+def cancel_pending_pulse_question_review_notifications(
+    suggestion_id: int,
+    *,
+    kinds: set[str] | None = None,
+    reason: str = "superseded",
+) -> None:
+    """Drop unsent review DMs for a suggestion so approve/reject cannot both go out."""
+    suggestion_id = int(suggestion_id or 0)
+    if not suggestion_id:
+        return
+    stamped = now_iso()
+    for existing in pulse_question_review_notifications:
+        if existing.get("notified_at"):
+            continue
+        if int(existing.get("suggestion_id") or 0) != suggestion_id:
+            continue
+        if kinds and existing.get("kind") not in kinds:
+            continue
+        existing["notified_at"] = stamped
+        existing["cancelled"] = True
+        existing["cancel_reason"] = reason
+
+
 def queue_pulse_question_review_notification(entry: dict, kind: str, *, rejection_reason: str | None = None) -> None:
     user_id = pulse_suggestion_submitter_user_id(entry)
     if not user_id:
@@ -2521,12 +2544,34 @@ def queue_pulse_question_review_notification(entry: dict, kind: str, *, rejectio
     suggestion_id = int(entry.get("id") or 0)
     if not suggestion_id:
         return
+    opposite = {
+        "question_approved": {"question_rejected"},
+        "question_rejected": {"question_approved"},
+    }.get(kind)
+    if opposite:
+        cancel_pending_pulse_question_review_notifications(
+            suggestion_id,
+            kinds=opposite,
+            reason=f"superseded_by_{kind}",
+        )
     for existing in pulse_question_review_notifications:
         if (
             existing.get("kind") == kind
             and int(existing.get("suggestion_id") or 0) == suggestion_id
             and not existing.get("notified_at")
         ):
+            # Refresh payload on the still-pending duplicate instead of stacking another DM.
+            existing["question"] = pulse_suggestion_question(entry)
+            existing["schedule_mode"] = entry.get("schedule_mode") or "tomorrow"
+            existing["active_from_day_key"] = entry.get("active_from_day_key")
+            existing["availability_copy"] = pulse_question_availability_copy(entry)
+            existing["rejection_reason"] = (
+                (rejection_reason or entry.get("rejection_reason") or "").strip() or None
+            )
+            existing["resubmit_allowed"] = bool(entry.get("resubmit_allowed"))
+            existing["recipient_user_id"] = user_id
+            existing["recipient_username"] = entry.get("username")
+            existing["recipient_display_name"] = entry.get("display_name")
             return
     pulse_question_review_notifications.append({
         "notification_id": f"pulse-review-{kind}-{suggestion_id}-{len(pulse_question_review_notifications) + 1}",
@@ -2544,6 +2589,29 @@ def queue_pulse_question_review_notification(entry: dict, kind: str, *, rejectio
         "created_at": now_iso(),
         "notified_at": None,
     })
+
+
+def pulse_question_review_notification_still_valid(item: dict) -> bool:
+    """Skip DMs that no longer match the suggestion's current review status."""
+    suggestion_id = int(item.get("suggestion_id") or 0)
+    if not suggestion_id:
+        return False
+    entry = find_pulse_question_suggestion(suggestion_id)
+    if not entry:
+        return False
+    status = (entry.get("status") or "").strip().lower()
+    kind = item.get("kind")
+    if kind == "question_approved":
+        return status == "approved"
+    if kind == "question_rejected":
+        if status != "rejected":
+            return False
+        # Keep button/resubmit flag in sync with the live row.
+        item["resubmit_allowed"] = bool(entry.get("resubmit_allowed"))
+        item["rejection_reason"] = (entry.get("rejection_reason") or item.get("rejection_reason") or "").strip() or None
+        item["question"] = pulse_suggestion_question(entry)
+        return True
+    return False
 
 
 def normalized_pulse_reset_interval(value) -> int:
@@ -3696,6 +3764,10 @@ def apply_admin_pulse_question_action(
                 status_code=400,
                 detail="A rejection reason is required so F.O.X can message the member.",
             )
+        current_status = (entry.get("status") or "").strip().lower()
+        if current_status == "rejected" and (entry.get("rejection_reason") or "").strip() == reason:
+            # Idempotent re-click — do not queue another conflicting DM.
+            return
         entry["status"] = "rejected"
         entry["rejection_reason"] = reason
         entry["resubmit_allowed"] = not pulse_rejection_replacement_used_today(
@@ -3707,6 +3779,10 @@ def apply_admin_pulse_question_action(
         return
     if action == "delete":
         # Silent remove — no rejection form, no F.O.X DM, hidden from member app.
+        cancel_pending_pulse_question_review_notifications(
+            int(entry.get("id") or 0),
+            reason="deleted",
+        )
         entry["status"] = "deleted"
         entry["rejection_reason"] = None
         entry["resubmit_allowed"] = False
@@ -10037,6 +10113,11 @@ def pulse_question_suggestion_status(user_id: int | None = None, username: str |
             continue
         latest_entry = existing
 
+    replacement_open = pulse_rejection_replacement_available(user_id, username)
+    has_approved_today = any(
+        (existing.get("status") or "").strip().lower() == "approved"
+        for existing in pulse_question_submissions_for_user_today(user_id, username)
+    )
     if not can_submit_another:
         if pulse_rejection_replacement_used_today(user_id, username):
             message = "You've used today's one replacement attempt. New questions unlock at midnight UK time."
@@ -10044,8 +10125,16 @@ def pulse_question_suggestion_status(user_id: int | None = None, username: str |
             message = "Both of today's Pulse questions are already with F.O.X for review."
         else:
             message = "Both of today's Pulse questions are already with F.O.X for review."
-    elif pulse_rejection_replacement_available(user_id, username):
-        message = "Your Pulse was not approved. You have one replacement attempt today ΓÇö choose your words carefully."
+    elif replacement_open and has_approved_today:
+        message = (
+            "One of today's Pulse questions was approved. Another was not approved — "
+            "you still have one replacement attempt today, so choose your words carefully."
+        )
+    elif replacement_open:
+        message = (
+            "Your Pulse was not approved. You have one replacement attempt today — "
+            "choose your words carefully."
+        )
     elif latest_entry and latest_entry.get("status") == "pending_review":
         message = "Your Pulse is with F.O.X for review. You can submit one more today."
     elif latest_entry and latest_entry.get("status") == "approved":
@@ -10710,8 +10799,19 @@ def bot_update_pulse_question_suggestion(suggestion_id: int, payload: dict | Non
 @app.get("/api/bot-sync/pulse-questions/review-notifications")
 def bot_pending_pulse_question_review_notifications(x_bot_sync_secret: str | None = Header(default=None)):
     verify_bot_sync_secret(x_bot_sync_secret)
-    rows = [
-        {
+    rows = []
+    stale_cleared = False
+    stamped = now_iso()
+    for item in pulse_question_review_notifications:
+        if item.get("notified_at"):
+            continue
+        if not pulse_question_review_notification_still_valid(item):
+            item["notified_at"] = stamped
+            item["cancelled"] = True
+            item["cancel_reason"] = "stale_status"
+            stale_cleared = True
+            continue
+        rows.append({
             "notification_id": item.get("notification_id"),
             "kind": item.get("kind"),
             "suggestion_id": item.get("suggestion_id"),
@@ -10725,10 +10825,9 @@ def bot_pending_pulse_question_review_notifications(x_bot_sync_secret: str | Non
             "rejection_reason": item.get("rejection_reason"),
             "resubmit_allowed": bool(item.get("resubmit_allowed")),
             "created_at": item.get("created_at"),
-        }
-        for item in pulse_question_review_notifications
-        if not item.get("notified_at")
-    ]
+        })
+    if stale_cleared:
+        save_runtime_state()
     return {"status": "ok", "notifications": rows}
 
 
