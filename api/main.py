@@ -4,6 +4,8 @@ from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel
 import re
 from urllib.parse import parse_qsl, urlparse, unquote
+import urllib.error
+import urllib.request
 from pathlib import Path
 from zoneinfo import ZoneInfo
 import datetime
@@ -2537,6 +2539,144 @@ def cancel_pending_pulse_question_review_notifications(
         existing["cancel_reason"] = reason
 
 
+PULSE_REVIEW_DM_WEBAPP_URL = (
+    "https://ardyn-alcove.com/wellbeing-concept-open-stage.html"
+    "?open=pulse&v=miniapp-wellbeing-20260806r"
+)
+PULSE_REVIEW_DM_SUBMIT_WEBAPP_URL = (
+    "https://ardyn-alcove.com/wellbeing-concept-open-stage.html"
+    "?open=pulse&submit=replace&v=miniapp-wellbeing-20260806r"
+)
+
+
+def telegram_bot_send_message(payload: dict) -> tuple[bool, str]:
+    if not TELEGRAM_BOT_TOKEN:
+        return False, "bot token missing"
+    try:
+        body = json.dumps(payload).encode("utf-8")
+        request = urllib.request.Request(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+            data=body,
+            method="POST",
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(request, timeout=15) as response:
+            result = json.loads(response.read().decode("utf-8"))
+        if result.get("ok"):
+            return True, ""
+        return False, str(result.get("description") or "sendMessage failed")
+    except urllib.error.HTTPError as exc:
+        try:
+            detail = json.loads(exc.read().decode("utf-8")).get("description") or repr(exc)
+        except Exception:
+            detail = repr(exc)
+        return False, str(detail)
+    except Exception as exc:
+        return False, repr(exc)
+
+
+def pulse_question_review_dm_content(notification: dict) -> tuple[str, str, str] | None:
+    kind = notification.get("kind")
+    question = (notification.get("question") or "").strip()
+    availability = (notification.get("availability_copy") or "").strip()
+    if kind == "question_approved":
+        text = (
+            "Good news — your Pulse question has been approved.\n\n"
+            f"<b>{escape(question)}</b>\n\n"
+            f"{escape(availability)}\n\n"
+            "Open Pulse in the Mini App to collect your approval EXP "
+            "and see answers in My Activity."
+        )
+        return text, "Open Pulse", PULSE_REVIEW_DM_WEBAPP_URL
+    if kind == "question_rejected":
+        reason = (notification.get("rejection_reason") or "").strip() or "It did not meet the Pulse guidelines."
+        if notification.get("resubmit_allowed"):
+            text = (
+                "Your Pulse question was not approved this time.\n\n"
+                f"<b>{escape(question)}</b>\n\n"
+                f"<b>Reason from F.O.X</b>\n{escape(reason)}\n\n"
+                "You get <b>one</b> replacement attempt today — choose your words carefully. "
+                "If it is approved, it will replace the rejected one.\n\n"
+                "Tap the button below to open Pulse and submit your replacement, "
+                "or reply to this message with your new question text."
+            )
+            return text, "Tap to submit a replacement", PULSE_REVIEW_DM_SUBMIT_WEBAPP_URL
+        text = (
+            "Your Pulse question was not approved this time.\n\n"
+            f"<b>{escape(question)}</b>\n\n"
+            f"<b>Reason from F.O.X</b>\n{escape(reason)}\n\n"
+            "You've already used today's replacement attempt. "
+            "You can submit fresh Pulse questions again after midnight UK time.\n\n"
+            "Tap Open Pulse to check your status in the Mini App."
+        )
+        return text, "Open Pulse", PULSE_REVIEW_DM_WEBAPP_URL
+    return None
+
+
+def try_send_pulse_question_review_dm_now(notification: dict) -> bool:
+    """Send approve/reject DMs immediately from the API so members are not waiting on FOX poll."""
+    if not notification or notification.get("notified_at"):
+        return False
+    if not pulse_question_review_notification_still_valid(notification):
+        return False
+    user_id = notification.get("recipient_user_id")
+    content = pulse_question_review_dm_content(notification)
+    if not user_id or not content:
+        return False
+    text, button_text, button_url = content
+    base_payload = {
+        "chat_id": int(user_id),
+        "text": text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True,
+    }
+    attempts = [
+        {
+            **base_payload,
+            "reply_markup": {
+                "inline_keyboard": [[{"text": button_text, "web_app": {"url": button_url}}]]
+            },
+        },
+        {
+            **base_payload,
+            "reply_markup": {
+                "inline_keyboard": [[{"text": button_text, "url": button_url}]]
+            },
+        },
+    ]
+    last_detail = ""
+    for payload in attempts:
+        ok, detail = telegram_bot_send_message(payload)
+        if ok:
+            notification["notified_at"] = now_iso()
+            notification["delivery"] = "api_immediate"
+            return True
+        last_detail = detail
+    lowered = last_detail.lower()
+    if any(
+        phrase in lowered
+        for phrase in (
+            "can't initiate conversation",
+            "bot was blocked",
+            "user is deactivated",
+            "chat not found",
+        )
+    ):
+        notification["notified_at"] = now_iso()
+        notification["cancelled"] = True
+        notification["cancel_reason"] = "user_unreachable"
+        print(
+            f"[{now_iso()}] pulse review DM unreachable for {user_id}: {last_detail}",
+            flush=True,
+        )
+        return False
+    print(
+        f"[{now_iso()}] pulse review DM send deferred for {user_id}: {last_detail}",
+        flush=True,
+    )
+    return False
+
+
 def queue_pulse_question_review_notification(entry: dict, kind: str, *, rejection_reason: str | None = None) -> None:
     user_id = pulse_suggestion_submitter_user_id(entry)
     if not user_id:
@@ -2554,6 +2694,7 @@ def queue_pulse_question_review_notification(entry: dict, kind: str, *, rejectio
             kinds=opposite,
             reason=f"superseded_by_{kind}",
         )
+    notification = None
     for existing in pulse_question_review_notifications:
         if (
             existing.get("kind") == kind
@@ -2572,23 +2713,28 @@ def queue_pulse_question_review_notification(entry: dict, kind: str, *, rejectio
             existing["recipient_user_id"] = user_id
             existing["recipient_username"] = entry.get("username")
             existing["recipient_display_name"] = entry.get("display_name")
-            return
-    pulse_question_review_notifications.append({
-        "notification_id": f"pulse-review-{kind}-{suggestion_id}-{len(pulse_question_review_notifications) + 1}",
-        "kind": kind,
-        "suggestion_id": suggestion_id,
-        "recipient_user_id": user_id,
-        "recipient_username": entry.get("username"),
-        "recipient_display_name": entry.get("display_name"),
-        "question": pulse_suggestion_question(entry),
-        "schedule_mode": entry.get("schedule_mode") or "tomorrow",
-        "active_from_day_key": entry.get("active_from_day_key"),
-        "availability_copy": pulse_question_availability_copy(entry),
-        "rejection_reason": (rejection_reason or entry.get("rejection_reason") or "").strip() or None,
-        "resubmit_allowed": bool(entry.get("resubmit_allowed")),
-        "created_at": now_iso(),
-        "notified_at": None,
-    })
+            notification = existing
+            break
+    if notification is None:
+        notification = {
+            "notification_id": f"pulse-review-{kind}-{suggestion_id}-{len(pulse_question_review_notifications) + 1}",
+            "kind": kind,
+            "suggestion_id": suggestion_id,
+            "recipient_user_id": user_id,
+            "recipient_username": entry.get("username"),
+            "recipient_display_name": entry.get("display_name"),
+            "question": pulse_suggestion_question(entry),
+            "schedule_mode": entry.get("schedule_mode") or "tomorrow",
+            "active_from_day_key": entry.get("active_from_day_key"),
+            "availability_copy": pulse_question_availability_copy(entry),
+            "rejection_reason": (rejection_reason or entry.get("rejection_reason") or "").strip() or None,
+            "resubmit_allowed": bool(entry.get("resubmit_allowed")),
+            "created_at": now_iso(),
+            "notified_at": None,
+        }
+        pulse_question_review_notifications.append(notification)
+    # Prefer immediate API delivery; FOX poll remains as fallback if this fails.
+    try_send_pulse_question_review_dm_now(notification)
 
 
 def pulse_question_review_notification_still_valid(item: dict) -> bool:
@@ -6478,7 +6624,7 @@ async def cards_startup_tasks():
 def root():
     return {
         "status": "Alcove API running",
-        "api_revision": "pulse-review-dm-guard-20260807",
+        "api_revision": "pulse-review-dm-immediate-20260807",
         "lean_mode": LEAN_MODE,
         "pulse_admin_notify_enabled": PULSE_ADMIN_NOTIFY_ENABLED,
         "pulse_admin_telegram_suppressed": PULSE_ADMIN_TELEGRAM_SUPPRESSED,
