@@ -6478,7 +6478,7 @@ async def cards_startup_tasks():
 def root():
     return {
         "status": "Alcove API running",
-        "api_revision": "pulse-admin-delete-20260804",
+        "api_revision": "pulse-review-dm-guard-20260807",
         "lean_mode": LEAN_MODE,
         "pulse_admin_notify_enabled": PULSE_ADMIN_NOTIFY_ENABLED,
         "pulse_admin_telegram_suppressed": PULSE_ADMIN_TELEGRAM_SUPPRESSED,
@@ -10126,9 +10126,11 @@ def pulse_question_suggestion_status(user_id: int | None = None, username: str |
         else:
             message = "Both of today's Pulse questions are already with F.O.X for review."
     elif replacement_open and has_approved_today:
+        # Lead with the approval — do not pair "approved" with "not approved"
+        # in one line (that reads like a contradictory F.O.X decision).
         message = (
-            "One of today's Pulse questions was approved. Another was not approved — "
-            "you still have one replacement attempt today, so choose your words carefully."
+            "Your Pulse was approved. You still have one replacement attempt today "
+            "if you want to rewrite the other question."
         )
     elif replacement_open:
         message = (
