@@ -2935,17 +2935,27 @@ def clear_pulse_question_roster(reviewed_by=None):
 
 
 def find_resubmittable_rejected_pulse_question(user_id: int | None = None, username: str | None = None):
+    """Only today's rejected rows can be amended — never recycle old rejects."""
+    today = pulse_day_key()
     username = (username or "").lower()
     matches = []
+    stale_cleared = False
     for entry in pulse_question_suggestions:
         if entry.get("status") != "rejected":
             continue
         if not entry.get("resubmit_allowed"):
             continue
+        # Stale open amend slots from earlier days must not keep accepting DM replies.
+        if (entry.get("day_key") or "") != today:
+            entry["resubmit_allowed"] = False
+            stale_cleared = True
+            continue
         same_user = user_id and int(entry.get("user_id") or 0) == int(user_id)
         same_username = username and (entry.get("username") or "").lower() == username
         if same_user or same_username:
             matches.append(entry)
+    if stale_cleared:
+        save_runtime_state()
     if not matches:
         return None
     matches.sort(key=lambda item: item.get("reviewed_at") or item.get("submitted_at") or "", reverse=True)
@@ -2992,7 +3002,10 @@ def resubmit_rejected_pulse_question(user_id: int | None, username: str | None, 
     save_runtime_state()
     return {
         "status": "ok",
-        "message": "Thanks ΓÇö your new Pulse question has been sent to F.O.X for review.",
+        "message": (
+            "Thanks — your new Pulse question has been sent to F.O.X for review. "
+            "That uses today's one replacement attempt."
+        ),
         "entry": entry,
     }
 
@@ -6624,7 +6637,7 @@ async def cards_startup_tasks():
 def root():
     return {
         "status": "Alcove API running",
-        "api_revision": "pulse-review-dm-immediate-20260807",
+        "api_revision": "pulse-resubmit-loop-fix-20260807",
         "lean_mode": LEAN_MODE,
         "pulse_admin_notify_enabled": PULSE_ADMIN_NOTIFY_ENABLED,
         "pulse_admin_telegram_suppressed": PULSE_ADMIN_TELEGRAM_SUPPRESSED,
@@ -10004,6 +10017,18 @@ def pulse_has_pending_rejection_resubmit(user_id=None, username=None) -> bool:
 
 
 def pulse_rejection_replacement_used_today(user_id=None, username=None) -> bool:
+    today = pulse_day_key()
+    username_key = (username or "").lower()
+    # Count a replacement if it was used today, even when the amended row
+    # originally belonged to an earlier day_key (legacy bad amend path).
+    for existing in pulse_question_suggestions:
+        same_user = user_id and int(existing.get("user_id") or 0) == int(user_id)
+        same_username = username_key and (existing.get("username") or "").lower() == username_key
+        if not (same_user or same_username):
+            continue
+        resubmitted_at = (existing.get("resubmitted_at") or "").strip()
+        if resubmitted_at.startswith(today):
+            return True
     rows = pulse_question_submissions_for_user_today(user_id, username)
     if any(existing.get("resubmitted_at") for existing in rows):
         return True
@@ -10035,7 +10060,13 @@ def pulse_consume_rejection_replacement(user_id=None, username=None, *, keep_ent
     """Mark today's one replacement as used and close any other open amend slots."""
     changed = False
     stamped = now_iso()
-    for existing in pulse_question_submissions_for_user_today(user_id, username):
+    today = pulse_day_key()
+    username_key = (username or "").lower()
+    for existing in pulse_question_suggestions:
+        same_user = user_id and int(existing.get("user_id") or 0) == int(user_id)
+        same_username = username_key and (existing.get("username") or "").lower() == username_key
+        if not (same_user or same_username):
+            continue
         if (existing.get("status") or "").strip().lower() != "rejected":
             continue
         if keep_entry_id is not None and existing.get("id") == keep_entry_id:
@@ -10046,9 +10077,8 @@ def pulse_consume_rejection_replacement(user_id=None, username=None, *, keep_ent
         if existing.get("resubmit_allowed"):
             existing["resubmit_allowed"] = False
             changed = True
-        if not existing.get("resubmitted_at"):
-            # Consuming the daily replacement even when the member submits a fresh
-            # question instead of amending the rejected row in place.
+        # Only stamp today's rejected rows — older rejects just lose their amend slot.
+        if (existing.get("day_key") or "") == today and not existing.get("resubmitted_at"):
             existing["resubmitted_at"] = stamped
             changed = True
     if changed:
