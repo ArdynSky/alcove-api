@@ -2541,11 +2541,11 @@ def cancel_pending_pulse_question_review_notifications(
 
 PULSE_REVIEW_DM_WEBAPP_URL = (
     "https://ardyn-alcove.com/wellbeing-concept-open-stage.html"
-    "?open=pulse&v=miniapp-wellbeing-20260806r"
+    "?open=pulse&v=miniapp-wellbeing-20260807a"
 )
 PULSE_REVIEW_DM_SUBMIT_WEBAPP_URL = (
     "https://ardyn-alcove.com/wellbeing-concept-open-stage.html"
-    "?open=pulse&submit=new&v=miniapp-wellbeing-20260806r"
+    "?open=pulse&submit=new&v=miniapp-wellbeing-20260807a"
 )
 
 
@@ -6644,7 +6644,7 @@ async def cards_startup_tasks():
 def root():
     return {
         "status": "Alcove API running",
-        "api_revision": "pulse-reset-test-quota-20260807",
+        "api_revision": "pulse-deeplink-silent-20260807",
         "lean_mode": LEAN_MODE,
         "pulse_admin_notify_enabled": PULSE_ADMIN_NOTIFY_ENABLED,
         "pulse_admin_telegram_suppressed": PULSE_ADMIN_TELEGRAM_SUPPRESSED,
