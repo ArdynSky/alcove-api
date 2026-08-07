@@ -1,4 +1,4 @@
-from fastapi import FastAPI
+﻿from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel
@@ -1539,7 +1539,9 @@ def sanitize_member_spotlight_entry(entry: dict, viewer: dict) -> dict:
     return {
         "spotlight_id": entry.get("spotlight_id"),
         "nominee_display_name": entry.get("nominee_display_name") or entry.get("nominee_username"),
+        "nominee_username": entry.get("nominee_username"),
         "nominator_display_name": entry.get("nominator_display_name") or entry.get("nominator_username"),
+        "nominator_username": entry.get("nominator_username"),
         "reason": entry.get("reason"),
         "style": entry.get("style"),
         "published_at": entry.get("published_at"),
