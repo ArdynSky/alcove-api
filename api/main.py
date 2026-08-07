@@ -6644,7 +6644,7 @@ async def cards_startup_tasks():
 def root():
     return {
         "status": "Alcove API running",
-        "api_revision": "pulse-dm-dedupe-deeplink-20260807",
+        "api_revision": "pulse-reset-test-quota-20260807",
         "lean_mode": LEAN_MODE,
         "pulse_admin_notify_enabled": PULSE_ADMIN_NOTIFY_ENABLED,
         "pulse_admin_telegram_suppressed": PULSE_ADMIN_TELEGRAM_SUPPRESSED,
@@ -11031,6 +11031,51 @@ def bot_mark_pulse_question_review_notification_sent(
     alert["notified_at"] = now_iso()
     save_runtime_state()
     return {"status": "ok", "notification": alert}
+
+
+@app.post("/api/bot-sync/pulse-questions/reset-daily-quota")
+def bot_reset_pulse_question_daily_quota(
+    payload: dict | None = None,
+    x_bot_sync_secret: str | None = Header(default=None),
+):
+    """Tester helper: clear today's submission quota / replacement-used markers for a member."""
+    verify_bot_sync_secret(x_bot_sync_secret)
+    payload = payload or {}
+    try:
+        user_id = int(payload.get("user_id") or 0) or None
+    except (TypeError, ValueError):
+        user_id = None
+    username = (payload.get("username") or "").strip().lower() or None
+    if not user_id and not username:
+        return {"status": "error", "message": "user_id or username is required."}
+
+    today = pulse_day_key()
+    cleared_today = 0
+    cleared_markers = 0
+    for entry in pulse_question_suggestions:
+        same_user = user_id and int(entry.get("user_id") or 0) == int(user_id)
+        same_username = username and (entry.get("username") or "").lower() == username
+        if not (same_user or same_username):
+            continue
+        if (entry.get("day_key") or "") == today and (entry.get("status") or "").strip().lower() != "deleted":
+            entry["status"] = "deleted"
+            entry["resubmit_allowed"] = False
+            entry["needs_admin_notify"] = False
+            cleared_today += 1
+        resubmitted_at = (entry.get("resubmitted_at") or "").strip()
+        if resubmitted_at.startswith(today):
+            entry["resubmitted_at"] = None
+            cleared_markers += 1
+        if entry.get("resubmit_allowed") and (entry.get("day_key") or "") != today:
+            entry["resubmit_allowed"] = False
+    save_runtime_state(force=True)
+    return {
+        "status": "ok",
+        "day_key": today,
+        "cleared_today_submissions": cleared_today,
+        "cleared_replacement_markers": cleared_markers,
+        "can_submit_now": True,
+    }
 
 
 @app.get("/api/bot-sync/pulse-questions/resubmit-pending")
