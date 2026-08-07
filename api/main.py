@@ -2545,7 +2545,7 @@ PULSE_REVIEW_DM_WEBAPP_URL = (
 )
 PULSE_REVIEW_DM_SUBMIT_WEBAPP_URL = (
     "https://ardyn-alcove.com/wellbeing-concept-open-stage.html"
-    "?open=pulse&submit=replace&v=miniapp-wellbeing-20260806r"
+    "?open=pulse&submit=new&v=miniapp-wellbeing-20260806r"
 )
 
 
@@ -2595,12 +2595,10 @@ def pulse_question_review_dm_content(notification: dict) -> tuple[str, str, str]
                 "Your Pulse question was not approved this time.\n\n"
                 f"<b>{escape(question)}</b>\n\n"
                 f"<b>Reason from F.O.X</b>\n{escape(reason)}\n\n"
-                "You get <b>one</b> replacement attempt today — choose your words carefully. "
-                "If it is approved, it will replace the rejected one.\n\n"
-                "Tap the button below to open Pulse and submit your replacement, "
-                "or reply to this message with your new question text."
+                "You get <b>one</b> replacement attempt today — choose your words carefully.\n\n"
+                "Tap the button below to open Pulse in the Mini App and submit your new question there."
             )
-            return text, "Tap to submit a replacement", PULSE_REVIEW_DM_SUBMIT_WEBAPP_URL
+            return text, "Submit in Pulse", PULSE_REVIEW_DM_SUBMIT_WEBAPP_URL
         text = (
             "Your Pulse question was not approved this time.\n\n"
             f"<b>{escape(question)}</b>\n\n"
@@ -2623,6 +2621,10 @@ def try_send_pulse_question_review_dm_now(notification: dict) -> bool:
     content = pulse_question_review_dm_content(notification)
     if not user_id or not content:
         return False
+    # Claim before calling Telegram so the FOX worker cannot also deliver this row.
+    notification["notified_at"] = now_iso()
+    notification["delivery"] = "api_claim"
+    save_runtime_state()
     text, button_text, button_url = content
     base_payload = {
         "chat_id": int(user_id),
@@ -2648,8 +2650,8 @@ def try_send_pulse_question_review_dm_now(notification: dict) -> bool:
     for payload in attempts:
         ok, detail = telegram_bot_send_message(payload)
         if ok:
-            notification["notified_at"] = now_iso()
             notification["delivery"] = "api_immediate"
+            save_runtime_state()
             return True
         last_detail = detail
     lowered = last_detail.lower()
@@ -2662,14 +2664,19 @@ def try_send_pulse_question_review_dm_now(notification: dict) -> bool:
             "chat not found",
         )
     ):
-        notification["notified_at"] = now_iso()
         notification["cancelled"] = True
         notification["cancel_reason"] = "user_unreachable"
+        notification["delivery"] = "api_unreachable"
+        save_runtime_state()
         print(
             f"[{now_iso()}] pulse review DM unreachable for {user_id}: {last_detail}",
             flush=True,
         )
         return False
+    # Transient failure — release the claim so a later retry can send once.
+    notification["notified_at"] = None
+    notification["delivery"] = None
+    save_runtime_state()
     print(
         f"[{now_iso()}] pulse review DM send deferred for {user_id}: {last_detail}",
         flush=True,
@@ -6637,7 +6644,7 @@ async def cards_startup_tasks():
 def root():
     return {
         "status": "Alcove API running",
-        "api_revision": "pulse-resubmit-loop-fix-20260807",
+        "api_revision": "pulse-dm-dedupe-deeplink-20260807",
         "lean_mode": LEAN_MODE,
         "pulse_admin_notify_enabled": PULSE_ADMIN_NOTIFY_ENABLED,
         "pulse_admin_telegram_suppressed": PULSE_ADMIN_TELEGRAM_SUPPRESSED,
