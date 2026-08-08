@@ -6773,7 +6773,7 @@ async def cards_startup_tasks():
 def root():
     return {
         "status": "Alcove API running",
-        "api_revision": "pulse-deeplink-silent-20260807",
+        "api_revision": "pulse-archive-delete-20260808",
         "lean_mode": LEAN_MODE,
         "pulse_admin_notify_enabled": PULSE_ADMIN_NOTIFY_ENABLED,
         "pulse_admin_telegram_suppressed": PULSE_ADMIN_TELEGRAM_SUPPRESSED,
@@ -7365,10 +7365,26 @@ def admin_pulse_archive_delete_question(suggestion_id: int, admin_secret: str):
     return {"status": "ok", "deleted": deleted}
 
 
+@app.post("/api/admin/pulse-archive/questions/{suggestion_id}/delete")
+def admin_pulse_archive_delete_question_post(suggestion_id: int, payload: AdminSecretQuery):
+    """POST fallback for clients that struggle with DELETE."""
+    verify_admin_secret(payload.admin_secret)
+    deleted = permanently_delete_pulse_archive_question(suggestion_id)
+    return {"status": "ok", "deleted": deleted}
+
+
 @app.delete("/api/admin/pulse-archive/answers/{pulse_id}")
 def admin_pulse_archive_delete_answer(pulse_id: int, admin_secret: str):
     """Permanently delete one archived Pulse answer."""
     verify_admin_secret(admin_secret)
+    deleted = permanently_delete_pulse_archive_answer(pulse_id)
+    return {"status": "ok", "deleted": deleted}
+
+
+@app.post("/api/admin/pulse-archive/answers/{pulse_id}/delete")
+def admin_pulse_archive_delete_answer_post(pulse_id: int, payload: AdminSecretQuery):
+    """POST fallback for clients that struggle with DELETE."""
+    verify_admin_secret(payload.admin_secret)
     deleted = permanently_delete_pulse_archive_answer(pulse_id)
     return {"status": "ok", "deleted": deleted}
 
