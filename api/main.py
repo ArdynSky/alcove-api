@@ -1679,6 +1679,109 @@ def sanitize_member_spotlight_entry(entry: dict, viewer: dict) -> dict:
     }
 
 
+def spotlight_archive_stats_payload() -> dict:
+    ensure_spotlight_archive_store()
+    backfill_spotlight_archive_from_runtime()
+    with sqlite3.connect(STATE_DB_PATH) as conn:
+        count = int(conn.execute("SELECT COUNT(*) FROM spotlight_archive").fetchone()[0] or 0)
+        first_day = conn.execute(
+            "SELECT MIN(day_key) FROM spotlight_archive WHERE COALESCE(day_key, '') != ''"
+        ).fetchone()[0]
+        last_day = conn.execute(
+            "SELECT MAX(day_key) FROM spotlight_archive WHERE COALESCE(day_key, '') != ''"
+        ).fetchone()[0]
+    return {
+        "entry_count": count,
+        "first_day_key": first_day,
+        "last_day_key": last_day,
+        "first_day_label": pulse_day_label(first_day) if first_day else None,
+        "last_day_label": pulse_day_label(last_day) if last_day else None,
+    }
+
+
+def permanently_delete_spotlight_archive_entry(spotlight_id: int) -> dict:
+    """Hard-delete one published Spotlight archive row and its runtime twin if present."""
+    ensure_spotlight_archive_store()
+    sid = int(spotlight_id)
+    with sqlite3.connect(STATE_DB_PATH) as conn:
+        cur = conn.execute("DELETE FROM spotlight_archive WHERE spotlight_id = ?", (sid,))
+        archive_deleted = int(cur.rowcount or 0)
+        conn.commit()
+    runtime_deleted = 0
+    kept = []
+    for entry in spotlight_entries:
+        if int(entry.get("id") or 0) == sid:
+            runtime_deleted += 1
+            continue
+        kept.append(entry)
+    if runtime_deleted:
+        spotlight_entries[:] = kept
+        save_runtime_state(force=True)
+    if archive_deleted <= 0 and runtime_deleted <= 0:
+        raise HTTPException(status_code=404, detail="Spotlight archive entry not found")
+    return {
+        "spotlight_id": sid,
+        "archive_deleted": archive_deleted,
+        "runtime_deleted": runtime_deleted,
+    }
+
+
+def permanently_delete_spotlight_runtime_entry(spotlight_id: int) -> dict:
+    """Permanently remove a runtime Spotlight nomination/entry (pending/rejected/approved)."""
+    sid = int(spotlight_id)
+    runtime_deleted = 0
+    kept = []
+    for entry in spotlight_entries:
+        if int(entry.get("id") or 0) == sid:
+            runtime_deleted += 1
+            continue
+        kept.append(entry)
+    if runtime_deleted <= 0:
+        raise HTTPException(status_code=404, detail="Spotlight entry not found")
+    spotlight_entries[:] = kept
+    # Also clear any published archive twin so member Archive stays consistent.
+    ensure_spotlight_archive_store()
+    with sqlite3.connect(STATE_DB_PATH) as conn:
+        cur = conn.execute("DELETE FROM spotlight_archive WHERE spotlight_id = ?", (sid,))
+        archive_deleted = int(cur.rowcount or 0)
+        conn.commit()
+    save_runtime_state(force=True)
+    return {
+        "spotlight_id": sid,
+        "runtime_deleted": runtime_deleted,
+        "archive_deleted": archive_deleted,
+    }
+
+
+def admin_spotlight_runtime_entries(status: str | None = None) -> list[dict]:
+    status_key = (status or "").strip().lower()
+    entries = []
+    for entry in spotlight_entries:
+        current = (entry.get("status") or "").strip().lower()
+        if status_key and current != status_key:
+            continue
+        entries.append({
+            "id": entry.get("id"),
+            "status": entry.get("status"),
+            "style": entry.get("style"),
+            "reason": entry.get("edited_reason") or entry.get("reason"),
+            "edited_reason": entry.get("edited_reason"),
+            "nominee_display_name": entry.get("nominee_display_name"),
+            "nominee_username": entry.get("nominee_username"),
+            "nominee_user_id": entry.get("nominee_user_id"),
+            "nominator_display_name": entry.get("nominator_display_name"),
+            "nominator_username": entry.get("nominator_username"),
+            "nominator_user_id": entry.get("nominator_user_id"),
+            "day_key": entry.get("day_key"),
+            "time": entry.get("time"),
+            "published_at": entry.get("published_at"),
+            "publish_pending": bool(entry.get("publish_pending")),
+            "reviewed_at": entry.get("reviewed_at"),
+        })
+    entries.sort(key=lambda item: int(item.get("id") or 0), reverse=True)
+    return entries
+
+
 def wheel_archive_reviews_for_entry(entry: dict) -> list[dict]:
     entry_id = entry.get("id")
     embedded = entry.get("reviews")
@@ -6773,7 +6876,7 @@ async def cards_startup_tasks():
 def root():
     return {
         "status": "Alcove API running",
-        "api_revision": "pulse-archive-delete-20260808",
+        "api_revision": "spotlight-archive-admin-20260808",
         "lean_mode": LEAN_MODE,
         "pulse_admin_notify_enabled": PULSE_ADMIN_NOTIFY_ENABLED,
         "pulse_admin_telegram_suppressed": PULSE_ADMIN_TELEGRAM_SUPPRESSED,
@@ -7386,6 +7489,70 @@ def admin_pulse_archive_delete_answer_post(pulse_id: int, payload: AdminSecretQu
     """POST fallback for clients that struggle with DELETE."""
     verify_admin_secret(payload.admin_secret)
     deleted = permanently_delete_pulse_archive_answer(pulse_id)
+    return {"status": "ok", "deleted": deleted}
+
+
+@app.get("/api/admin/spotlight-archive/stats")
+def admin_spotlight_archive_stats(admin_secret: str):
+    verify_admin_secret(admin_secret)
+    return {"status": "ok", "stats": spotlight_archive_stats_payload()}
+
+
+@app.get("/api/admin/spotlight-archive")
+def admin_spotlight_archive_list(
+    admin_secret: str,
+    style: str | None = None,
+    nominator: str | None = None,
+    nominee: str | None = None,
+    from_day: str | None = None,
+    to_day: str | None = None,
+    sort: str = "date_desc",
+    page: int = 1,
+    limit: int = 50,
+):
+    verify_admin_secret(admin_secret)
+    return {
+        "status": "ok",
+        **query_spotlight_archive(
+            style=style,
+            nominator=nominator,
+            nominee=nominee,
+            from_day=from_day,
+            to_day=to_day,
+            sort=sort,
+            page=page,
+            limit=limit,
+        ),
+    }
+
+
+@app.delete("/api/admin/spotlight-archive/{spotlight_id}")
+def admin_spotlight_archive_delete(spotlight_id: int, admin_secret: str):
+    verify_admin_secret(admin_secret)
+    deleted = permanently_delete_spotlight_archive_entry(spotlight_id)
+    return {"status": "ok", "deleted": deleted}
+
+
+@app.post("/api/admin/spotlight-archive/{spotlight_id}/delete")
+def admin_spotlight_archive_delete_post(spotlight_id: int, payload: AdminSecretQuery):
+    verify_admin_secret(payload.admin_secret)
+    deleted = permanently_delete_spotlight_archive_entry(spotlight_id)
+    return {"status": "ok", "deleted": deleted}
+
+
+@app.get("/api/admin/spotlights")
+def admin_spotlight_runtime_list(admin_secret: str, status: str | None = None):
+    """List runtime Spotlight nominations/entries for Feature Admin cleanup."""
+    verify_admin_secret(admin_secret)
+    entries = admin_spotlight_runtime_entries(status=status)
+    return {"status": "ok", "entries": entries, "total": len(entries)}
+
+
+@app.post("/api/admin/spotlights/{entry_id}/delete")
+def admin_spotlight_runtime_delete_post(entry_id: int, payload: AdminSecretQuery):
+    """Permanently delete a runtime Spotlight nomination/entry."""
+    verify_admin_secret(payload.admin_secret)
+    deleted = permanently_delete_spotlight_runtime_entry(entry_id)
     return {"status": "ok", "deleted": deleted}
 
 
@@ -8048,6 +8215,9 @@ def admin_spotlight_action(entry_id: int, payload: AdminSpotlightAction):
             entry["status"] = "approved"
             entry["reviewed_at"] = now_iso()
             entry["publish_pending"] = True
+        elif action == "delete":
+            deleted = permanently_delete_spotlight_runtime_entry(entry_id)
+            return {"status": "ok", "deleted": deleted}
         else:
             raise HTTPException(status_code=400, detail="Unknown Spotlight action.")
         save_runtime_state()
