@@ -704,11 +704,18 @@ def pulse_suggestion_id_for_question(question: str, pool: str) -> int | None:
     return None
 
 
+# Only approved/reserved Pulse questions belong in the member-facing archive.
+MEMBER_PULSE_ARCHIVE_QUESTION_STATUSES = ("approved", "reserved")
+
+
 def archive_pulse_question_from_suggestion(entry: dict) -> None:
     if not entry:
         return
     suggestion_id = entry.get("id")
     if suggestion_id is None:
+        return
+    # Keep pending/rejected/deleted out of the durable archive.
+    if (entry.get("status") or "").strip().lower() not in MEMBER_PULSE_ARCHIVE_QUESTION_STATUSES:
         return
     question = pulse_suggestion_question(entry)
     if not question:
@@ -828,12 +835,125 @@ def pulse_archive_backfill() -> dict:
         archive_completed_pulse_entry(entry)
         answers += 1
     for entry in pulse_question_suggestions:
-        if entry.get("status") in {"rejected", "deleted"}:
+        # Member archive should only keep approved/reserved history, not pending review.
+        if entry.get("status") not in {"approved", "reserved"}:
             continue
         archive_pulse_question_from_suggestion(entry)
         questions += 1
     pulse_archive_meta_set("backfill_v1", "done")
     return {"answers": answers, "questions": questions, "skipped": False}
+
+
+def permanently_delete_pulse_archive_answer(pulse_id: int) -> dict:
+    """Hard-delete one archived answer and its live runtime twin (if present)."""
+    ensure_pulse_archive_store()
+    pid = int(pulse_id)
+    with sqlite3.connect(STATE_DB_PATH) as conn:
+        cur = conn.execute("DELETE FROM pulse_archive_answers WHERE pulse_id = ?", (pid,))
+        archive_deleted = int(cur.rowcount or 0)
+        conn.commit()
+    runtime_deleted = 0
+    kept = []
+    for entry in pulse_entries:
+        if int(entry.get("id") or 0) == pid:
+            runtime_deleted += 1
+            continue
+        kept.append(entry)
+    if runtime_deleted:
+        pulse_entries[:] = kept
+        save_runtime_state(force=True)
+    if archive_deleted <= 0 and runtime_deleted <= 0:
+        raise HTTPException(status_code=404, detail="Pulse answer not found")
+    return {
+        "pulse_id": pid,
+        "archive_deleted": archive_deleted,
+        "runtime_deleted": runtime_deleted,
+    }
+
+
+def permanently_delete_pulse_archive_question(suggestion_id: int) -> dict:
+    """Hard-delete one archived question, cascade its answers, and soft-delete the live suggestion."""
+    ensure_pulse_archive_store()
+    sid = int(suggestion_id)
+    with sqlite3.connect(STATE_DB_PATH) as conn:
+        row = conn.execute(
+            """
+            SELECT suggestion_id, question, pool
+            FROM pulse_archive_questions
+            WHERE suggestion_id = ?
+            """,
+            (sid,),
+        ).fetchone()
+        if not row:
+            # Still allow deleting a live suggestion even if it never reached archive.
+            question = None
+            pool = None
+        else:
+            question = (row[1] or "").strip()
+            pool = (row[2] or "green").strip().lower()
+        answers_deleted = 0
+        if question:
+            cur = conn.execute(
+                """
+                DELETE FROM pulse_archive_answers
+                WHERE suggestion_id = ?
+                   OR (COALESCE(suggestion_id, 0) = 0 AND question = ? AND pool = ?)
+                """,
+                (sid, question, pool or "green"),
+            )
+            answers_deleted = int(cur.rowcount or 0)
+        else:
+            cur = conn.execute(
+                "DELETE FROM pulse_archive_answers WHERE suggestion_id = ?",
+                (sid,),
+            )
+            answers_deleted = int(cur.rowcount or 0)
+        qcur = conn.execute(
+            "DELETE FROM pulse_archive_questions WHERE suggestion_id = ?",
+            (sid,),
+        )
+        questions_deleted = int(qcur.rowcount or 0)
+        conn.commit()
+
+    runtime_answers_deleted = 0
+    if question:
+        kept = []
+        for entry in pulse_entries:
+            entry_question = (entry.get("question") or "").strip()
+            entry_pool = (entry.get("pulse_type") or "green").strip().lower()
+            if entry_question == question and entry_pool == (pool or "green"):
+                runtime_answers_deleted += 1
+                continue
+            kept.append(entry)
+        if runtime_answers_deleted:
+            pulse_entries[:] = kept
+
+    suggestion_deleted = False
+    for entry in pulse_question_suggestions:
+        if int(entry.get("id") or 0) != sid:
+            continue
+        cancel_pending_pulse_question_review_notifications(sid, reason="deleted")
+        entry["status"] = "deleted"
+        entry["rejection_reason"] = None
+        entry["resubmit_allowed"] = False
+        entry["needs_admin_notify"] = False
+        entry["reviewed_at"] = now_iso()
+        suggestion_deleted = True
+        break
+
+    if questions_deleted <= 0 and answers_deleted <= 0 and not suggestion_deleted and runtime_answers_deleted <= 0:
+        raise HTTPException(status_code=404, detail="Pulse question not found")
+
+    if suggestion_deleted or runtime_answers_deleted:
+        save_runtime_state(force=True)
+
+    return {
+        "suggestion_id": sid,
+        "questions_deleted": questions_deleted,
+        "answers_deleted": answers_deleted,
+        "runtime_answers_deleted": runtime_answers_deleted,
+        "suggestion_soft_deleted": suggestion_deleted,
+    }
 
 
 def pulse_archive_answer_row_to_payload(row: tuple) -> dict:
@@ -1032,6 +1152,7 @@ def query_pulse_archive_questions(
     *,
     pool: str | None = None,
     status: str | None = None,
+    statuses: list[str] | None = None,
     q: str | None = None,
     from_day: str | None = None,
     to_day: str | None = None,
@@ -1053,7 +1174,11 @@ def query_pulse_archive_questions(
         else:
             clauses.append(f"pool IN ({','.join('?' * len(pools))})")
             params.extend(pools)
-    if status:
+    status_list = [item.strip() for item in (statuses or []) if item and str(item).strip()]
+    if status_list:
+        clauses.append(f"status IN ({','.join('?' * len(status_list))})")
+        params.extend(status_list)
+    elif status:
         clauses.append("status = ?")
         params.append(status.strip())
     needle = (q or "").strip().lower()
@@ -1248,6 +1373,8 @@ def build_member_pulse_archive_payload(
     if view_key in {"questions", "all"}:
         question_result = query_pulse_archive_questions(
             pool=pool,
+            # Pending / rejected / deleted questions stay out of the member Archive.
+            statuses=list(MEMBER_PULSE_ARCHIVE_QUESTION_STATUSES),
             q=q,
             from_day=from_day,
             to_day=to_day,
@@ -7228,6 +7355,22 @@ def admin_pulse_archive_export(
         media_type="text/csv; charset=utf-8",
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
+
+
+@app.delete("/api/admin/pulse-archive/questions/{suggestion_id}")
+def admin_pulse_archive_delete_question(suggestion_id: int, admin_secret: str):
+    """Permanently delete an archived Pulse question and cascade its answers."""
+    verify_admin_secret(admin_secret)
+    deleted = permanently_delete_pulse_archive_question(suggestion_id)
+    return {"status": "ok", "deleted": deleted}
+
+
+@app.delete("/api/admin/pulse-archive/answers/{pulse_id}")
+def admin_pulse_archive_delete_answer(pulse_id: int, admin_secret: str):
+    """Permanently delete one archived Pulse answer."""
+    verify_admin_secret(admin_secret)
+    deleted = permanently_delete_pulse_archive_answer(pulse_id)
+    return {"status": "ok", "deleted": deleted}
 
 
 @app.get("/api/archive/summary")
