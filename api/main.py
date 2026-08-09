@@ -1,4 +1,4 @@
-﻿from fastapi import FastAPI
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel
@@ -38,6 +38,7 @@ from .cards_game import (
 from .cards_progress import fetch_pending_rewards, mark_rewards_claimed, profile_summary
 from .cards_ws_manager import cards_ws_manager
 from . import fox_messages as fox_messages_store
+from .home_alerts import router as home_alerts_router
 
 try:
     from dotenv import load_dotenv
@@ -54,6 +55,7 @@ except ImportError:
     pass
 
 app = FastAPI()
+app.include_router(home_alerts_router)
 
 CORS_ALLOWED_ORIGINS = [
     "null",
