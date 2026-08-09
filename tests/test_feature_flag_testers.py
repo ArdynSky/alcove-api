@@ -36,6 +36,39 @@ class FeatureFlagTesterUsernamesTests(unittest.TestCase):
         self.assertEqual(payload["tester_usernames"], ["tester_one"])
         self.assertIn("pages", payload["features"])
 
+    def test_reward_catalog_rejects_retired_effect_items(self):
+        self.assertIsNone(
+            main._normalize_reward_pack_item({"type": "effect", "id": "shimmer"})
+        )
+
+    def test_reward_catalog_preserves_skin_layer_layout(self):
+        stamp = main._normalize_reward_pack_item(
+            {"type": "skin", "id": "crest", "layout": "square"}
+        )
+        banner = main._normalize_reward_pack_item(
+            {"type": "skin", "id": "scene", "skin_layout": "wide"}
+        )
+        self.assertEqual(stamp["layout"], "stamp")
+        self.assertEqual(banner["layout"], "banner")
+
+    def test_achievement_uploads_filter_retired_effect_items(self):
+        achievements = main.normalize_reward_achievements(
+            [
+                {
+                    "id": "test-achievement",
+                    "name": "Test",
+                    "items": [
+                        {"type": "effect", "id": "sparkle"},
+                        {"type": "skin", "id": "crest", "layout": "stamp"},
+                    ],
+                }
+            ]
+        )
+        self.assertEqual(
+            achievements[0]["items"],
+            [{"type": "skin", "id": "crest", "layout": "stamp"}],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

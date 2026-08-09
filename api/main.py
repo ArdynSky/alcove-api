@@ -3713,12 +3713,15 @@ def resolve_reward_asset_file(filename: str) -> str:
     return path
 
 
+REWARD_PACK_ITEM_TYPES = {"color", "sticker", "skin", "backdrop", "title"}
+
+
 def _normalize_reward_pack_item(item) -> dict | None:
     if not isinstance(item, dict):
         return None
     item_id = str(item.get("id") or "").strip()
     item_type = str(item.get("type") or "").strip().lower()
-    if not item_id or not item_type:
+    if not item_id or item_type not in REWARD_PACK_ITEM_TYPES:
         return None
     entry = {
         "type": item_type,
@@ -3733,6 +3736,12 @@ def _normalize_reward_pack_item(item) -> dict | None:
     swatch = str(item.get("swatch") or "").strip()
     if swatch:
         entry["swatch"] = swatch
+    if item_type == "skin":
+        layout = str(item.get("layout") or item.get("skin_layout") or "").strip().lower()
+        if layout in {"banner", "fill", "wide", "full"}:
+            entry["layout"] = "banner"
+        elif layout in {"stamp", "square", "corner", "seal"}:
+            entry["layout"] = "stamp"
     return entry
 
 
