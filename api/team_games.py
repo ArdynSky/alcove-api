@@ -18,9 +18,11 @@ router = APIRouter(prefix="/api/team-game", tags=["team-game"])
 
 DATA_DIR = Path(os.getenv("ALCOVE_TEAM_GAME_DIR", Path.cwd() / "team_game_data"))
 UPLOAD_DIR = DATA_DIR / "uploads"
+BACKGROUND_DIR = DATA_DIR / "backgrounds"
 DB_PATH = DATA_DIR / "team_game.sqlite3"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+BACKGROUND_DIR.mkdir(parents=True, exist_ok=True)
 _LOCK = threading.RLock()
 
 
@@ -62,6 +64,7 @@ def _default_state():
         "participants": [],
         "teams": [],
         "reveal": {"visible": False, "submission_id": None},
+        "background_filename": None,
     }
 
 
@@ -76,6 +79,7 @@ def _load_state():
             state = json.loads(row["payload"])
         except Exception:
             return _default_state()
+        state.setdefault("background_filename", None)
         return state
 
 
@@ -115,11 +119,13 @@ def _public_state(state, user_id: Optional[str] = None):
     out = dict(state)
     out["participants"] = list(state.get("participants", []))
     out["teams"] = list(state.get("teams", []))
+    bg = state.get("background_filename")
+    out["background_url"] = f"/api/team-game/background-media/{bg}" if bg else None
     uid = str(user_id or "").strip()
     mine = _find_team_for_user(state, uid) if uid else None
     out["joined"] = bool(uid and _find_participant(state, uid))
     out["my_team"] = mine
-    out["team_chat_enabled"] = bool(mine and state.get("status") in {"assigned", "running"})
+    out["team_chat_enabled"] = bool(mine and state.get("status") == "running")
     with _LOCK:
         con = _conn()
         rows = con.execute(
@@ -167,7 +173,10 @@ def team_game_state(user_id: Optional[str] = None):
 @router.post("/start")
 def team_game_start(payload: StartPayload):
     duration = max(30, min(int(payload.duration_seconds or 300), 3600))
+    previous = _load_state()
     state = _default_state()
+    if previous.get("game_type") == (payload.game_type or "drawing"):
+        state["background_filename"] = previous.get("background_filename")
     state.update(
         {
             "session_id": str(uuid.uuid4()),
@@ -181,6 +190,54 @@ def team_game_start(payload: StartPayload):
     )
     _save_state(state)
     return _public_state(state)
+
+
+@router.post("/background")
+async def team_game_background(file: UploadFile = File(...)):
+    state = _load_state()
+    content_type = (file.content_type or "").lower()
+    ext = Path(file.filename or "background.mp4").suffix.lower()
+    if content_type not in {"video/mp4", "video/webm"} and ext not in {".mp4", ".webm"}:
+        raise HTTPException(status_code=400, detail="Please upload an MP4 or WebM video")
+    data = await file.read()
+    if len(data) > 40 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="Background video must be under 40 MB")
+    if ext not in {".mp4", ".webm"}:
+        ext = ".mp4" if "mp4" in content_type else ".webm"
+    old = state.get("background_filename")
+    filename = f"{state.get('game_type') or 'activity'}-{uuid.uuid4().hex[:12]}{ext}"
+    (BACKGROUND_DIR / filename).write_bytes(data)
+    state["background_filename"] = filename
+    _save_state(state)
+    if old:
+        try:
+            (BACKGROUND_DIR / Path(old).name).unlink(missing_ok=True)
+        except Exception:
+            pass
+    return _public_state(state)
+
+
+@router.delete("/background")
+def team_game_background_remove():
+    state = _load_state()
+    old = state.get("background_filename")
+    state["background_filename"] = None
+    _save_state(state)
+    if old:
+        try:
+            (BACKGROUND_DIR / Path(old).name).unlink(missing_ok=True)
+        except Exception:
+            pass
+    return _public_state(state)
+
+
+@router.get("/background-media/{filename}")
+def team_game_background_media(filename: str):
+    safe = Path(filename).name
+    path = BACKGROUND_DIR / safe
+    if not path.exists() or not path.is_file():
+        raise HTTPException(status_code=404, detail="Background video not found")
+    return FileResponse(path)
 
 
 @router.post("/join")
@@ -259,8 +316,8 @@ def team_game_chat(user_id: str, after_id: int = 0):
     state = _load_state()
     uid = _clean_user_id(user_id)
     team = _find_team_for_user(state, uid)
-    if not team or state.get("status") not in {"assigned", "running"}:
-        raise HTTPException(status_code=403, detail="You are not assigned to an active team")
+    if not team or state.get("status") != "running":
+        raise HTTPException(status_code=403, detail="Private chat opens when the activity starts")
     with _LOCK:
         con = _conn()
         rows = con.execute(
@@ -276,8 +333,8 @@ def team_game_chat_post(payload: ChatPayload):
     state = _load_state()
     uid = _clean_user_id(payload.user_id)
     team = _find_team_for_user(state, uid)
-    if not team or state.get("status") not in {"assigned", "running"}:
-        raise HTTPException(status_code=403, detail="You are not assigned to an active team")
+    if not team or state.get("status") != "running":
+        raise HTTPException(status_code=403, detail="Private chat opens when the activity starts")
     body = (payload.body or "").strip()
     if not body:
         raise HTTPException(status_code=400, detail="Message is empty")
