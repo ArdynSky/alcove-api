@@ -39,6 +39,7 @@ from .cards_progress import fetch_pending_rewards, mark_rewards_claimed, profile
 from .cards_ws_manager import cards_ws_manager
 from . import fox_messages as fox_messages_store
 from .home_alerts import router as home_alerts_router
+from .team_games import router as team_games_router
 
 try:
     from dotenv import load_dotenv
@@ -56,6 +57,7 @@ except ImportError:
 
 app = FastAPI()
 app.include_router(home_alerts_router)
+app.include_router(team_games_router)
 
 CORS_ALLOWED_ORIGINS = [
     "null",
