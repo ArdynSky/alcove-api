@@ -1,0 +1,32 @@
+name: Preserve custom pack skin opacity
+on:
+  push:
+    paths:
+      - .github/workflows/add-custom-pack-opacity.yml
+permissions:
+  contents: write
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Patch API
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          p=Path('api/custom_rewards.py')
+          s=p.read_text()
+          old='''        for key in ("name", "label", "image", "layout"):\n            value = str(raw.get(key) or "").strip()\n            if value:\n                item[key] = value[:500]\n        out.append(item)'''
+          new='''        for key in ("name", "label", "image", "layout"):\n            value = str(raw.get(key) or "").strip()\n            if value:\n                item[key] = value[:500]\n        if kind == "skin":\n            try:\n                opacity_percent = int(round(float(raw.get("opacity_percent", 20))))\n            except (TypeError, ValueError):\n                opacity_percent = 20\n            item["opacity_percent"] = max(10, min(opacity_percent, 30))\n        out.append(item)'''
+          if old not in s: raise SystemExit('clean items block not found')
+          p.write_text(s.replace(old,new,1))
+          PY
+          python -m py_compile api/custom_rewards.py api/main.py
+      - name: Commit and push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add api/custom_rewards.py
+          git diff --cached --quiet || git commit -m "Store custom pack skin opacity"
+          git pull --rebase origin main
+          git push origin HEAD:main
