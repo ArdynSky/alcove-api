@@ -64,6 +64,12 @@ def _clean_items(items):
             value = str(raw.get(key) or "").strip()
             if value:
                 item[key] = value[:500]
+        if kind == "skin":
+            try:
+                opacity_percent = int(round(float(raw.get("opacity_percent", 20))))
+            except (TypeError, ValueError):
+                opacity_percent = 20
+            item["opacity_percent"] = max(10, min(opacity_percent, 30))
         out.append(item)
     if not out:
         raise HTTPException(status_code=400, detail="Add at least one reward item")
