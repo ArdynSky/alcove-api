@@ -1,0 +1,35 @@
+name: Patch debate router
+on:
+  push:
+    paths:
+      - '.github/workflows/patch-debate-router.yml'
+permissions:
+  contents: write
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Patch main router imports
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          p=Path('api/main.py')
+          s=p.read_text()
+          marker='from .custom_rewards import router as custom_rewards_router\n'
+          addition='from .debate_games import router as debate_games_router\n'
+          if addition not in s:
+              s=s.replace(marker, marker+addition)
+          include='app.include_router(custom_rewards_router)\n'
+          debate='app.include_router(debate_games_router)\n'
+          if debate not in s:
+              s=s.replace(include, include+debate)
+          p.write_text(s)
+          PY
+      - name: Commit router wiring
+        run: |
+          git config user.name "alcove-debate-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add api/main.py
+          git diff --cached --quiet || git commit -m "Wire debate router into API"
+          git push
