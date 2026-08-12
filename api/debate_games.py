@@ -25,8 +25,21 @@ _LOCK = threading.RLock()
 PRESENCE_TTL_SECONDS = 22
 
 
+def _now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
 def _iso(dt: Optional[datetime] = None) -> str:
-    return (dt or datetime.now(timezone.utc)).isoformat()
+    return (dt or _now()).isoformat()
+
+
+def _parse(value: Optional[str]) -> Optional[datetime]:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _conn():
@@ -45,21 +58,24 @@ def _default_state():
         "status": "idle",
         "title": "Live Debate",
         "statement": "",
-        "description": "Join the debate for a chance to argue your side, then everyone votes for the winner.",
+        "description": "",
+        "registration_seconds": 60,
+        "registration_ends_at": None,
         "duration_seconds": 120,
         "voting_seconds": 30,
         "created_at": None,
-        "started_at": None,
-        "ends_at": None,
         "participants": [],
         "contestants": [],
+        "active_side": None,
+        "turn_started_at": None,
+        "turn_ends_at": None,
         "voting": {"open": False, "opened_at": None, "ends_at": None},
         "results": {"visible": False, "reveal_started_at": None, "animation_seconds": 7},
         "background_filename": None,
     }
 
 
-def _load():
+def _raw_load():
     with _LOCK:
         con = _conn()
         row = con.execute("SELECT payload FROM debate_state WHERE id=1").fetchone()
@@ -78,10 +94,48 @@ def _load():
 def _save(state):
     with _LOCK:
         con = _conn()
-        con.execute("INSERT INTO debate_state(id,payload,updated_at) VALUES(1,?,?) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload,updated_at=excluded.updated_at", (json.dumps(state), _iso()))
+        con.execute(
+            "INSERT INTO debate_state(id,payload,updated_at) VALUES(1,?,?) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload,updated_at=excluded.updated_at",
+            (json.dumps(state), _iso()),
+        )
         con.commit()
         con.close()
     return state
+
+
+def _normalize_timers(state):
+    changed = False
+    now = _now()
+    if state.get("status") == "pooling":
+        end = _parse(state.get("registration_ends_at"))
+        if end and end <= now:
+            state["status"] = "registration_closed"
+            changed = True
+    if state.get("status") == "speaker_for":
+        end = _parse(state.get("turn_ends_at"))
+        if end and end <= now:
+            state["status"] = "holding_against"
+            state["active_side"] = None
+            changed = True
+    if state.get("status") == "speaker_against":
+        end = _parse(state.get("turn_ends_at"))
+        if end and end <= now:
+            state["status"] = "holding_vote"
+            state["active_side"] = None
+            changed = True
+    if state.get("status") == "voting" and state.get("voting", {}).get("open"):
+        end = _parse(state.get("voting", {}).get("ends_at"))
+        if end and end <= now:
+            state["voting"]["open"] = False
+            state["status"] = "results_ready"
+            changed = True
+    if changed:
+        _save(state)
+    return state
+
+
+def _load():
+    return _normalize_timers(_raw_load())
 
 
 def _votes(state):
@@ -106,17 +160,16 @@ def _public(state, user_id: Optional[str] = None):
     out["background_url"] = f"/api/debate/background-media/{bg}" if bg else None
     counts, percentages, total, rows = _votes(state)
     uid = str(user_id or "")
-    my_vote = next((str(r["contestant_id"]) for r in rows if str(r["user_id"]) == uid), None)
     out["vote_counts"] = counts
     out["vote_percentages"] = percentages
     out["vote_total"] = total
-    out["my_vote"] = my_vote
+    out["my_vote"] = next((str(r["contestant_id"]) for r in rows if str(r["user_id"]) == uid), None)
     out["joined"] = any(str(p.get("user_id")) == uid for p in state.get("participants", [])) if uid else False
     return out
 
 
 def _active_presence():
-    cutoff = datetime.now(timezone.utc) - timedelta(seconds=PRESENCE_TTL_SECONDS)
+    cutoff = _now() - timedelta(seconds=PRESENCE_TTL_SECONDS)
     with _LOCK:
         con = _conn()
         con.execute("DELETE FROM live_room_presence WHERE last_seen < ?", (_iso(cutoff),))
@@ -129,7 +182,8 @@ def _active_presence():
 class StartPayload(BaseModel):
     title: str = "Live Debate"
     statement: str
-    description: str = "Join the debate for a chance to argue your side, then everyone votes for the winner."
+    description: str = ""
+    registration_seconds: int = 60
     duration_seconds: int = 120
     voting_seconds: int = 30
 
@@ -207,7 +261,9 @@ def start(payload: StartPayload):
     statement = (payload.statement or "").strip()
     if not statement:
         raise HTTPException(status_code=400, detail="Debate statement is required")
-    previous = _load()
+    previous = _raw_load()
+    now = _now()
+    registration_seconds = max(15, min(int(payload.registration_seconds or 60), 600))
     state = _default_state()
     state["background_filename"] = previous.get("background_filename")
     state.update({
@@ -216,10 +272,23 @@ def start(payload: StartPayload):
         "title": (payload.title or "Live Debate")[:120],
         "statement": statement[:300],
         "description": (payload.description or "")[:600],
-        "duration_seconds": max(30, min(int(payload.duration_seconds or 120), 900)),
+        "registration_seconds": registration_seconds,
+        "registration_ends_at": _iso(now + timedelta(seconds=registration_seconds)),
+        "duration_seconds": max(30, min(int(payload.duration_seconds or 120), 600)),
         "voting_seconds": max(10, min(int(payload.voting_seconds or 30), 120)),
-        "created_at": _iso(),
+        "created_at": _iso(now),
     })
+    _save(state)
+    return _public(state)
+
+
+@router.post("/registration/close")
+def close_registration():
+    state = _load()
+    if state.get("status") not in {"pooling", "registration_closed"}:
+        raise HTTPException(status_code=409, detail="Registration is not open")
+    state["status"] = "registration_closed"
+    state["registration_ends_at"] = _iso()
     _save(state)
     return _public(state)
 
@@ -253,8 +322,7 @@ def background_remove():
 
 @router.get("/background-media/{filename}")
 def background_media(filename: str):
-    safe = Path(filename).name
-    path = BACKGROUND_DIR / safe
+    path = BACKGROUND_DIR / Path(filename).name
     if not path.exists() or not path.is_file():
         raise HTTPException(status_code=404, detail="Background video not found")
     return FileResponse(path)
@@ -264,7 +332,7 @@ def background_media(filename: str):
 def join(payload: JoinPayload):
     state = _load()
     if state.get("status") != "pooling":
-        raise HTTPException(status_code=409, detail="Debate registration is not open")
+        raise HTTPException(status_code=409, detail="Debate registration is closed")
     uid = str(payload.user_id or "").strip()
     if not uid:
         raise HTTPException(status_code=400, detail="user_id is required")
@@ -284,7 +352,7 @@ def join(payload: JoinPayload):
 def leave(payload: UserPayload):
     state = _load()
     if state.get("status") != "pooling":
-        raise HTTPException(status_code=409, detail="You can only leave before contestants are selected")
+        raise HTTPException(status_code=409, detail="You can only leave while registration is open")
     uid = str(payload.user_id or "")
     state["participants"] = [p for p in state.get("participants", []) if str(p.get("user_id")) != uid]
     _save(state)
@@ -294,31 +362,69 @@ def leave(payload: UserPayload):
 @router.post("/select")
 def select_contestants():
     state = _load()
-    if state.get("status") != "pooling":
-        raise HTTPException(status_code=409, detail="Registration must be open")
+    if state.get("status") not in {"pooling", "registration_closed"}:
+        raise HTTPException(status_code=409, detail="Close registration before selecting contestants")
     people = list(state.get("participants", []))
     if len(people) < 2:
         raise HTTPException(status_code=409, detail="At least two people must join")
     chosen = random.sample(people, 2)
-    sides = ["FOR", "AGAINST"]
-    random.shuffle(sides)
-    state["contestants"] = [dict(chosen[i], side=sides[i], slot="A" if i == 0 else "B") for i in range(2)]
+    if random.random() < 0.5:
+        chosen.reverse()
+    # Visual order is always FOR on the left (A), AGAINST on the right (B).
+    state["contestants"] = [dict(chosen[0], side="FOR", slot="A"), dict(chosen[1], side="AGAINST", slot="B")]
     state["status"] = "selected"
+    state["registration_ends_at"] = _iso()
     _save(state)
     return _public(state)
 
 
-@router.post("/begin")
-def begin():
+def _start_turn(side: str):
     state = _load()
     if len(state.get("contestants", [])) != 2:
         raise HTTPException(status_code=409, detail="Select two contestants first")
-    now = datetime.now(timezone.utc)
-    state["status"] = "debating"
-    state["started_at"] = _iso(now)
-    state["ends_at"] = _iso(now + timedelta(seconds=int(state.get("duration_seconds") or 120)))
+    side = side.upper()
+    if side == "FOR" and state.get("status") not in {"selected", "holding_against"}:
+        raise HTTPException(status_code=409, detail="The FOR turn cannot start from the current stage")
+    if side == "AGAINST" and state.get("status") not in {"selected", "holding_against"}:
+        raise HTTPException(status_code=409, detail="The AGAINST turn cannot start from the current stage")
+    now = _now()
+    state["status"] = "speaker_for" if side == "FOR" else "speaker_against"
+    state["active_side"] = side
+    state["turn_started_at"] = _iso(now)
+    state["turn_ends_at"] = _iso(now + timedelta(seconds=int(state.get("duration_seconds") or 120)))
     state["voting"] = {"open": False, "opened_at": None, "ends_at": None}
     state["results"] = {"visible": False, "reveal_started_at": None, "animation_seconds": 7}
+    _save(state)
+    return _public(state)
+
+
+@router.post("/turn/for")
+def start_for_turn():
+    return _start_turn("FOR")
+
+
+@router.post("/turn/against")
+def start_against_turn():
+    return _start_turn("AGAINST")
+
+
+# Kept for older host pages: begin now starts the FOR turn.
+@router.post("/begin")
+def begin():
+    return _start_turn("FOR")
+
+
+@router.post("/holding")
+def holding():
+    state = _load()
+    if state.get("status") in {"speaker_for", "holding_against"}:
+        state["status"] = "holding_against"
+    elif state.get("status") in {"speaker_against", "holding_vote", "selected"}:
+        state["status"] = "holding_vote"
+    else:
+        raise HTTPException(status_code=409, detail="Cannot move to holding from the current stage")
+    state["active_side"] = None
+    state["turn_ends_at"] = None
     _save(state)
     return _public(state)
 
@@ -328,7 +434,9 @@ def open_voting():
     state = _load()
     if len(state.get("contestants", [])) != 2:
         raise HTTPException(status_code=409, detail="No contestants selected")
-    now = datetime.now(timezone.utc)
+    if state.get("status") not in {"holding_vote", "results_ready"}:
+        raise HTTPException(status_code=409, detail="Finish both speaking turns before opening voting")
+    now = _now()
     state["status"] = "voting"
     state["voting"] = {"open": True, "opened_at": _iso(now), "ends_at": _iso(now + timedelta(seconds=int(state.get("voting_seconds") or 30)))}
     state["results"] = {"visible": False, "reveal_started_at": None, "animation_seconds": 7}
@@ -339,25 +447,23 @@ def open_voting():
 @router.post("/vote")
 def vote(payload: VotePayload):
     state = _load()
-    if not state.get("voting", {}).get("open"):
+    if state.get("status") != "voting" or not state.get("voting", {}).get("open"):
         raise HTTPException(status_code=409, detail="Voting is not open")
-    ends_at = state.get("voting", {}).get("ends_at")
-    if ends_at:
-        try:
-            if datetime.fromisoformat(ends_at) <= datetime.now(timezone.utc):
-                raise HTTPException(status_code=409, detail="Voting has closed")
-        except ValueError:
-            pass
     uid = str(payload.user_id or "").strip()
     cid = str(payload.contestant_id or "").strip()
     valid = {str(c.get("user_id")) for c in state.get("contestants", [])}
     if cid not in valid:
         raise HTTPException(status_code=400, detail="Invalid contestant")
     if uid in valid:
-        raise HTTPException(status_code=403, detail="Contestants cannot vote for themselves")
+        raise HTTPException(status_code=403, detail="Contestants cannot vote in their own debate")
+    if not uid:
+        raise HTTPException(status_code=400, detail="Your member identity is not available")
     with _LOCK:
         con = _conn()
-        con.execute("INSERT INTO debate_votes(session_id,user_id,contestant_id,created_at) VALUES(?,?,?,?) ON CONFLICT(session_id,user_id) DO UPDATE SET contestant_id=excluded.contestant_id,created_at=excluded.created_at", (state.get("session_id") or "", uid[:80], cid[:80], _iso()))
+        con.execute(
+            "INSERT INTO debate_votes(session_id,user_id,contestant_id,created_at) VALUES(?,?,?,?) ON CONFLICT(session_id,user_id) DO UPDATE SET contestant_id=excluded.contestant_id,created_at=excluded.created_at",
+            (state.get("session_id") or "", uid[:80], cid[:80], _iso()),
+        )
         con.commit()
         con.close()
     return _public(state, uid)
@@ -366,6 +472,8 @@ def vote(payload: VotePayload):
 @router.post("/voting/close")
 def close_voting():
     state = _load()
+    if state.get("status") not in {"voting", "results_ready"}:
+        raise HTTPException(status_code=409, detail="Voting is not open")
     state.setdefault("voting", {})["open"] = False
     state["status"] = "results_ready"
     _save(state)
@@ -392,6 +500,8 @@ def results(payload: ResultsPayload):
 def end():
     state = _load()
     state["status"] = "ended"
+    state["active_side"] = None
+    state["turn_ends_at"] = None
     state.setdefault("voting", {})["open"] = False
     state.setdefault("results", {})["visible"] = False
     _save(state)
