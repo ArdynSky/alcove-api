@@ -22,6 +22,7 @@ DB_PATH = DATA_DIR / "debate.sqlite3"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 BACKGROUND_DIR.mkdir(parents=True, exist_ok=True)
 _LOCK = threading.RLock()
+PRESENCE_TTL_SECONDS = 22
 
 
 def _iso(dt: Optional[datetime] = None) -> str:
@@ -33,6 +34,7 @@ def _conn():
     con.row_factory = sqlite3.Row
     con.execute("CREATE TABLE IF NOT EXISTS debate_state (id INTEGER PRIMARY KEY CHECK(id=1), payload TEXT NOT NULL, updated_at TEXT NOT NULL)")
     con.execute("CREATE TABLE IF NOT EXISTS debate_votes (session_id TEXT NOT NULL, user_id TEXT NOT NULL, contestant_id TEXT NOT NULL, created_at TEXT NOT NULL, PRIMARY KEY(session_id,user_id))")
+    con.execute("CREATE TABLE IF NOT EXISTS live_room_presence (user_id TEXT PRIMARY KEY, display_name TEXT NOT NULL, username TEXT, last_seen TEXT NOT NULL)")
     con.commit()
     return con
 
@@ -113,6 +115,17 @@ def _public(state, user_id: Optional[str] = None):
     return out
 
 
+def _active_presence():
+    cutoff = datetime.now(timezone.utc) - timedelta(seconds=PRESENCE_TTL_SECONDS)
+    with _LOCK:
+        con = _conn()
+        con.execute("DELETE FROM live_room_presence WHERE last_seen < ?", (_iso(cutoff),))
+        rows = con.execute("SELECT user_id,display_name,username,last_seen FROM live_room_presence ORDER BY last_seen DESC").fetchall()
+        con.commit()
+        con.close()
+    return [dict(row) for row in rows]
+
+
 class StartPayload(BaseModel):
     title: str = "Live Debate"
     statement: str
@@ -132,6 +145,12 @@ class UserPayload(BaseModel):
     user_id: str
 
 
+class PresencePayload(BaseModel):
+    user_id: str
+    display_name: str = "Member"
+    username: Optional[str] = None
+
+
 class VotePayload(BaseModel):
     user_id: str
     contestant_id: str
@@ -145,6 +164,42 @@ class ResultsPayload(BaseModel):
 @router.get("/state")
 def state(user_id: Optional[str] = None):
     return _public(_load(), user_id)
+
+
+@router.post("/presence/heartbeat")
+def presence_heartbeat(payload: PresencePayload):
+    uid = str(payload.user_id or "").strip()
+    if not uid:
+        raise HTTPException(status_code=400, detail="user_id is required")
+    with _LOCK:
+        con = _conn()
+        con.execute(
+            "INSERT INTO live_room_presence(user_id,display_name,username,last_seen) VALUES(?,?,?,?) ON CONFLICT(user_id) DO UPDATE SET display_name=excluded.display_name,username=excluded.username,last_seen=excluded.last_seen",
+            (uid[:80], (payload.display_name or "Member")[:80], (payload.username or "")[:80], _iso()),
+        )
+        con.commit()
+        con.close()
+    people = _active_presence()
+    return {"count": len(people), "people": people, "ttl_seconds": PRESENCE_TTL_SECONDS}
+
+
+@router.get("/presence")
+def presence_list():
+    people = _active_presence()
+    return {"count": len(people), "people": people, "ttl_seconds": PRESENCE_TTL_SECONDS}
+
+
+@router.post("/presence/leave")
+def presence_leave(payload: UserPayload):
+    uid = str(payload.user_id or "").strip()
+    if uid:
+        with _LOCK:
+            con = _conn()
+            con.execute("DELETE FROM live_room_presence WHERE user_id=?", (uid[:80],))
+            con.commit()
+            con.close()
+    people = _active_presence()
+    return {"count": len(people), "people": people, "ttl_seconds": PRESENCE_TTL_SECONDS}
 
 
 @router.post("/start")
