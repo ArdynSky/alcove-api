@@ -3,13 +3,15 @@ from __future__ import annotations
 import datetime
 import json
 import os
+import re
 import sqlite3
 import threading
 import uuid
 from pathlib import Path
 from typing import Optional
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, File, Form, HTTPException, UploadFile
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
 router = APIRouter(prefix="/api/custom-packs", tags=["custom-packs"])
@@ -25,7 +27,11 @@ def _data_dir() -> Path:
 
 
 DB_PATH = Path(os.getenv("ALCOVE_CUSTOM_PACKS_DB", str(_data_dir() / "custom_reward_packs.sqlite3")))
+ASSET_DIR = Path(os.getenv("ALCOVE_CUSTOM_PACK_ASSETS", str(_data_dir() / "custom-pack-assets")))
 DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+ASSET_DIR.mkdir(parents=True, exist_ok=True)
+ALLOWED_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
+MAX_IMAGE_BYTES = 5 * 1024 * 1024
 
 
 def _now() -> str:
@@ -65,6 +71,8 @@ def _clean_items(items):
             if value:
                 item[key] = value[:500]
         if kind == "skin":
+            layout = str(raw.get("layout") or "stamp").strip().lower()
+            item["layout"] = "banner" if layout in {"banner", "wide", "full", "fill"} else "stamp"
             try:
                 opacity_percent = int(round(float(raw.get("opacity_percent", 20))))
             except (TypeError, ValueError):
@@ -80,6 +88,16 @@ def _pack(row):
     item = dict(row)
     item["items"] = json.loads(item.pop("items_json") or "[]")
     return item
+
+
+def _safe_asset_path(filename: str) -> Path:
+    clean = Path(filename or "").name
+    if not clean or clean != filename:
+        raise HTTPException(status_code=404, detail="Asset not found")
+    path = (ASSET_DIR / clean).resolve()
+    if path.parent != ASSET_DIR.resolve() or not path.exists() or not path.is_file():
+        raise HTTPException(status_code=404, detail="Asset not found")
+    return path
 
 
 class PackPayload(BaseModel):
@@ -100,6 +118,36 @@ class ClaimPayload(BaseModel):
     grant_id: str
     user_id: Optional[str] = None
     username: Optional[str] = None
+
+
+@router.post("/admin/assets")
+async def upload_custom_pack_asset(admin_secret: str = Form(...), file: UploadFile = File(...)):
+    _admin(admin_secret)
+    original = Path(file.filename or "reward.png")
+    ext = original.suffix.lower()
+    if ext not in ALLOWED_IMAGE_EXTENSIONS:
+        raise HTTPException(status_code=400, detail="Use PNG, JPEG, WebP, or GIF images")
+    data = await file.read(MAX_IMAGE_BYTES + 1)
+    if not data:
+        raise HTTPException(status_code=400, detail="Image file is empty")
+    if len(data) > MAX_IMAGE_BYTES:
+        raise HTTPException(status_code=413, detail="Image must be 5 MB or smaller")
+    stem = re.sub(r"[^a-zA-Z0-9_-]+", "-", original.stem).strip("-")[:50] or "reward"
+    filename = f"{stem}-{uuid.uuid4().hex[:10]}{ext}"
+    path = ASSET_DIR / filename
+    path.write_bytes(data)
+    return {
+        "ok": True,
+        "filename": filename,
+        "url": f"/api/custom-packs/assets/{filename}",
+        "size": len(data),
+    }
+
+
+@router.get("/assets/{filename}")
+def get_custom_pack_asset(filename: str):
+    path = _safe_asset_path(filename)
+    return FileResponse(path)
 
 
 @router.get("/admin/templates")
