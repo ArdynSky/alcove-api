@@ -42,6 +42,9 @@ def _conn():
     con = sqlite3.connect(DB_PATH)
     con.row_factory = sqlite3.Row
     con.execute("CREATE TABLE IF NOT EXISTS custom_pack_templates (id TEXT PRIMARY KEY, name TEXT NOT NULL, description TEXT NOT NULL, items_json TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)")
+    columns = {row[1] for row in con.execute("PRAGMA table_info(custom_pack_templates)").fetchall()}
+    if "image" not in columns:
+        con.execute("ALTER TABLE custom_pack_templates ADD COLUMN image TEXT NOT NULL DEFAULT ''")
     con.execute("CREATE TABLE IF NOT EXISTS custom_pack_grants (id TEXT PRIMARY KEY, template_id TEXT, target_user_id TEXT, target_username TEXT, pack_json TEXT NOT NULL, sent_at TEXT NOT NULL, claimed_at TEXT)")
     con.commit()
     return con
@@ -104,6 +107,7 @@ class PackPayload(BaseModel):
     admin_secret: str
     name: str
     description: str = ""
+    image: str = ""
     items: list[dict]
 
 
@@ -169,7 +173,7 @@ def create_template(payload: PackPayload):
     now = _now()
     with _LOCK:
         con = _conn()
-        con.execute("INSERT INTO custom_pack_templates(id,name,description,items_json,created_at,updated_at) VALUES(?,?,?,?,?,?)", (pack_id, name, (payload.description or "")[:500], json.dumps(items), now, now))
+        con.execute("INSERT INTO custom_pack_templates(id,name,description,image,items_json,created_at,updated_at) VALUES(?,?,?,?,?,?,?)", (pack_id, name, (payload.description or "")[:500], (payload.image or "")[:500], json.dumps(items), now, now))
         con.commit()
         row = con.execute("SELECT * FROM custom_pack_templates WHERE id=?", (pack_id,)).fetchone()
         con.close()
@@ -186,7 +190,7 @@ def update_template(pack_id: str, payload: PackPayload):
         if not exists:
             con.close()
             raise HTTPException(status_code=404, detail="Custom pack not found")
-        con.execute("UPDATE custom_pack_templates SET name=?,description=?,items_json=?,updated_at=? WHERE id=?", ((payload.name or "Custom Pack")[:120], (payload.description or "")[:500], json.dumps(items), _now(), pack_id))
+        con.execute("UPDATE custom_pack_templates SET name=?,description=?,image=?,items_json=?,updated_at=? WHERE id=?", ((payload.name or "Custom Pack")[:120], (payload.description or "")[:500], (payload.image or "")[:500], json.dumps(items), _now(), pack_id))
         con.commit()
         row = con.execute("SELECT * FROM custom_pack_templates WHERE id=?", (pack_id,)).fetchone()
         con.close()
