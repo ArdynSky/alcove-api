@@ -10,14 +10,17 @@ import sqlite3
 import threading
 import uuid
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, File, HTTPException, UploadFile
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
 router = APIRouter(prefix="/api/debate", tags=["debate"])
 
 DATA_DIR = Path(os.getenv("ALCOVE_DEBATE_DIR", Path.cwd() / "debate_data"))
+BACKGROUND_DIR = DATA_DIR / "backgrounds"
 DB_PATH = DATA_DIR / "debate.sqlite3"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
+BACKGROUND_DIR.mkdir(parents=True, exist_ok=True)
 _LOCK = threading.RLock()
 
 
@@ -38,7 +41,9 @@ def _default_state():
     return {
         "session_id": None,
         "status": "idle",
+        "title": "Live Debate",
         "statement": "",
+        "description": "Join the debate for a chance to argue your side, then everyone votes for the winner.",
         "duration_seconds": 120,
         "voting_seconds": 30,
         "created_at": None,
@@ -48,6 +53,7 @@ def _default_state():
         "contestants": [],
         "voting": {"open": False, "opened_at": None, "ends_at": None},
         "results": {"visible": False, "reveal_started_at": None, "animation_seconds": 7},
+        "background_filename": None,
     }
 
 
@@ -71,7 +77,8 @@ def _save(state):
     with _LOCK:
         con = _conn()
         con.execute("INSERT INTO debate_state(id,payload,updated_at) VALUES(1,?,?) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload,updated_at=excluded.updated_at", (json.dumps(state), _iso()))
-        con.commit(); con.close()
+        con.commit()
+        con.close()
     return state
 
 
@@ -84,7 +91,8 @@ def _votes(state):
     counts = {str(c.get("user_id")): 0 for c in state.get("contestants", [])}
     for row in rows:
         cid = str(row["contestant_id"])
-        if cid in counts: counts[cid] += 1
+        if cid in counts:
+            counts[cid] += 1
     total = sum(counts.values())
     percentages = {k: (round((v / total) * 100, 1) if total else 0) for k, v in counts.items()}
     return counts, percentages, total, rows
@@ -92,6 +100,8 @@ def _votes(state):
 
 def _public(state, user_id: Optional[str] = None):
     out = json.loads(json.dumps(state))
+    bg = state.get("background_filename")
+    out["background_url"] = f"/api/debate/background-media/{bg}" if bg else None
     counts, percentages, total, rows = _votes(state)
     uid = str(user_id or "")
     my_vote = next((str(r["contestant_id"]) for r in rows if str(r["user_id"]) == uid), None)
@@ -104,7 +114,9 @@ def _public(state, user_id: Optional[str] = None):
 
 
 class StartPayload(BaseModel):
+    title: str = "Live Debate"
     statement: str
+    description: str = "Join the debate for a chance to argue your side, then everyone votes for the winner."
     duration_seconds: int = 120
     voting_seconds: int = 30
 
@@ -140,11 +152,15 @@ def start(payload: StartPayload):
     statement = (payload.statement or "").strip()
     if not statement:
         raise HTTPException(status_code=400, detail="Debate statement is required")
+    previous = _load()
     state = _default_state()
+    state["background_filename"] = previous.get("background_filename")
     state.update({
         "session_id": str(uuid.uuid4()),
         "status": "pooling",
+        "title": (payload.title or "Live Debate")[:120],
         "statement": statement[:300],
+        "description": (payload.description or "")[:600],
         "duration_seconds": max(30, min(int(payload.duration_seconds or 120), 900)),
         "voting_seconds": max(10, min(int(payload.voting_seconds or 30), 120)),
         "created_at": _iso(),
@@ -153,13 +169,50 @@ def start(payload: StartPayload):
     return _public(state)
 
 
+@router.post("/background")
+async def background_upload(file: UploadFile = File(...)):
+    state = _load()
+    content_type = (file.content_type or "").lower()
+    ext = Path(file.filename or "background.mp4").suffix.lower()
+    if content_type not in {"video/mp4", "video/webm"} and ext not in {".mp4", ".webm"}:
+        raise HTTPException(status_code=400, detail="Please upload an MP4 or WebM video")
+    data = await file.read()
+    if len(data) > 40 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="Background video must be under 40 MB")
+    if ext not in {".mp4", ".webm"}:
+        ext = ".mp4" if "mp4" in content_type else ".webm"
+    filename = f"debate-{uuid.uuid4().hex[:12]}{ext}"
+    (BACKGROUND_DIR / filename).write_bytes(data)
+    state["background_filename"] = filename
+    _save(state)
+    return _public(state)
+
+
+@router.delete("/background")
+def background_remove():
+    state = _load()
+    state["background_filename"] = None
+    _save(state)
+    return _public(state)
+
+
+@router.get("/background-media/{filename}")
+def background_media(filename: str):
+    safe = Path(filename).name
+    path = BACKGROUND_DIR / safe
+    if not path.exists() or not path.is_file():
+        raise HTTPException(status_code=404, detail="Background video not found")
+    return FileResponse(path)
+
+
 @router.post("/join")
 def join(payload: JoinPayload):
     state = _load()
     if state.get("status") != "pooling":
         raise HTTPException(status_code=409, detail="Debate registration is not open")
     uid = str(payload.user_id or "").strip()
-    if not uid: raise HTTPException(status_code=400, detail="user_id is required")
+    if not uid:
+        raise HTTPException(status_code=400, detail="user_id is required")
     if not any(str(p.get("user_id")) == uid for p in state.get("participants", [])):
         state.setdefault("participants", []).append({
             "user_id": uid[:80],
@@ -175,7 +228,8 @@ def join(payload: JoinPayload):
 @router.post("/leave")
 def leave(payload: UserPayload):
     state = _load()
-    if state.get("status") != "pooling": raise HTTPException(status_code=409, detail="You can only leave before contestants are selected")
+    if state.get("status") != "pooling":
+        raise HTTPException(status_code=409, detail="You can only leave before contestants are selected")
     uid = str(payload.user_id or "")
     state["participants"] = [p for p in state.get("participants", []) if str(p.get("user_id")) != uid]
     _save(state)
@@ -185,9 +239,11 @@ def leave(payload: UserPayload):
 @router.post("/select")
 def select_contestants():
     state = _load()
-    if state.get("status") != "pooling": raise HTTPException(status_code=409, detail="Registration must be open")
+    if state.get("status") != "pooling":
+        raise HTTPException(status_code=409, detail="Registration must be open")
     people = list(state.get("participants", []))
-    if len(people) < 2: raise HTTPException(status_code=409, detail="At least two people must join")
+    if len(people) < 2:
+        raise HTTPException(status_code=409, detail="At least two people must join")
     chosen = random.sample(people, 2)
     sides = ["FOR", "AGAINST"]
     random.shuffle(sides)
@@ -200,7 +256,8 @@ def select_contestants():
 @router.post("/begin")
 def begin():
     state = _load()
-    if len(state.get("contestants", [])) != 2: raise HTTPException(status_code=409, detail="Select two contestants first")
+    if len(state.get("contestants", [])) != 2:
+        raise HTTPException(status_code=409, detail="Select two contestants first")
     now = datetime.now(timezone.utc)
     state["status"] = "debating"
     state["started_at"] = _iso(now)
@@ -214,7 +271,8 @@ def begin():
 @router.post("/voting/open")
 def open_voting():
     state = _load()
-    if len(state.get("contestants", [])) != 2: raise HTTPException(status_code=409, detail="No contestants selected")
+    if len(state.get("contestants", [])) != 2:
+        raise HTTPException(status_code=409, detail="No contestants selected")
     now = datetime.now(timezone.utc)
     state["status"] = "voting"
     state["voting"] = {"open": True, "opened_at": _iso(now), "ends_at": _iso(now + timedelta(seconds=int(state.get("voting_seconds") or 30)))}
@@ -226,20 +284,27 @@ def open_voting():
 @router.post("/vote")
 def vote(payload: VotePayload):
     state = _load()
-    if not state.get("voting", {}).get("open"): raise HTTPException(status_code=409, detail="Voting is not open")
+    if not state.get("voting", {}).get("open"):
+        raise HTTPException(status_code=409, detail="Voting is not open")
     ends_at = state.get("voting", {}).get("ends_at")
     if ends_at:
         try:
-            if datetime.fromisoformat(ends_at) <= datetime.now(timezone.utc): raise HTTPException(status_code=409, detail="Voting has closed")
-        except ValueError: pass
-    uid = str(payload.user_id or "").strip(); cid = str(payload.contestant_id or "").strip()
+            if datetime.fromisoformat(ends_at) <= datetime.now(timezone.utc):
+                raise HTTPException(status_code=409, detail="Voting has closed")
+        except ValueError:
+            pass
+    uid = str(payload.user_id or "").strip()
+    cid = str(payload.contestant_id or "").strip()
     valid = {str(c.get("user_id")) for c in state.get("contestants", [])}
-    if cid not in valid: raise HTTPException(status_code=400, detail="Invalid contestant")
-    if uid in valid: raise HTTPException(status_code=403, detail="Contestants cannot vote for themselves")
+    if cid not in valid:
+        raise HTTPException(status_code=400, detail="Invalid contestant")
+    if uid in valid:
+        raise HTTPException(status_code=403, detail="Contestants cannot vote for themselves")
     with _LOCK:
         con = _conn()
         con.execute("INSERT INTO debate_votes(session_id,user_id,contestant_id,created_at) VALUES(?,?,?,?) ON CONFLICT(session_id,user_id) DO UPDATE SET contestant_id=excluded.contestant_id,created_at=excluded.created_at", (state.get("session_id") or "", uid[:80], cid[:80], _iso()))
-        con.commit(); con.close()
+        con.commit()
+        con.close()
     return _public(state, uid)
 
 
@@ -262,7 +327,8 @@ def results(payload: ResultsPayload):
     else:
         state.setdefault("results", {})["visible"] = False
         state["results"]["reveal_started_at"] = None
-        if state.get("status") == "results": state["status"] = "results_ready"
+        if state.get("status") == "results":
+            state["status"] = "results_ready"
     _save(state)
     return _public(state)
 
