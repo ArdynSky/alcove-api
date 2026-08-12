@@ -14,144 +14,19 @@ jobs:
         with:
           python-version: '3.12'
       - name: Patch team game API
+        env:
+          TEMPLATE_B64: CgpjbGFzcyBBY3Rpdml0eVRlbXBsYXRlUGF5bG9hZChCYXNlTW9kZWwpOgogICAgbmFtZTogc3RyCiAgICB0aXRsZTogc3RyID0gIkRyYXdpbmcgQ2hhbGxlbmdlIgogICAgcHJvbXB0OiBzdHIgPSAiRHJhdyB5b3VyIHBhcnRuZXIiCiAgICBkdXJhdGlvbl9zZWNvbmRzOiBpbnQgPSAzMDAKICAgIGdhbWVfdHlwZTogc3RyID0gImRyYXdpbmciCgoKZGVmIF9lbnN1cmVfdGVtcGxhdGVfdGFibGUoY29uKToKICAgIGNvbi5leGVjdXRlKAogICAgICAgICJDUkVBVEUgVEFCTEUgSUYgTk9UIEVYSVNUUyB0ZWFtX2dhbWVfdGVtcGxhdGVzIChpZCBURVhUIFBSSU1BUlkgS0VZLCBuYW1lIFRFWFQgTk9UIE5VTEwsIHRpdGxlIFRFWFQgTk9UIE5VTEwsIHByb21wdCBURVhUIE5PVCBOVUxMLCBkdXJhdGlvbl9zZWNvbmRzIElOVEVHRVIgTk9UIE5VTEwsIGdhbWVfdHlwZSBURVhUIE5PVCBOVUxMLCBiYWNrZ3JvdW5kX2ZpbGVuYW1lIFRFWFQsIGNyZWF0ZWRfYXQgVEVYVCBOT1QgTlVMTCwgdXBkYXRlZF9hdCBURVhUIE5PVCBOVUxMKSIKICAgICkKICAgIGNvbi5jb21taXQoKQoKCmRlZiBfdGVtcGxhdGVfZGljdChyb3cpOgogICAgaXRlbSA9IGRpY3Qocm93KQogICAgYmcgPSBpdGVtLmdldCgiYmFja2dyb3VuZF9maWxlbmFtZSIpCiAgICBpdGVtWyJiYWNrZ3JvdW5kX3VybCJdID0gZiIvYXBpL3RlYW0tZ2FtZS9iYWNrZ3JvdW5kLW1lZGlhL3tiZ30iIGlmIGJnIGVsc2UgTm9uZQogICAgcmV0dXJuIGl0ZW0KCgpAcm91dGVyLmdldCgiL3RlbXBsYXRlcyIpCmRlZiB0ZWFtX2dhbWVfdGVtcGxhdGVzKCk6CiAgICB3aXRoIF9MT0NLOgogICAgICAgIGNvbiA9IF9jb25uKCkKICAgICAgICBfZW5zdXJlX3RlbXBsYXRlX3RhYmxlKGNvbikKICAgICAgICByb3dzID0gY29uLmV4ZWN1dGUoIlNFTEVDVCAqIEZST00gdGVhbV9nYW1lX3RlbXBsYXRlcyBPUkRFUiBCWSB1cGRhdGVkX2F0IERFU0MsIG5hbWUgQ09MTEFURSBOT0NBU0UiKS5mZXRjaGFsbCgpCiAgICAgICAgY29uLmNsb3NlKCkKICAgIHJldHVybiB7InRlbXBsYXRlcyI6IFtfdGVtcGxhdGVfZGljdChyKSBmb3IgciBpbiByb3dzXX0KCgpAcm91dGVyLnBvc3QoIi90ZW1wbGF0ZXMiKQpkZWYgdGVhbV9nYW1lX3RlbXBsYXRlX2NyZWF0ZShwYXlsb2FkOiBBY3Rpdml0eVRlbXBsYXRlUGF5bG9hZCk6CiAgICBzdGF0ZSA9IF9sb2FkX3N0YXRlKCkKICAgIHRlbXBsYXRlX2lkID0gc3RyKHV1aWQudXVpZDQoKSkKICAgIG5vdyA9IF9pc28oKQogICAgd2l0aCBfTE9DSzoKICAgICAgICBjb24gPSBfY29ubigpCiAgICAgICAgX2Vuc3VyZV90ZW1wbGF0ZV90YWJsZShjb24pCiAgICAgICAgY29uLmV4ZWN1dGUoCiAgICAgICAgICAgICJJTlNFUlQgSU5UTyB0ZWFtX2dhbWVfdGVtcGxhdGVzKGlkLG5hbWUsdGl0bGUscHJvbXB0LGR1cmF0aW9uX3NlY29uZHMsZ2FtZV90eXBlLGJhY2tncm91bmRfZmlsZW5hbWUsY3JlYXRlZF9hdCx1cGRhdGVkX2F0KSBWQUxVRVMoPyw/LD8sPyw/LD8sPyw/LD8pIiwKICAgICAgICAgICAgKAogICAgICAgICAgICAgICAgdGVtcGxhdGVfaWQsCiAgICAgICAgICAgICAgICAocGF5bG9hZC5uYW1lIG9yIHBheWxvYWQudGl0bGUgb3IgIlNhdmVkIGFjdGl2aXR5IilbOjEwMF0sCiAgICAgICAgICAgICAgICAocGF5bG9hZC50aXRsZSBvciAiRHJhd2luZyBDaGFsbGVuZ2UiKVs6MTIwXSwKICAgICAgICAgICAgICAgIChwYXlsb2FkLnByb21wdCBvciAiRHJhdyB5b3VyIHBhcnRuZXIiKVs6NTAwXSwKICAgICAgICAgICAgICAgIG1heCgzMCwgbWluKGludChwYXlsb2FkLmR1cmF0aW9uX3NlY29uZHMgb3IgMzAwKSwgMzYwMCkpLAogICAgICAgICAgICAgICAgKHBheWxvYWQuZ2FtZV90eXBlIG9yICJkcmF3aW5nIilbOjQwXSwKICAgICAgICAgICAgICAgIHN0YXRlLmdldCgiYmFja2dyb3VuZF9maWxlbmFtZSIpLAogICAgICAgICAgICAgICAgbm93LAogICAgICAgICAgICAgICAgbm93LAogICAgICAgICAgICApLAogICAgICAgICkKICAgICAgICBjb24uY29tbWl0KCkKICAgICAgICByb3cgPSBjb24uZXhlY3V0ZSgiU0VMRUNUICogRlJPTSB0ZWFtX2dhbWVfdGVtcGxhdGVzIFdIRVJFIGlkPT8iLCAodGVtcGxhdGVfaWQsKSkuZmV0Y2hvbmUoKQogICAgICAgIGNvbi5jbG9zZSgpCiAgICByZXR1cm4gX3RlbXBsYXRlX2RpY3Qocm93KQoKCkByb3V0ZXIucHV0KCIvdGVtcGxhdGVzL3t0ZW1wbGF0ZV9pZH0iKQpkZWYgdGVhbV9nYW1lX3RlbXBsYXRlX3VwZGF0ZSh0ZW1wbGF0ZV9pZDogc3RyLCBwYXlsb2FkOiBBY3Rpdml0eVRlbXBsYXRlUGF5bG9hZCk6CiAgICBzdGF0ZSA9IF9sb2FkX3N0YXRlKCkKICAgIHdpdGggX0xPQ0s6CiAgICAgICAgY29uID0gX2Nvbm4oKQogICAgICAgIF9lbnN1cmVfdGVtcGxhdGVfdGFibGUoY29uKQogICAgICAgIGV4aXN0cyA9IGNvbi5leGVjdXRlKCJTRUxFQ1QgaWQgRlJPTSB0ZWFtX2dhbWVfdGVtcGxhdGVzIFdIRVJFIGlkPT8iLCAodGVtcGxhdGVfaWQsKSkuZmV0Y2hvbmUoKQogICAgICAgIGlmIG5vdCBleGlzdHM6CiAgICAgICAgICAgIGNvbi5jbG9zZSgpCiAgICAgICAgICAgIHJhaXNlIEhUVFBFeGNlcHRpb24oc3RhdHVzX2NvZGU9NDA0LCBkZXRhaWw9IlNhdmVkIGFjdGl2aXR5IG5vdCBmb3VuZCIpCiAgICAgICAgY29uLmV4ZWN1dGUoCiAgICAgICAgICAgICJVUERBVEUgdGVhbV9nYW1lX3RlbXBsYXRlcyBTRVQgbmFtZT0/LHRpdGxlPT8scHJvbXB0PT8sZHVyYXRpb25fc2Vjb25kcz0/LGdhbWVfdHlwZT0/LGJhY2tncm91bmRfZmlsZW5hbWU9Pyx1cGRhdGVkX2F0PT8gV0hFUkUgaWQ9PyIsCiAgICAgICAgICAgICgKICAgICAgICAgICAgICAgIChwYXlsb2FkLm5hbWUgb3IgcGF5bG9hZC50aXRsZSBvciAiU2F2ZWQgYWN0aXZpdHkiKVs6MTAwXSwKICAgICAgICAgICAgICAgIChwYXlsb2FkLnRpdGxlIG9yICJEcmF3aW5nIENoYWxsZW5nZSIpWzoxMjBdLAogICAgICAgICAgICAgICAgKHBheWxvYWQucHJvbXB0IG9yICJEcmF3IHlvdXIgcGFydG5lciIpWzo1MDBdLAogICAgICAgICAgICAgICAgbWF4KDMwLCBtaW4oaW50KHBheWxvYWQuZHVyYXRpb25fc2Vjb25kcyBvciAzMDApLCAzNjAwKSksCiAgICAgICAgICAgICAgICAocGF5bG9hZC5nYW1lX3R5cGUgb3IgImRyYXdpbmciKVs6NDBdLAogICAgICAgICAgICAgICAgc3RhdGUuZ2V0KCJiYWNrZ3JvdW5kX2ZpbGVuYW1lIiksCiAgICAgICAgICAgICAgICBfaXNvKCksCiAgICAgICAgICAgICAgICB0ZW1wbGF0ZV9pZCwKICAgICAgICAgICAgKSwKICAgICAgICApCiAgICAgICAgY29uLmNvbWl0KCkKICAgICAgICByb3cgPSBjb24uZXhlY3V0ZSgiU0VMRUNUICogRlJPTSB0ZWFtX2dhbWVfdGVtcGxhdGVzIFdIRVJFIGlkPT8iLCAodGVtcGxhdGVfaWQsKSkuZmV0Y2hvbmUoKQogICAgICAgIGNvbi5jbG9zZSgpCiAgICByZXR1cm4gX3RlbXBsYXRlX2RpY3Qocm93KQoKCkByb3V0ZXIuZGVsZXRlKCIvdGVtcGxhdGVzL3t0ZW1wbGF0ZV9pZH0iKQpkZWYgdGVhbV9nYW1lX3RlbXBsYXRlX2RlbGV0ZSh0ZW1wbGF0ZV9pZDogc3RyKToKICAgIHdpdGggX0xPQ0s6CiAgICAgICAgY29uID0gX2Nvbm4oKQogICAgICAgIF9lbnN1cmVfdGVtcGxhdGVfdGFibGUoY29uKQogICAgICAgIGNvbi5leGVjdXRlKCJERUxFVEUgRlJPTSB0ZWFtX2dhbWVfdGVtcGxhdGVzIFdIRVJFIGlkPT8iLCAodGVtcGxhdGVfaWQsKSkKICAgICAgICBjb24uY29tbWl0KCkKICAgICAgICBjb24uY2xvc2UoKQogICAgcmV0dXJuIHsib2siOiBUcnVlfQoKCkByb3V0ZXIucG9zdCgiL3RlbXBsYXRlcy97dGVtcGxhdGVfaWR9L2FjdGl2YXRlIikKZGVmIHRlYW1fZ2FtZV90ZW1wbGF0ZV9hY3RpdmF0ZSh0ZW1wbGF0ZV9pZDogc3RyKToKICAgIHdpdGggX0xPQ0s6CiAgICAgICAgY29uID0gX2Nvbm4oKQogICAgICAgIF9lbnN1cmVfdGVtcGxhdGVfdGFibGUoY29uKQogICAgICAgIHJvdyA9IGNvbi5leGVjdXRlKCJTRUxFQ1QgKiBGUk9NIHRlYW1fZ2FtZV90ZW1wbGF0ZXMgV0hFUkUgaWQ9PyIsICh0ZW1wbGF0ZV9pZCwpKS5mZXRjaG9uZSgpCiAgICAgICAgY29uLmNsb3NlKCkKICAgIGlmIG5vdCByb3c6CiAgICAgICAgcmFpc2UgSFRUUEV4Y2VwdGlvbihzdGF0dXNfY29kZT00MDQsIGRldGFpbD0iU2F2ZWQgYWN0aXZpdHkgbm90IGZvdW5kIikKICAgIGl0ZW0gPSBkaWN0KHJvdykKICAgIHN0YXRlID0gX2RlZmF1bHRfc3RhdGUoKQogICAgc3RhdGUudXBkYXRlKAogICAgICAgIHsKICAgICAgICAgICAgInNlc3Npb25faWQiOiBzdHIodXVpZC51dWlkNCgpKSwKICAgICAgICAgICAgImdhbWVfdHlwZSI6IGl0ZW0uZ2V0KCJnYW1lX3R5cGUiKSBvciAiZHJhd2luZyIsCiAgICAgICAgICAgICJ0aXRsZSI6IGl0ZW0uZ2V0KCJ0aXRsZSIpIG9yICJEcmF3aW5nIENoYWxsZW5nZSIsCiAgICAgICAgICAgICJwcm9tcHQiOiBpdGVtLmdldCgicHJvbXB0Iikgb3IgIkRyYXcgeW91ciBwYXJ0bmVyIiwKICAgICAgICAgICAgInN0YXR1cyI6ICJwb29saW5nIiwKICAgICAgICAgICAgImR1cmF0aW9uX3NlY29uZHMiOiBtYXgoMzAsIG1pbihpbnQoaXRlbS5nZXQoImR1cmF0aW9uX3NlY29uZHMiKSBvciAzMDApLCAzNjAwKSksCiAgICAgICAgICAgICJjcmVhdGVkX2F0IjogX2lzbygpLAogICAgICAgICAgICAiYmFja2dyb3VuZF9maWxlbmFtZSI6IGl0ZW0uZ2V0KCJiYWNrZ3JvdW5kX2ZpbGVuYW1lIiksCiAgICAgICAgfQogICAgKQogICAgX3NhdmVfc3RhdGUoc3RhdGUpCiAgICByZXR1cm4gX3B1YmxpY19zdGF0ZShzdGF0ZSkK
         run: |
           python - <<'PY'
           from pathlib import Path
+          import base64, os
           p=Path('api/team_games.py')
           s=p.read_text()
-          # Keep old background media because saved activity templates may reference it.
+          # Keep old backgrounds because saved activities may reference them.
           s=s.replace("    if old:\n        try:\n            (BACKGROUND_DIR / Path(old).name).unlink(missing_ok=True)\n        except Exception:\n            pass\n    return _public_state(state)\n\n\n@router.delete(\"/background\")", "    return _public_state(state)\n\n\n@router.delete(\"/background\")", 1)
           s=s.replace("    if old:\n        try:\n            (BACKGROUND_DIR / Path(old).name).unlink(missing_ok=True)\n        except Exception:\n            pass\n    return _public_state(state)\n\n\n@router.get(\"/background-media/{filename}\")", "    return _public_state(state)\n\n\n@router.get(\"/background-media/{filename}\")", 1)
           if 'class ActivityTemplatePayload' not in s:
-              s += r'''
-
-
-class ActivityTemplatePayload(BaseModel):
-    name: str
-    title: str = "Drawing Challenge"
-    prompt: str = "Draw your partner"
-    duration_seconds: int = 300
-    game_type: str = "drawing"
-
-
-def _ensure_template_table(con):
-    con.execute(
-        "CREATE TABLE IF NOT EXISTS team_game_templates (id TEXT PRIMARY KEY, name TEXT NOT NULL, title TEXT NOT NULL, prompt TEXT NOT NULL, duration_seconds INTEGER NOT NULL, game_type TEXT NOT NULL, background_filename TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)"
-    )
-    con.commit()
-
-
-def _template_dict(row):
-    item = dict(row)
-    bg = item.get("background_filename")
-    item["background_url"] = f"/api/team-game/background-media/{bg}" if bg else None
-    return item
-
-
-@router.get("/templates")
-def team_game_templates():
-    with _LOCK:
-        con = _conn()
-        _ensure_template_table(con)
-        rows = con.execute("SELECT * FROM team_game_templates ORDER BY updated_at DESC, name COLLATE NOCASE").fetchall()
-        con.close()
-    return {"templates": [_template_dict(r) for r in rows]}
-
-
-@router.post("/templates")
-def team_game_template_create(payload: ActivityTemplatePayload):
-    state = _load_state()
-    template_id = str(uuid.uuid4())
-    now = _iso()
-    with _LOCK:
-        con = _conn()
-        _ensure_template_table(con)
-        con.execute(
-            "INSERT INTO team_game_templates(id,name,title,prompt,duration_seconds,game_type,background_filename,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)",
-            (
-                template_id,
-                (payload.name or payload.title or "Saved activity")[:100],
-                (payload.title or "Drawing Challenge")[:120],
-                (payload.prompt or "Draw your partner")[:500],
-                max(30, min(int(payload.duration_seconds or 300), 3600)),
-                (payload.game_type or "drawing")[:40],
-                state.get("background_filename"),
-                now,
-                now,
-            ),
-        )
-        con.commit()
-        row = con.execute("SELECT * FROM team_game_templates WHERE id=?", (template_id,)).fetchone()
-        con.close()
-    return _template_dict(row)
-
-
-@router.put("/templates/{template_id}")
-def team_game_template_update(template_id: str, payload: ActivityTemplatePayload):
-    state = _load_state()
-    with _LOCK:
-        con = _conn()
-        _ensure_template_table(con)
-        exists = con.execute("SELECT id FROM team_game_templates WHERE id=?", (template_id,)).fetchone()
-        if not exists:
-            con.close()
-            raise HTTPException(status_code=404, detail="Saved activity not found")
-        con.execute(
-            "UPDATE team_game_templates SET name=?,title=?,prompt=?,duration_seconds=?,game_type=?,background_filename=?,updated_at=? WHERE id=?",
-            (
-                (payload.name or payload.title or "Saved activity")[:100],
-                (payload.title or "Drawing Challenge")[:120],
-                (payload.prompt or "Draw your partner")[:500],
-                max(30, min(int(payload.duration_seconds or 300), 3600)),
-                (payload.game_type or "drawing")[:40],
-                state.get("background_filename"),
-                _iso(),
-                template_id,
-            ),
-        )
-        con.commit()
-        row = con.execute("SELECT * FROM team_game_templates WHERE id=?", (template_id,)).fetchone()
-        con.close()
-    return _template_dict(row)
-
-
-@router.delete("/templates/{template_id}")
-def team_game_template_delete(template_id: str):
-    with _LOCK:
-        con = _conn()
-        _ensure_template_table(con)
-        con.execute("DELETE FROM team_game_templates WHERE id=?", (template_id,))
-        con.commit()
-        con.close()
-    return {"ok": True}
-
-
-@router.post("/templates/{template_id}/activate")
-def team_game_template_activate(template_id: str):
-    with _LOCK:
-        con = _conn()
-        _ensure_template_table(con)
-        row = con.execute("SELECT * FROM team_game_templates WHERE id=?", (template_id,)).fetchone()
-        con.close()
-    if not row:
-        raise HTTPException(status_code=404, detail="Saved activity not found")
-    item = dict(row)
-    state = _default_state()
-    state.update(
-        {
-            "session_id": str(uuid.uuid4()),
-            "game_type": item.get("game_type") or "drawing",
-            "title": item.get("title") or "Drawing Challenge",
-            "prompt": item.get("prompt") or "Draw your partner",
-            "status": "pooling",
-            "duration_seconds": max(30, min(int(item.get("duration_seconds") or 300), 3600)),
-            "created_at": _iso(),
-            "background_filename": item.get("background_filename"),
-        }
-    )
-    _save_state(state)
-    return _public_state(state)
-'''
+              s += base64.b64decode(os.environ['TEMPLATE_B64']).decode()
           p.write_text(s)
           PY
           python -m py_compile api/team_games.py api/main.py
