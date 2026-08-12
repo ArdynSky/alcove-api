@@ -23,6 +23,9 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 BACKGROUND_DIR.mkdir(parents=True, exist_ok=True)
 _LOCK = threading.RLock()
 PRESENCE_TTL_SECONDS = 22
+FOR_INTRO_SECONDS = 4.4
+AGAINST_INTRO_SECONDS = 1.6
+TIME_UP_SECONDS = 2.6
 
 
 def _now() -> datetime:
@@ -67,8 +70,13 @@ def _default_state():
         "participants": [],
         "contestants": [],
         "active_side": None,
+        "intro_started_at": None,
+        "intro_ends_at": None,
         "turn_started_at": None,
         "turn_ends_at": None,
+        "time_up_side": None,
+        "time_up_at": None,
+        "time_up_until": None,
         "voting": {"open": False, "opened_at": None, "ends_at": None},
         "results": {"visible": False, "reveal_started_at": None, "animation_seconds": 7},
         "background_filename": None,
@@ -103,6 +111,30 @@ def _save(state):
     return state
 
 
+def _begin_actual_turn(state, side: str, now: datetime):
+    side = side.upper()
+    state["status"] = "speaker_for" if side == "FOR" else "speaker_against"
+    state["active_side"] = side
+    state["intro_started_at"] = None
+    state["intro_ends_at"] = None
+    state["turn_started_at"] = _iso(now)
+    state["turn_ends_at"] = _iso(now + timedelta(seconds=int(state.get("duration_seconds") or 120)))
+    state["time_up_side"] = None
+    state["time_up_at"] = None
+    state["time_up_until"] = None
+    return state
+
+
+def _mark_time_up(state, side: str, next_status: str, now: datetime):
+    state["status"] = next_status
+    state["active_side"] = None
+    state["turn_ends_at"] = None
+    state["time_up_side"] = side.upper()
+    state["time_up_at"] = _iso(now)
+    state["time_up_until"] = _iso(now + timedelta(seconds=TIME_UP_SECONDS))
+    return state
+
+
 def _normalize_timers(state):
     changed = False
     now = _now()
@@ -111,17 +143,25 @@ def _normalize_timers(state):
         if end and end <= now:
             state["status"] = "registration_closed"
             changed = True
+    if state.get("status") == "intro_for":
+        end = _parse(state.get("intro_ends_at"))
+        if end and end <= now:
+            _begin_actual_turn(state, "FOR", now)
+            changed = True
+    if state.get("status") == "intro_against":
+        end = _parse(state.get("intro_ends_at"))
+        if end and end <= now:
+            _begin_actual_turn(state, "AGAINST", now)
+            changed = True
     if state.get("status") == "speaker_for":
         end = _parse(state.get("turn_ends_at"))
         if end and end <= now:
-            state["status"] = "holding_against"
-            state["active_side"] = None
+            _mark_time_up(state, "FOR", "holding_against", now)
             changed = True
     if state.get("status") == "speaker_against":
         end = _parse(state.get("turn_ends_at"))
         if end and end <= now:
-            state["status"] = "holding_vote"
-            state["active_side"] = None
+            _mark_time_up(state, "AGAINST", "holding_vote", now)
             changed = True
     if state.get("status") == "voting" and state.get("voting", {}).get("open"):
         end = _parse(state.get("voting", {}).get("ends_at"))
@@ -370,10 +410,14 @@ def select_contestants():
     chosen = random.sample(people, 2)
     if random.random() < 0.5:
         chosen.reverse()
-    # Visual order is always FOR on the left (A), AGAINST on the right (B).
     state["contestants"] = [dict(chosen[0], side="FOR", slot="A"), dict(chosen[1], side="AGAINST", slot="B")]
     state["status"] = "selected"
     state["registration_ends_at"] = _iso()
+    state["intro_started_at"] = None
+    state["intro_ends_at"] = None
+    state["time_up_side"] = None
+    state["time_up_at"] = None
+    state["time_up_until"] = None
     _save(state)
     return _public(state)
 
@@ -388,10 +432,16 @@ def _start_turn(side: str):
     if side == "AGAINST" and state.get("status") not in {"selected", "holding_against"}:
         raise HTTPException(status_code=409, detail="The AGAINST turn cannot start from the current stage")
     now = _now()
-    state["status"] = "speaker_for" if side == "FOR" else "speaker_against"
+    intro_seconds = FOR_INTRO_SECONDS if side == "FOR" else AGAINST_INTRO_SECONDS
+    state["status"] = "intro_for" if side == "FOR" else "intro_against"
     state["active_side"] = side
-    state["turn_started_at"] = _iso(now)
-    state["turn_ends_at"] = _iso(now + timedelta(seconds=int(state.get("duration_seconds") or 120)))
+    state["intro_started_at"] = _iso(now)
+    state["intro_ends_at"] = _iso(now + timedelta(seconds=intro_seconds))
+    state["turn_started_at"] = None
+    state["turn_ends_at"] = None
+    state["time_up_side"] = None
+    state["time_up_at"] = None
+    state["time_up_until"] = None
     state["voting"] = {"open": False, "opened_at": None, "ends_at": None}
     state["results"] = {"visible": False, "reveal_started_at": None, "animation_seconds": 7}
     _save(state)
@@ -408,7 +458,6 @@ def start_against_turn():
     return _start_turn("AGAINST")
 
 
-# Kept for older host pages: begin now starts the FOR turn.
 @router.post("/begin")
 def begin():
     return _start_turn("FOR")
@@ -417,13 +466,22 @@ def begin():
 @router.post("/holding")
 def holding():
     state = _load()
-    if state.get("status") in {"speaker_for", "holding_against"}:
-        state["status"] = "holding_against"
-    elif state.get("status") in {"speaker_against", "holding_vote", "selected"}:
-        state["status"] = "holding_vote"
+    now = _now()
+    if state.get("status") in {"intro_for", "speaker_for", "holding_against"}:
+        _mark_time_up(state, "FOR", "holding_against", now)
+    elif state.get("status") in {"intro_against", "speaker_against", "holding_vote", "selected"}:
+        if state.get("status") == "selected":
+            state["status"] = "holding_vote"
+            state["active_side"] = None
+            state["time_up_side"] = None
+            state["time_up_at"] = None
+            state["time_up_until"] = None
+        else:
+            _mark_time_up(state, "AGAINST", "holding_vote", now)
     else:
         raise HTTPException(status_code=409, detail="Cannot move to holding from the current stage")
-    state["active_side"] = None
+    state["intro_started_at"] = None
+    state["intro_ends_at"] = None
     state["turn_ends_at"] = None
     _save(state)
     return _public(state)
@@ -438,6 +496,10 @@ def open_voting():
         raise HTTPException(status_code=409, detail="Finish both speaking turns before opening voting")
     now = _now()
     state["status"] = "voting"
+    state["active_side"] = None
+    state["time_up_side"] = None
+    state["time_up_at"] = None
+    state["time_up_until"] = None
     state["voting"] = {"open": True, "opened_at": _iso(now), "ends_at": _iso(now + timedelta(seconds=int(state.get("voting_seconds") or 30)))}
     state["results"] = {"visible": False, "reveal_started_at": None, "animation_seconds": 7}
     _save(state)
@@ -501,7 +563,12 @@ def end():
     state = _load()
     state["status"] = "ended"
     state["active_side"] = None
+    state["intro_started_at"] = None
+    state["intro_ends_at"] = None
     state["turn_ends_at"] = None
+    state["time_up_side"] = None
+    state["time_up_at"] = None
+    state["time_up_until"] = None
     state.setdefault("voting", {})["open"] = False
     state.setdefault("results", {})["visible"] = False
     _save(state)
