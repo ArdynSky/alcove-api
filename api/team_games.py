@@ -527,7 +527,7 @@ def team_game_template_update(template_id: str, payload: ActivityTemplatePayload
                 template_id,
             ),
         )
-        con.comit()
+        con.commit()
         row = con.execute("SELECT * FROM team_game_templates WHERE id=?", (template_id,)).fetchone()
         con.close()
     return _template_dict(row)
