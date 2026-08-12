@@ -1,0 +1,36 @@
+name: Add custom pack cover image
+on:
+  push:
+    paths:
+      - .github/workflows/add-custom-pack-cover.yml
+permissions:
+  contents: write
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Patch API
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          p=Path('api/custom_rewards.py')
+          s=p.read_text()
+          old='''    con.execute("CREATE TABLE IF NOT EXISTS custom_pack_templates (id TEXT PRIMARY KEY, name TEXT NOT NULL, description TEXT NOT NULL, items_json TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)")\n    con.execute("CREATE TABLE IF NOT EXISTS custom_pack_grants'''
+          new='''    con.execute("CREATE TABLE IF NOT EXISTS custom_pack_templates (id TEXT PRIMARY KEY, name TEXT NOT NULL, description TEXT NOT NULL, items_json TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)")\n    columns = {row[1] for row in con.execute("PRAGMA table_info(custom_pack_templates)").fetchall()}\n    if "image" not in columns:\n        con.execute("ALTER TABLE custom_pack_templates ADD COLUMN image TEXT NOT NULL DEFAULT ''")\n    con.execute("CREATE TABLE IF NOT EXISTS custom_pack_grants'''
+          if old not in s: raise SystemExit('table patch anchor missing')
+          s=s.replace(old,new,1)
+          s=s.replace('''class PackPayload(BaseModel):\n    admin_secret: str\n    name: str\n    description: str = ""\n    items: list[dict]''','''class PackPayload(BaseModel):\n    admin_secret: str\n    name: str\n    description: str = ""\n    image: str = ""\n    items: list[dict]''',1)
+          s=s.replace('''con.execute("INSERT INTO custom_pack_templates(id,name,description,items_json,created_at,updated_at) VALUES(?,?,?,?,?,?)", (pack_id, name, (payload.description or "")[:500], json.dumps(items), now, now))''','''con.execute("INSERT INTO custom_pack_templates(id,name,description,image,items_json,created_at,updated_at) VALUES(?,?,?,?,?,?,?)", (pack_id, name, (payload.description or "")[:500], (payload.image or "")[:500], json.dumps(items), now, now))''',1)
+          s=s.replace('''con.execute("UPDATE custom_pack_templates SET name=?,description=?,items_json=?,updated_at=? WHERE id=?", ((payload.name or "Custom Pack")[:120], (payload.description or "")[:500], json.dumps(items), _now(), pack_id))''','''con.execute("UPDATE custom_pack_templates SET name=?,description=?,image=?,items_json=?,updated_at=? WHERE id=?", ((payload.name or "Custom Pack")[:120], (payload.description or "")[:500], (payload.image or "")[:500], json.dumps(items), _now(), pack_id))''',1)
+          p.write_text(s)
+          PY
+          python -m py_compile api/custom_rewards.py
+      - name: Commit and push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add api/custom_rewards.py
+          git diff --cached --quiet || git commit -m "Support custom pack claim cover images"
+          git pull --rebase origin main
+          git push origin HEAD:main
