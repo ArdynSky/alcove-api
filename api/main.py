@@ -40,6 +40,7 @@ from .cards_ws_manager import cards_ws_manager
 from . import fox_messages as fox_messages_store
 from .home_alerts import router as home_alerts_router
 from .team_games import router as team_games_router
+from .custom_rewards import router as custom_rewards_router
 
 try:
     from dotenv import load_dotenv
@@ -58,6 +59,7 @@ except ImportError:
 app = FastAPI()
 app.include_router(home_alerts_router)
 app.include_router(team_games_router)
+app.include_router(custom_rewards_router)
 
 CORS_ALLOWED_ORIGINS = [
     "null",
