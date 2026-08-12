@@ -209,11 +209,6 @@ async def team_game_background(file: UploadFile = File(...)):
     (BACKGROUND_DIR / filename).write_bytes(data)
     state["background_filename"] = filename
     _save_state(state)
-    if old:
-        try:
-            (BACKGROUND_DIR / Path(old).name).unlink(missing_ok=True)
-        except Exception:
-            pass
     return _public_state(state)
 
 
@@ -223,11 +218,6 @@ def team_game_background_remove():
     old = state.get("background_filename")
     state["background_filename"] = None
     _save_state(state)
-    if old:
-        try:
-            (BACKGROUND_DIR / Path(old).name).unlink(missing_ok=True)
-        except Exception:
-            pass
     return _public_state(state)
 
 
@@ -452,3 +442,130 @@ def team_game_obs_state():
     item["team_label"] = team.get("label") if team else ""
     item["team_members"] = [m.get("display_name") for m in (team or {}).get("members", [])]
     return {"visible": True, "game": {"title": state.get("title"), "prompt": state.get("prompt")}, "submission": item}
+
+
+class ActivityTemplatePayload(BaseModel):
+    name: str
+    title: str = "Drawing Challenge"
+    prompt: str = "Draw your partner"
+    duration_seconds: int = 300
+    game_type: str = "drawing"
+
+
+def _ensure_template_table(con):
+    con.execute(
+        "CREATE TABLE IF NOT EXISTS team_game_templates (id TEXT PRIMARY KEY, name TEXT NOT NULL, title TEXT NOT NULL, prompt TEXT NOT NULL, duration_seconds INTEGER NOT NULL, game_type TEXT NOT NULL, background_filename TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)"
+    )
+    con.commit()
+
+
+def _template_dict(row):
+    item = dict(row)
+    bg = item.get("background_filename")
+    item["background_url"] = f"/api/team-game/background-media/{bg}" if bg else None
+    return item
+
+
+@router.get("/templates")
+def team_game_templates():
+    with _LOCK:
+        con = _conn()
+        _ensure_template_table(con)
+        rows = con.execute("SELECT * FROM team_game_templates ORDER BY updated_at DESC, name COLLATE NOCASE").fetchall()
+        con.close()
+    return {"templates": [_template_dict(r) for r in rows]}
+
+
+@router.post("/templates")
+def team_game_template_create(payload: ActivityTemplatePayload):
+    state = _load_state()
+    template_id = str(uuid.uuid4())
+    now = _iso()
+    with _LOCK:
+        con = _conn()
+        _ensure_template_table(con)
+        con.execute(
+            "INSERT INTO team_game_templates(id,name,title,prompt,duration_seconds,game_type,background_filename,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)",
+            (
+                template_id,
+                (payload.name or payload.title or "Saved activity")[:100],
+                (payload.title or "Drawing Challenge")[:120],
+                (payload.prompt or "Draw your partner")[:500],
+                max(30, min(int(payload.duration_seconds or 300), 3600)),
+                (payload.game_type or "drawing")[:40],
+                state.get("background_filename"),
+                now,
+                now,
+            ),
+        )
+        con.commit()
+        row = con.execute("SELECT * FROM team_game_templates WHERE id=?", (template_id,)).fetchone()
+        con.close()
+    return _template_dict(row)
+
+
+@router.put("/templates/{template_id}")
+def team_game_template_update(template_id: str, payload: ActivityTemplatePayload):
+    state = _load_state()
+    with _LOCK:
+        con = _conn()
+        _ensure_template_table(con)
+        exists = con.execute("SELECT id FROM team_game_templates WHERE id=?", (template_id,)).fetchone()
+        if not exists:
+            con.close()
+            raise HTTPException(status_code=404, detail="Saved activity not found")
+        con.execute(
+            "UPDATE team_game_templates SET name=?,title=?,prompt=?,duration_seconds=?,game_type=?,background_filename=?,updated_at=? WHERE id=?",
+            (
+                (payload.name or payload.title or "Saved activity")[:100],
+                (payload.title or "Drawing Challenge")[:120],
+                (payload.prompt or "Draw your partner")[:500],
+                max(30, min(int(payload.duration_seconds or 300), 3600)),
+                (payload.game_type or "drawing")[:40],
+                state.get("background_filename"),
+                _iso(),
+                template_id,
+            ),
+        )
+        con.comit()
+        row = con.execute("SELECT * FROM team_game_templates WHERE id=?", (template_id,)).fetchone()
+        con.close()
+    return _template_dict(row)
+
+
+@router.delete("/templates/{template_id}")
+def team_game_template_delete(template_id: str):
+    with _LOCK:
+        con = _conn()
+        _ensure_template_table(con)
+        con.execute("DELETE FROM team_game_templates WHERE id=?", (template_id,))
+        con.commit()
+        con.close()
+    return {"ok": True}
+
+
+@router.post("/templates/{template_id}/activate")
+def team_game_template_activate(template_id: str):
+    with _LOCK:
+        con = _conn()
+        _ensure_template_table(con)
+        row = con.execute("SELECT * FROM team_game_templates WHERE id=?", (template_id,)).fetchone()
+        con.close()
+    if not row:
+        raise HTTPException(status_code=404, detail="Saved activity not found")
+    item = dict(row)
+    state = _default_state()
+    state.update(
+        {
+            "session_id": str(uuid.uuid4()),
+            "game_type": item.get("game_type") or "drawing",
+            "title": item.get("title") or "Drawing Challenge",
+            "prompt": item.get("prompt") or "Draw your partner",
+            "status": "pooling",
+            "duration_seconds": max(30, min(int(item.get("duration_seconds") or 300), 3600)),
+            "created_at": _iso(),
+            "background_filename": item.get("background_filename"),
+        }
+    )
+    _save_state(state)
+    return _public_state(state)
