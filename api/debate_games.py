@@ -200,11 +200,13 @@ def _public(state, user_id: Optional[str] = None):
     out["background_url"] = f"/api/debate/background-media/{bg}" if bg else None
     counts, percentages, total, rows = _votes(state)
     uid = str(user_id or "")
+    mine = next((p for p in state.get("participants", []) if str(p.get("user_id")) == uid), None) if uid else None
     out["vote_counts"] = counts
     out["vote_percentages"] = percentages
     out["vote_total"] = total
     out["my_vote"] = next((str(r["contestant_id"]) for r in rows if str(r["user_id"]) == uid), None)
-    out["joined"] = any(str(p.get("user_id")) == uid for p in state.get("participants", [])) if uid else False
+    out["joined"] = bool(mine)
+    out["my_side_preference"] = (mine or {}).get("side_preference")
     return out
 
 
@@ -233,6 +235,7 @@ class JoinPayload(BaseModel):
     display_name: str
     username: Optional[str] = None
     feed_style: Optional[dict] = None
+    side_preference: Optional[str] = None
 
 
 class UserPayload(BaseModel):
@@ -304,9 +307,9 @@ def start(payload: StartPayload):
     previous = _raw_load()
     now = _now()
     registration_seconds = max(15, min(int(payload.registration_seconds or 60), 600))
-    state = _default_state()
-    state["background_filename"] = previous.get("background_filename")
-    state.update({
+    new_state = _default_state()
+    new_state["background_filename"] = previous.get("background_filename")
+    new_state.update({
         "session_id": str(uuid.uuid4()),
         "status": "pooling",
         "title": (payload.title or "Live Debate")[:120],
@@ -318,8 +321,8 @@ def start(payload: StartPayload):
         "voting_seconds": max(10, min(int(payload.voting_seconds or 30), 120)),
         "created_at": _iso(now),
     })
-    _save(state)
-    return _public(state)
+    _save(new_state)
+    return _public(new_state)
 
 
 @router.post("/registration/close")
@@ -376,15 +379,23 @@ def join(payload: JoinPayload):
     uid = str(payload.user_id or "").strip()
     if not uid:
         raise HTTPException(status_code=400, detail="user_id is required")
-    if not any(str(p.get("user_id")) == uid for p in state.get("participants", [])):
-        state.setdefault("participants", []).append({
-            "user_id": uid[:80],
-            "display_name": (payload.display_name or "Member")[:80],
-            "username": (payload.username or "")[:80],
-            "feed_style": payload.feed_style or {},
-            "joined_at": _iso(),
-        })
-        _save(state)
+    side = str(payload.side_preference or "").upper().strip()
+    if side not in {"FOR", "AGAINST"}:
+        raise HTTPException(status_code=400, detail="Choose FOR or AGAINST")
+    participant = {
+        "user_id": uid[:80],
+        "display_name": (payload.display_name or "Member")[:80],
+        "username": (payload.username or "")[:80],
+        "feed_style": payload.feed_style or {},
+        "side_preference": side,
+        "joined_at": _iso(),
+    }
+    existing = next((p for p in state.get("participants", []) if str(p.get("user_id")) == uid), None)
+    if existing:
+        existing.update(participant)
+    else:
+        state.setdefault("participants", []).append(participant)
+    _save(state)
     return _public(state, uid)
 
 
@@ -392,7 +403,7 @@ def join(payload: JoinPayload):
 def leave(payload: UserPayload):
     state = _load()
     if state.get("status") != "pooling":
-        raise HTTPException(status_code=409, detail="You can only leave while registration is open")
+        raise HTTPException(status_code=409, detail="You can only opt out while registration is open")
     uid = str(payload.user_id or "")
     state["participants"] = [p for p in state.get("participants", []) if str(p.get("user_id")) != uid]
     _save(state)
@@ -406,18 +417,23 @@ def select_contestants():
         raise HTTPException(status_code=409, detail="Close registration before selecting contestants")
     people = list(state.get("participants", []))
     if len(people) < 2:
-        raise HTTPException(status_code=409, detail="At least two people must join")
-    chosen = random.sample(people, 2)
-    if random.random() < 0.5:
-        chosen.reverse()
-    state["contestants"] = [dict(chosen[0], side="FOR", slot="A"), dict(chosen[1], side="AGAINST", slot="B")]
+        raise HTTPException(status_code=409, detail="At least two people must volunteer")
+
+    for_pool = [p for p in people if str(p.get("side_preference") or "").upper() == "FOR"]
+    against_pool = [p for p in people if str(p.get("side_preference") or "").upper() == "AGAINST"]
+    flexible = [p for p in people if str(p.get("side_preference") or "").upper() not in {"FOR", "AGAINST"}]
+
+    chosen_for = random.choice(for_pool) if for_pool else (random.choice(flexible) if flexible else None)
+    if chosen_for in flexible:
+        flexible.remove(chosen_for)
+    chosen_against = random.choice(against_pool) if against_pool else (random.choice(flexible) if flexible else None)
+
+    if not chosen_for or not chosen_against:
+        raise HTTPException(status_code=409, detail="At least one FOR volunteer and one AGAINST volunteer are needed")
+
+    state["contestants"] = [dict(chosen_for, side="FOR", slot="A"), dict(chosen_against, side="AGAINST", slot="B")]
     state["status"] = "selected"
     state["registration_ends_at"] = _iso()
-    state["intro_started_at"] = None
-    state["intro_ends_at"] = None
-    state["time_up_side"] = None
-    state["time_up_at"] = None
-    state["time_up_until"] = None
     _save(state)
     return _public(state)
 
@@ -427,10 +443,10 @@ def _start_turn(side: str):
     if len(state.get("contestants", [])) != 2:
         raise HTTPException(status_code=409, detail="Select two contestants first")
     side = side.upper()
-    if side == "FOR" and state.get("status") not in {"selected", "holding_against"}:
-        raise HTTPException(status_code=409, detail="The FOR turn cannot start from the current stage")
-    if side == "AGAINST" and state.get("status") not in {"selected", "holding_against"}:
-        raise HTTPException(status_code=409, detail="The AGAINST turn cannot start from the current stage")
+    if side == "FOR" and state.get("status") != "selected":
+        raise HTTPException(status_code=409, detail="The FOR turn can only start after contestants are selected")
+    if side == "AGAINST" and state.get("status") != "holding_against":
+        raise HTTPException(status_code=409, detail="The AGAINST turn can only start after FOR has finished")
     now = _now()
     intro_seconds = FOR_INTRO_SECONDS if side == "FOR" else AGAINST_INTRO_SECONDS
     state["status"] = "intro_for" if side == "FOR" else "intro_against"
@@ -467,22 +483,16 @@ def begin():
 def holding():
     state = _load()
     now = _now()
-    if state.get("status") in {"intro_for", "speaker_for", "holding_against"}:
+    if state.get("status") in {"speaker_for", "intro_for"}:
         _mark_time_up(state, "FOR", "holding_against", now)
-    elif state.get("status") in {"intro_against", "speaker_against", "holding_vote", "selected"}:
-        if state.get("status") == "selected":
-            state["status"] = "holding_vote"
-            state["active_side"] = None
-            state["time_up_side"] = None
-            state["time_up_at"] = None
-            state["time_up_until"] = None
-        else:
-            _mark_time_up(state, "AGAINST", "holding_vote", now)
+    elif state.get("status") in {"speaker_against", "intro_against"}:
+        _mark_time_up(state, "AGAINST", "holding_vote", now)
+    elif state.get("status") in {"holding_against", "holding_vote"}:
+        pass
     else:
         raise HTTPException(status_code=409, detail="Cannot move to holding from the current stage")
     state["intro_started_at"] = None
     state["intro_ends_at"] = None
-    state["turn_ends_at"] = None
     _save(state)
     return _public(state)
 
@@ -496,12 +506,10 @@ def open_voting():
         raise HTTPException(status_code=409, detail="Finish both speaking turns before opening voting")
     now = _now()
     state["status"] = "voting"
-    state["active_side"] = None
-    state["time_up_side"] = None
-    state["time_up_at"] = None
-    state["time_up_until"] = None
     state["voting"] = {"open": True, "opened_at": _iso(now), "ends_at": _iso(now + timedelta(seconds=int(state.get("voting_seconds") or 30)))}
     state["results"] = {"visible": False, "reveal_started_at": None, "animation_seconds": 7}
+    state["time_up_side"] = None
+    state["time_up_until"] = None
     _save(state)
     return _public(state)
 
@@ -567,7 +575,6 @@ def end():
     state["intro_ends_at"] = None
     state["turn_ends_at"] = None
     state["time_up_side"] = None
-    state["time_up_at"] = None
     state["time_up_until"] = None
     state.setdefault("voting", {})["open"] = False
     state.setdefault("results", {})["visible"] = False
