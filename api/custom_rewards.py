@@ -84,7 +84,7 @@ def _clean_items(items):
         out.append(item)
     if not out:
         raise HTTPException(status_code=400, detail="Add at least one reward item")
-    return out[:30]
+    return out[:100]
 
 
 def _pack(row):
@@ -276,3 +276,7 @@ def claim_pack(payload: ClaimPayload):
         con.commit()
         con.close()
     return {"ok": True}
+
+
+from .participation_rewards import router as participation_rewards_router
+router.include_router(participation_rewards_router)
