@@ -21,6 +21,11 @@ class ParticipationAwardPayload(BaseModel):
     activity: str = "live_room"
 
 
+class ParticipationSendPayload(BaseModel):
+    event_id: str
+    activity: str = "live_room"
+
+
 def _ensure_tables(con: sqlite3.Connection):
     con.execute(
         "CREATE TABLE IF NOT EXISTS participation_reward_config ("
@@ -32,6 +37,11 @@ def _ensure_tables(con: sqlite3.Connection):
         "id TEXT PRIMARY KEY, user_key TEXT NOT NULL, event_id TEXT NOT NULL, activity TEXT NOT NULL, "
         "item_key TEXT NOT NULL, grant_id TEXT NOT NULL, awarded_at TEXT NOT NULL, "
         "UNIQUE(user_key,event_id), UNIQUE(user_key,item_key))"
+    )
+    con.execute(
+        "CREATE TABLE IF NOT EXISTS participation_reward_eligibility ("
+        "user_key TEXT NOT NULL, event_id TEXT NOT NULL, activity TEXT NOT NULL, user_id TEXT, username TEXT, "
+        "registered_at TEXT NOT NULL, PRIMARY KEY(user_key,event_id))"
     )
     con.commit()
 
@@ -77,6 +87,57 @@ def _public_config(con: sqlite3.Connection):
         "image": pack.get("image") or "",
         "item_count": len(pack.get("items") or []),
     }
+
+
+def _grant_one(con: sqlite3.Connection, cfg, row, eligible):
+    key = str(eligible["user_key"])
+    event_id = str(eligible["event_id"])
+    activity = str(eligible["activity"] or "live_room")
+    existing = con.execute(
+        "SELECT * FROM participation_reward_awards WHERE user_key=? AND event_id=?",
+        (key, event_id),
+    ).fetchone()
+    if existing:
+        return {"status": "already_awarded", "grant_id": existing["grant_id"]}
+
+    pack = cr._pack(row)
+    items = list(pack.get("items") or [])
+    owned_rows = con.execute(
+        "SELECT item_key FROM participation_reward_awards WHERE user_key=?",
+        (key,),
+    ).fetchall()
+    owned = {str(r["item_key"]) for r in owned_rows}
+    available = []
+    for item in items:
+        item_key = f"{item.get('type','')}:{item.get('id','')}"
+        if item.get("type") and item.get("id") and item_key not in owned:
+            available.append((item_key, item))
+    if not available:
+        return {"status": "collection_complete"}
+
+    item_key, chosen = random.choice(available)
+    grant_id = str(uuid.uuid4())
+    popup_title = (cfg["popup_title"] if cfg else None) or "Participation Pack"
+    popup_copy = (cfg["popup_copy"] if cfg else None) or pack.get("description") or "Thanks for taking part! You unlocked a new customisation."
+    reward_pack = {
+        "id": f"participation-{grant_id}",
+        "name": popup_title,
+        "description": popup_copy,
+        "image": pack.get("image") or "",
+        "participation_reward": True,
+        "activity": activity,
+        "event_id": event_id,
+        "items": [chosen],
+    }
+    con.execute(
+        "INSERT INTO custom_pack_grants(id,template_id,target_user_id,target_username,pack_json,sent_at,claimed_at) VALUES(?,?,?,?,?,?,NULL)",
+        (grant_id, row["id"], eligible["user_id"] or None, eligible["username"] or None, json.dumps(reward_pack), cr._now()),
+    )
+    con.execute(
+        "INSERT INTO participation_reward_awards(id,user_key,event_id,activity,item_key,grant_id,awarded_at) VALUES(?,?,?,?,?,?,?)",
+        (str(uuid.uuid4()), key, event_id, activity, item_key, grant_id, cr._now()),
+    )
+    return {"status": "awarded", "grant_id": grant_id, "item_key": item_key}
 
 
 @router.get("/config")
@@ -135,7 +196,7 @@ def save_participation_admin(payload: ParticipationConfigPayload):
 
 
 @router.post("/award")
-def award_participation(payload: ParticipationAwardPayload):
+def register_participation(payload: ParticipationAwardPayload):
     uid = str(payload.user_id or "").strip()[:80]
     uname = str(payload.username or "").strip().lstrip("@").lower()[:80]
     event_id = str(payload.event_id or "").strip()[:180]
@@ -150,60 +211,80 @@ def award_participation(payload: ParticipationAwardPayload):
         con = cr._conn()
         try:
             _ensure_tables(con)
-            cfg, row = _participation_template(con)
-            if not row:
-                return {"ok": True, "awarded": False, "reason": "participation_pack_not_configured"}
-            existing = con.execute(
-                "SELECT * FROM participation_reward_awards WHERE user_key=? AND event_id=?",
+            con.execute(
+                "INSERT INTO participation_reward_eligibility(user_key,event_id,activity,user_id,username,registered_at) VALUES(?,?,?,?,?,?) "
+                "ON CONFLICT(user_key,event_id) DO UPDATE SET activity=excluded.activity,user_id=COALESCE(excluded.user_id,user_id),username=COALESCE(excluded.username,username)",
+                (key, event_id, activity, uid or None, uname or None, cr._now()),
+            )
+            con.commit()
+            already = con.execute(
+                "SELECT grant_id FROM participation_reward_awards WHERE user_key=? AND event_id=?",
                 (key, event_id),
             ).fetchone()
-            if existing:
-                return {"ok": True, "awarded": False, "already_awarded": True, "grant_id": existing["grant_id"]}
-
-            pack = cr._pack(row)
-            items = list(pack.get("items") or [])
-            owned_rows = con.execute(
-                "SELECT item_key FROM participation_reward_awards WHERE user_key=?",
-                (key,),
-            ).fetchall()
-            owned = {str(r["item_key"]) for r in owned_rows}
-            available = []
-            for item in items:
-                item_key = f"{item.get('type','')}:{item.get('id','')}"
-                if item.get("type") and item.get("id") and item_key not in owned:
-                    available.append((item_key, item))
-            if not available:
-                return {"ok": True, "awarded": False, "collection_complete": True, "item_count": len(items)}
-
-            item_key, chosen = random.choice(available)
-            grant_id = str(uuid.uuid4())
-            popup_title = (cfg["popup_title"] if cfg else None) or "Participation Pack"
-            popup_copy = (cfg["popup_copy"] if cfg else None) or pack.get("description") or "Thanks for taking part! You unlocked a new customisation."
-            reward_pack = {
-                "id": f"participation-{grant_id}",
-                "name": popup_title,
-                "description": popup_copy,
-                "image": pack.get("image") or "",
-                "participation_reward": True,
-                "activity": activity,
-                "items": [chosen],
+            return {
+                "ok": True,
+                "queued": True,
+                "awarded": False,
+                "already_awarded": bool(already),
+                "event_id": event_id,
             }
-            con.execute(
-                "INSERT INTO custom_pack_grants(id,template_id,target_user_id,target_username,pack_json,sent_at,claimed_at) VALUES(?,?,?,?,?,?,NULL)",
-                (grant_id, row["id"], uid or None, uname or None, json.dumps(reward_pack), cr._now()),
-            )
-            con.execute(
-                "INSERT INTO participation_reward_awards(id,user_key,event_id,activity,item_key,grant_id,awarded_at) VALUES(?,?,?,?,?,?,?)",
-                (str(uuid.uuid4()), key, event_id, activity, item_key, grant_id, cr._now()),
-            )
+        finally:
+            con.close()
+
+
+@router.get("/event")
+def participation_event(event_id: str):
+    event_id = str(event_id or "").strip()[:180]
+    with cr._LOCK:
+        con = cr._conn()
+        try:
+            _ensure_tables(con)
+            eligible = con.execute(
+                "SELECT COUNT(*) AS n FROM participation_reward_eligibility WHERE event_id=?",
+                (event_id,),
+            ).fetchone()["n"]
+            awarded = con.execute(
+                "SELECT COUNT(*) AS n FROM participation_reward_awards WHERE event_id=?",
+                (event_id,),
+            ).fetchone()["n"]
+            return {"ok": True, "event_id": event_id, "eligible": int(eligible or 0), "awarded": int(awarded or 0), "sent": bool(eligible and awarded >= eligible)}
+        finally:
+            con.close()
+
+
+@router.post("/send")
+def send_participation_pack(payload: ParticipationSendPayload):
+    event_id = str(payload.event_id or "").strip()[:180]
+    if not event_id:
+        raise HTTPException(status_code=400, detail="event_id is required")
+    with cr._LOCK:
+        con = cr._conn()
+        try:
+            _ensure_tables(con)
+            cfg, row = _participation_template(con)
+            if not row:
+                raise HTTPException(status_code=409, detail="Participation Pack is not configured")
+            eligible = con.execute(
+                "SELECT * FROM participation_reward_eligibility WHERE event_id=? ORDER BY registered_at ASC",
+                (event_id,),
+            ).fetchall()
+            awarded = already = complete = 0
+            for person in eligible:
+                result = _grant_one(con, cfg, row, person)
+                if result["status"] == "awarded":
+                    awarded += 1
+                elif result["status"] == "already_awarded":
+                    already += 1
+                elif result["status"] == "collection_complete":
+                    complete += 1
             con.commit()
             return {
                 "ok": True,
-                "awarded": True,
-                "grant_id": grant_id,
-                "pack": reward_pack,
-                "item_key": item_key,
-                "remaining": max(0, len(available) - 1),
+                "event_id": event_id,
+                "eligible": len(eligible),
+                "awarded": awarded,
+                "already_awarded": already,
+                "collection_complete": complete,
             }
         finally:
             con.close()
