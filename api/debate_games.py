@@ -138,11 +138,6 @@ def _mark_time_up(state, side: str, next_status: str, now: datetime):
 def _normalize_timers(state):
     changed = False
     now = _now()
-    if state.get("status") == "pooling":
-        end = _parse(state.get("registration_ends_at"))
-        if end and end <= now:
-            state["status"] = "registration_closed"
-            changed = True
     if state.get("status") == "intro_for":
         end = _parse(state.get("intro_ends_at"))
         if end and end <= now:
@@ -316,7 +311,7 @@ def start(payload: StartPayload):
         "statement": statement[:300],
         "description": (payload.description or "")[:600],
         "registration_seconds": registration_seconds,
-        "registration_ends_at": _iso(now + timedelta(seconds=registration_seconds)),
+        "registration_ends_at": None,
         "duration_seconds": max(30, min(int(payload.duration_seconds or 120), 600)),
         "voting_seconds": max(10, min(int(payload.voting_seconds or 30), 120)),
         "created_at": _iso(now),
@@ -331,7 +326,7 @@ def close_registration():
     if state.get("status") not in {"pooling", "registration_closed"}:
         raise HTTPException(status_code=409, detail="Registration is not open")
     state["status"] = "registration_closed"
-    state["registration_ends_at"] = _iso()
+    state["registration_ends_at"] = None
     _save(state)
     return _public(state)
 
@@ -433,7 +428,7 @@ def select_contestants():
 
     state["contestants"] = [dict(chosen_for, side="FOR", slot="A"), dict(chosen_against, side="AGAINST", slot="B")]
     state["status"] = "selected"
-    state["registration_ends_at"] = _iso()
+    state["registration_ends_at"] = None
     _save(state)
     return _public(state)
 
