@@ -15,9 +15,18 @@ from pydantic import BaseModel, Field
 
 
 router = APIRouter(prefix="/api/agendas", tags=["agendas"])
-DATA_DIR = Path(os.getenv("ALCOVE_AGENDA_DIR", Path.cwd() / "agenda_data"))
-DB_PATH = DATA_DIR / "agendas.sqlite3"
-DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _data_dir() -> Path:
+    for key in ("ALCOVE_STATE_DB_PATH", "ALCOVE_RUNTIME_STATE_PATH", "FOX_LOGS_DB_PATH"):
+        raw = os.getenv(key, "").strip()
+        if raw:
+            return Path(raw).expanduser().resolve().parent
+    return Path.cwd()
+
+
+DB_PATH = Path(os.getenv("ALCOVE_AGENDA_DB", str(_data_dir() / "agendas.sqlite3")))
+DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 _LOCK = threading.RLock()
 
 
