@@ -42,6 +42,7 @@ from .home_alerts import router as home_alerts_router
 from .team_games import router as team_games_router
 from .custom_rewards import router as custom_rewards_router
 from .debate_games import router as debate_games_router
+from .agendas import router as agendas_router
 
 try:
     from dotenv import load_dotenv
@@ -62,6 +63,7 @@ app.include_router(home_alerts_router)
 app.include_router(team_games_router)
 app.include_router(custom_rewards_router)
 app.include_router(debate_games_router)
+app.include_router(agendas_router)
 
 CORS_ALLOWED_ORIGINS = [
     "null",
