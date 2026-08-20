@@ -253,6 +253,11 @@ class ResultsPayload(BaseModel):
     animation_seconds: int = 7
 
 
+class ReplaceContestantPayload(BaseModel):
+    current_user_id: str
+    replacement_user_id: str
+
+
 @router.get("/state")
 def state(user_id: Optional[str] = None):
     return _public(_load(), user_id)
@@ -429,6 +434,30 @@ def select_contestants():
     state["contestants"] = [dict(chosen_for, side="FOR", slot="A"), dict(chosen_against, side="AGAINST", slot="B")]
     state["status"] = "selected"
     state["registration_ends_at"] = None
+    _save(state)
+    return _public(state)
+
+
+@router.post("/contestants/replace")
+def replace_contestant(payload: ReplaceContestantPayload):
+    state = _load()
+    if state.get("status") not in {"selected", "intro_for", "holding_against", "intro_against", "holding_vote"}:
+        raise HTTPException(status_code=409, detail="Speakers can only be replaced while a turn is not running")
+    current_id = str(payload.current_user_id or "").strip()
+    replacement_id = str(payload.replacement_user_id or "").strip()
+    contestants = state.get("contestants", [])
+    index = next((i for i, c in enumerate(contestants) if str(c.get("user_id")) == current_id), None)
+    if index is None:
+        raise HTTPException(status_code=404, detail="Current speaker was not found")
+    if any(str(c.get("user_id")) == replacement_id for c in contestants):
+        raise HTTPException(status_code=409, detail="That volunteer is already speaking")
+    volunteer = next((p for p in state.get("participants", []) if str(p.get("user_id")) == replacement_id), None)
+    if not volunteer:
+        raise HTTPException(status_code=400, detail="Replacement must be a registered volunteer")
+    old = contestants[index]
+    replacement = dict(volunteer, side=old.get("side"), slot=old.get("slot"))
+    contestants[index] = replacement
+    state["contestants"] = contestants
     _save(state)
     return _public(state)
 
