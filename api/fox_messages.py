@@ -16,6 +16,8 @@ def _default_fox_messages_path() -> str:
         parent = os.path.dirname(configured)
         if parent:
             return os.path.join(parent, "fox_messages.json")
+    if os.path.isdir("/var/data"):
+        return "/var/data/fox_messages.json"
     return os.path.join(os.getcwd(), "fox_messages.json")
 
 
