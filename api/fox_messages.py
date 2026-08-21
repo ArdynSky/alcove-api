@@ -4,9 +4,25 @@ import os
 import re
 import uuid
 
-FOX_MESSAGES_PATH = os.getenv(
-    "FOX_MESSAGES_PATH",
-    os.path.join(os.getcwd(), "fox_messages.json"),
+def _default_fox_messages_path() -> str:
+    """Keep editable F.O.X settings beside the service's persistent state."""
+    for env_name in (
+        "ALCOVE_RUNTIME_STATE_PATH",
+        "ALCOVE_STATE_DB_PATH",
+        "SAFETY_SETTINGS_PATH",
+        "FOX_LOGS_DB_PATH",
+    ):
+        configured = os.path.expanduser(str(os.getenv(env_name, "") or "").strip())
+        parent = os.path.dirname(configured)
+        if parent:
+            return os.path.join(parent, "fox_messages.json")
+    if os.path.isdir("/var/data"):
+        return "/var/data/fox_messages.json"
+    return os.path.join(os.getcwd(), "fox_messages.json")
+
+
+FOX_MESSAGES_PATH = os.path.expanduser(
+    os.getenv("FOX_MESSAGES_PATH") or _default_fox_messages_path()
 )
 
 UPLOADED_BANNER_PREFIX = "fox-banners/"
@@ -691,8 +707,19 @@ def save_fox_messages_state(state: dict) -> dict:
     directory = os.path.dirname(FOX_MESSAGES_PATH)
     if directory:
         os.makedirs(directory, exist_ok=True)
-    with open(FOX_MESSAGES_PATH, "w", encoding="utf-8") as handle:
-        json.dump(state, handle, indent=2, sort_keys=True)
+    temporary_path = f"{FOX_MESSAGES_PATH}.{uuid.uuid4().hex}.tmp"
+    try:
+        with open(temporary_path, "w", encoding="utf-8") as handle:
+            json.dump(state, handle, indent=2, sort_keys=True)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_path, FOX_MESSAGES_PATH)
+    finally:
+        if os.path.exists(temporary_path):
+            try:
+                os.remove(temporary_path)
+            except OSError:
+                pass
     return state
 
 
