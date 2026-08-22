@@ -44,6 +44,11 @@ def _conn():
         "show_in_app INTEGER NOT NULL DEFAULT 0, items_json TEXT NOT NULL, "
         "created_at TEXT NOT NULL, updated_at TEXT NOT NULL)"
     )
+    columns = {row[1] for row in con.execute("PRAGMA table_info(agendas)").fetchall()}
+    if "current_item_id" not in columns:
+        con.execute("ALTER TABLE agendas ADD COLUMN current_item_id TEXT")
+    if "completed_item_ids_json" not in columns:
+        con.execute("ALTER TABLE agendas ADD COLUMN completed_item_ids_json TEXT NOT NULL DEFAULT '[]'")
     con.commit()
     return con
 
@@ -70,6 +75,11 @@ class AgendaStatusPayload(BaseModel):
     status: Literal["draft", "future", "active", "finished"]
 
 
+class AgendaProgressPayload(BaseModel):
+    action: Literal["activate", "advance", "complete", "reset"]
+    item_id: Optional[str] = None
+
+
 def _validate(payload: AgendaPayload):
     try:
         ZoneInfo(payload.timezone)
@@ -88,6 +98,7 @@ def _public(row):
     data = dict(row)
     data["show_in_app"] = bool(data["show_in_app"])
     data["items"] = json.loads(data.pop("items_json") or "[]")
+    data["completed_item_ids"] = json.loads(data.pop("completed_item_ids_json", "[]") or "[]")
     start = datetime.strptime(
         f"{data['event_date']} {data['start_time']}", "%Y-%m-%d %H:%M"
     ).replace(tzinfo=ZoneInfo(data["timezone"]))
@@ -150,7 +161,7 @@ def create_agenda(payload: AgendaPayload):
     with _LOCK:
         con = _conn()
         con.execute(
-            "INSERT INTO agendas VALUES(?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO agendas(id,title,event_date,start_time,timezone,status,show_in_app,items_json,created_at,updated_at,current_item_id,completed_item_ids_json) VALUES(?,?,?,?,?,?,?,?,?,?,NULL,'[]')",
             (agenda_id, payload.title.strip()[:160], payload.event_date, payload.start_time,
              payload.timezone, payload.status, int(payload.show_in_app),
              json.dumps([x.model_dump() for x in payload.items]), now, now),
@@ -199,6 +210,45 @@ def set_status(agenda_id: str, payload: AgendaStatusPayload):
     with _LOCK:
         con = _conn()
         con.execute("UPDATE agendas SET status=?,updated_at=? WHERE id=?", (payload.status, _now(), agenda_id))
+        con.commit()
+        con.close()
+    return _public(_get(agenda_id))
+
+
+@router.post("/{agenda_id}/progress")
+def set_progress(agenda_id: str, payload: AgendaProgressPayload):
+    agenda = _public(_get(agenda_id))
+    if agenda["status"] != "active":
+        raise HTTPException(status_code=409, detail="Activate the agenda before running it")
+    item_ids = [str(item.get("id")) for item in agenda["items"]]
+    item_id = str(payload.item_id or "").strip() or None
+    if item_id and item_id not in item_ids:
+        raise HTTPException(status_code=404, detail="Agenda item not found")
+    current = agenda.get("current_item_id")
+    completed = list(dict.fromkeys(str(x) for x in agenda.get("completed_item_ids", [])))
+    if payload.action == "reset":
+        current, completed = None, []
+    elif payload.action == "activate":
+        if not item_id:
+            raise HTTPException(status_code=400, detail="Choose an agenda item")
+        current = item_id
+    elif payload.action == "advance":
+        if current and current not in completed:
+            completed.append(current)
+        if not item_id:
+            raise HTTPException(status_code=400, detail="Choose the next agenda item")
+        current = item_id
+    else:
+        target = item_id or current
+        if target and target not in completed:
+            completed.append(target)
+        current = None if target == current else current
+    with _LOCK:
+        con = _conn()
+        con.execute(
+            "UPDATE agendas SET current_item_id=?,completed_item_ids_json=?,updated_at=? WHERE id=?",
+            (current, json.dumps(completed), _now(), agenda_id),
+        )
         con.commit()
         con.close()
     return _public(_get(agenda_id))
