@@ -76,6 +76,13 @@ def _ensure_settings(session_id: str):
     return dict(row) if row else {"session_id": session_id, "submissions_open": 0, "overlay_submission_id": None}
 
 
+def _submissions_open(state: dict) -> bool:
+    return str(state.get("status") or "") in {
+        "pooling", "registration_closed", "selected", "intro_for", "speaker_for",
+        "holding_against", "intro_against", "speaker_against", "holding_vote",
+    }
+
+
 def _thoughts(session_id: str):
     with _LOCK:
         con = _conn()
@@ -128,7 +135,7 @@ def audience_state(user_id: Optional[str] = None):
     mine = next((x for x in thoughts if str(x.get("user_id")) == str(user_id or "")), None) if user_id else None
     return {
         "session_id": sid,
-        "submissions_open": bool(settings.get("submissions_open")),
+        "submissions_open": _submissions_open(state),
         "count": len(thoughts),
         "mine": mine,
         "overlay": _overlay(sid, settings),
@@ -156,8 +163,8 @@ def audience_submit(payload: AudienceThoughtPayload):
     sid = str(state.get("session_id") or "")
     if not sid:
         raise HTTPException(status_code=409, detail="No debate is active")
-    settings = _ensure_settings(sid)
-    if not settings.get("submissions_open"):
+    _ensure_settings(sid)
+    if not _submissions_open(state):
         raise HTTPException(status_code=409, detail="Audience thoughts are currently closed")
     uid = str(payload.user_id or "").strip()
     if not uid:
@@ -206,7 +213,7 @@ def audience_submissions():
     settings = _ensure_settings(sid)
     return {
         "session_id": sid,
-        "submissions_open": bool(settings.get("submissions_open")),
+        "submissions_open": _submissions_open(_load()),
         "overlay": _overlay(sid, settings),
         "submissions": _thoughts(sid),
     }
