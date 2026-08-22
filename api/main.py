@@ -11565,6 +11565,7 @@ def mark_pulse_daily_summary_posted(day_key: str, category_slug: str, payload: d
 def bot_pending_pulse_notifications(x_bot_sync_secret: str | None = Header(default=None)):
     verify_bot_sync_secret(x_bot_sync_secret)
     rows = []
+    receipt_claims_changed = False
     for entry in pulse_entries:
         if entry.get("status") != "awaiting_response" or entry.get("assignment_notified_at"):
             continue
@@ -11589,6 +11590,12 @@ def bot_pending_pulse_notifications(x_bot_sync_secret: str | None = Header(defau
             continue
         if not iso_has_passed(receipt.get("notify_after")):
             continue
+        # Lease a pending receipt before handing it to a polling bot. If the
+        # bot's sent acknowledgement is delayed, another poll cannot deliver
+        # the same Telegram DM every few minutes. A genuine failed delivery
+        # becomes eligible for retry after the lease expires.
+        if not iso_has_passed(receipt.get("notification_claim_until")):
+            continue
         payload = pulse_receipt_payload(receipt)
         if not payload:
             continue
@@ -11606,6 +11613,10 @@ def bot_pending_pulse_notifications(x_bot_sync_secret: str | None = Header(defau
             "notify_after": receipt.get("notify_after"),
             "pulse": payload,
         })
+        receipt["notification_claim_until"] = iso_in_seconds(15 * 60)
+        receipt_claims_changed = True
+    if receipt_claims_changed:
+        save_runtime_state()
     for alert in pulse_red_unlock_notifications:
         if alert.get("notified_at"):
             continue
@@ -11655,6 +11666,7 @@ def mark_pulse_notification_sent(notification_id: str, x_bot_sync_secret: str | 
     if not receipt:
         return {"status": "error", "message": "Pulse receipt not found."}
     receipt["notified_at"] = now_iso()
+    receipt["notification_claim_until"] = None
     save_runtime_state()
     return {"status": "ok", "receipt": pulse_receipt_payload(receipt)}
 
