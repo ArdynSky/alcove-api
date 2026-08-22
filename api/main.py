@@ -375,6 +375,10 @@ PULSE_RED_UNLOCK_NOTIFY_USERNAMES_RAW = os.getenv(
     "PULSE_RED_UNLOCK_NOTIFY_USERNAMES",
     "Ardyn_Sky,The_Alcove",
 ).strip()
+PULSE_RED_UNLOCK_DMS_ENABLED = os.getenv(
+    "PULSE_RED_UNLOCK_DMS_ENABLED",
+    "0",
+).strip().lower() in {"1", "true", "yes", "on"}
 UK_TZ = ZoneInfo("Europe/London")
 
 
@@ -5060,6 +5064,8 @@ def pulse_red_unlock_notify_allowed(user: dict) -> bool:
 
 
 def queue_red_pulse_unlock_notifications(day_key: str, cycle_number: int):
+    if not PULSE_RED_UNLOCK_DMS_ENABLED:
+        return
     users = get_verified_alcove_users()
     if not users:
         return
@@ -11619,7 +11625,7 @@ def bot_pending_pulse_notifications(x_bot_sync_secret: str | None = Header(defau
         receipt_handoffs_changed = True
     if receipt_handoffs_changed:
         save_runtime_state()
-    for alert in pulse_red_unlock_notifications:
+    for alert in pulse_red_unlock_notifications if PULSE_RED_UNLOCK_DMS_ENABLED else []:
         if alert.get("notified_at"):
             continue
         if not pulse_red_unlock_notify_allowed({
