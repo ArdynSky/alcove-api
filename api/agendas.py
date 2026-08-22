@@ -56,6 +56,7 @@ def _conn():
 class AgendaItem(BaseModel):
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     content_id: Optional[str] = None
+    content_snapshot: Optional[dict] = None
     kind: str = "activity"
     title: str
     duration_minutes: int = Field(default=10, ge=1, le=480)
