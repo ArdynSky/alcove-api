@@ -6,7 +6,7 @@ import sqlite3
 import uuid
 from typing import Optional
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Header, HTTPException
 from pydantic import BaseModel
 
 from . import custom_rewards as cr
@@ -196,7 +196,12 @@ def save_participation_admin(payload: ParticipationConfigPayload):
 
 
 @router.post("/award")
-def register_participation(payload: ParticipationAwardPayload):
+def register_participation(payload: ParticipationAwardPayload, authorization: str | None = Header(default=None)):
+    try:
+        from .live_room_test import apply_authorization_identity
+        apply_authorization_identity(payload, authorization)
+    except Exception:
+        pass
     uid = str(payload.user_id or "").strip()[:80]
     uname = str(payload.username or "").strip().lstrip("@").lower()[:80]
     event_id = str(payload.event_id or "").strip()[:180]

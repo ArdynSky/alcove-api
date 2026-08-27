@@ -10,7 +10,7 @@ import sqlite3
 import threading
 import uuid
 
-from fastapi import APIRouter, File, HTTPException, UploadFile
+from fastapi import APIRouter, File, Header, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
@@ -264,7 +264,12 @@ def state(user_id: Optional[str] = None):
 
 
 @router.post("/presence/heartbeat")
-def presence_heartbeat(payload: PresencePayload):
+def presence_heartbeat(payload: PresencePayload, authorization: str | None = Header(default=None)):
+    try:
+        from .live_room_test import apply_authorization_identity
+        apply_authorization_identity(payload, authorization)
+    except Exception:
+        pass
     uid = str(payload.user_id or "").strip()
     if not uid:
         raise HTTPException(status_code=400, detail="user_id is required")

@@ -43,6 +43,7 @@ from .team_games import router as team_games_router
 from .custom_rewards import router as custom_rewards_router
 from .debate_games import router as debate_games_router
 from .agendas import router as agendas_router
+from .live_room_test import apply_authorization_identity, router as live_room_test_router
 
 try:
     from dotenv import load_dotenv
@@ -64,6 +65,7 @@ app.include_router(team_games_router)
 app.include_router(custom_rewards_router)
 app.include_router(debate_games_router)
 app.include_router(agendas_router)
+app.include_router(live_room_test_router)
 
 CORS_ALLOWED_ORIGINS = [
     "null",
@@ -2209,6 +2211,12 @@ FEATURE_FLAG_REGISTRY = {
                 "label": "Alcove Cards",
                 "description": "Show or hide the Alcove Cards game on home.",
                 "path": "alcove-cards-demo.html",
+                "default": False,
+            },
+            "live_room_test": {
+                "label": "Live Room Test",
+                "description": "Show or hide the isolated Live Room camera test page on home.",
+                "path": "live-room-test.html",
                 "default": False,
             },
         },
@@ -9111,7 +9119,8 @@ def list_reviews():
 # ---------------------------------
 
 @app.post("/api/stream-comment")
-def submit_stream_comment(comment: StreamComment):
+def submit_stream_comment(comment: StreamComment, authorization: str | None = Header(default=None)):
+    apply_authorization_identity(comment, authorization)
     # Live Feed copy is single-line and capped to ~3 wrapped lines at max bubble width.
     text = " ".join(str(comment.text or "").split())
     if len(text) == 0:
@@ -9490,7 +9499,8 @@ def list_poll_history():
 
 
 @app.post("/api/room-poll/vote")
-def vote_room_poll(payload: RoomPollVote):
+def vote_room_poll(payload: RoomPollVote, authorization: str | None = Header(default=None)):
+    apply_authorization_identity(payload, authorization)
     if not active_poll or active_poll.get("status") != "open":
         return {"status": "error", "message": "No open poll right now."}
     option_id = (payload.option_id or "").strip()
