@@ -147,34 +147,74 @@ def _role_for(user: dict) -> str:
     return "host" if _is_host(user.get("id") or user.get("user_id")) else "participant"
 
 
-def _build_embed_url(raw_url: str, display_name: str) -> str:
+def _has_room_key(query: dict) -> bool:
+    return bool(str(query.get("roomKey") or query.get("roomkey") or "").strip())
+
+
+def _drop_host_keys(query: dict) -> dict:
+    cleaned = dict(query)
+    cleaned.pop("roomKey", None)
+    cleaned.pop("roomkey", None)
+    return cleaned
+
+
+def _apply_embed_defaults(query: dict, display_name: str, user: dict, *, host: bool) -> dict:
+    next_query = dict(query)
+    if not host:
+        next_query = _drop_host_keys(next_query)
+        next_query.setdefault("screenshare", "off")
+        next_query.setdefault("locking", "off")
+        next_query.setdefault("moreButton", "off")
+        next_query.setdefault("people", "off")
+        next_query.setdefault("breakout", "off")
+        next_query.setdefault("topToolbar", "off")
+    next_query.setdefault("displayName", display_name or "Member")
+    next_query.setdefault("embed", "")
+    next_query.setdefault("skipMediaPermissionPrompt", "")
+    next_query.setdefault("precallReview", "off")
+    next_query.setdefault("precallCeremony", "off")
+    next_query.setdefault("chat", "off")
+    next_query.setdefault("logo", "off")
+    next_query.setdefault("floatSelf", "")
+    next_query.setdefault("pipButton", "off")
+    next_query.setdefault("leaveButton", "off")
+    user_id = str(user.get("id") or user.get("user_id") or "").strip()
+    if user_id.isalnum() and len(user_id) <= 36:
+        next_query.setdefault("externalId", user_id)
+    next_query.pop("audio", None)
+    next_query.pop("video", None)
+    return next_query
+
+
+def _build_embed_url(raw_url: str, display_name: str, user: dict, *, host: bool) -> str:
     raw = str(raw_url or "").strip()
     if not raw:
         return ""
     parsed = urlparse(raw)
-    query = dict(parse_qsl(parsed.query, keep_blank_values=True))
-    query.setdefault("displayName", display_name or "Member")
-    query.setdefault("embed", "")
-    query.setdefault("chat", "off")
-    query.setdefault("logo", "off")
-    query.pop("audio", None)
-    query.pop("video", None)
+    query = _apply_embed_defaults(
+        dict(parse_qsl(parsed.query, keep_blank_values=True)),
+        display_name,
+        user,
+        host=host,
+    )
     return urlunparse(parsed._replace(query=urlencode(query)))
 
 
 def _embed_for(user: dict, role: str) -> dict:
-    participant = _participant_url()
-    host = _host_url()
     display_name = _display_name(user)
-    if role == "host" and host:
-        embed_url = _build_embed_url(host, display_name)
-    else:
-        embed_url = _build_embed_url(participant, display_name)
-        role = "participant"
+    raw_host = _host_url()
+    raw_participant = _participant_url() or raw_host
+    participant_url = _build_embed_url(raw_participant, display_name, user, host=False)
+    host_url = _build_embed_url(raw_host, display_name, user, host=True) if raw_host else ""
+    is_host = role == "host" and bool(host_url)
+    embed_url = host_url if is_host else participant_url
+    host_query = dict(parse_qsl(urlparse(embed_url or "").query, keep_blank_values=True))
     return {
-        "role": role,
+        "role": "host" if is_host else "participant",
         "embed_url": embed_url or None,
+        "participant_embed_url": participant_url or None,
         "configured": bool(embed_url),
+        "host_controls": bool(is_host and _has_room_key(host_query)),
     }
 
 
@@ -287,14 +327,15 @@ def apply_authorization_identity(payload, authorization: Optional[str]):
 
 def _session_payload(user: dict, session_token: str, expires_at: datetime) -> dict:
     public = _public_user(user)
-    role = _role_for(user)
-    embed = _embed_for(user, role)
+    embed = _embed_for(user, _role_for(user))
     return {
         "session_token": session_token,
         "user": public,
         "role": embed["role"],
         "embed_url": embed["embed_url"],
+        "participant_embed_url": embed["participant_embed_url"],
         "configured": embed["configured"],
+        "host_controls": embed["host_controls"],
         "expires_at": _iso(expires_at),
         "telegram_app_url": _telegram_app_url() or None,
     }
@@ -362,7 +403,9 @@ def me(authorization: Optional[str] = Header(default=None)):
         "user": _public_user(user),
         "role": embed["role"],
         "embed_url": embed["embed_url"],
+        "participant_embed_url": embed["participant_embed_url"],
         "configured": embed["configured"],
+        "host_controls": embed["host_controls"],
         "telegram_app_url": _telegram_app_url() or None,
     }
 

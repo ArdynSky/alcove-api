@@ -71,6 +71,10 @@ class LiveRoomTestAuthTests(unittest.TestCase):
         self.assertIn("the-alcove.whereby.com/test-room", data["embed_url"])
         self.assertNotIn("HOSTKEYSECRET", data["embed_url"])
         self.assertNotIn("HOSTKEYSECRET", response.text)
+        self.assertNotIn("roomKey", data["embed_url"])
+        self.assertIn("people=off", data["embed_url"])
+        self.assertIn("screenshare=off", data["embed_url"])
+        self.assertFalse(data["host_controls"])
         self.assertTrue(data["configured"])
 
     def test_host_session_receives_host_embed(self):
@@ -82,6 +86,27 @@ class LiveRoomTestAuthTests(unittest.TestCase):
         data = response.json()
         self.assertEqual(data["role"], "host")
         self.assertIn("roomKey=HOSTKEYSECRET", data["embed_url"])
+        self.assertTrue(data["host_controls"])
+        self.assertNotIn("people=off", data["embed_url"])
+        self.assertNotIn("HOSTKEYSECRET", data.get("participant_embed_url") or "")
+
+    def test_participant_env_room_key_is_stripped(self):
+        previous = os.environ["WHEREBY_LIVE_ROOM_TEST_PARTICIPANT_URL"]
+        os.environ["WHEREBY_LIVE_ROOM_TEST_PARTICIPANT_URL"] = os.environ["WHEREBY_LIVE_ROOM_TEST_HOST_URL"]
+        try:
+            response = self.client.post(
+                "/api/live-room-test/session",
+                json={"init_data": "member-init"},
+            )
+            self.assertEqual(response.status_code, 200)
+            data = response.json()
+            self.assertEqual(data["role"], "participant")
+            self.assertNotIn("HOSTKEYSECRET", data["embed_url"])
+            self.assertNotIn("roomKey", data["embed_url"])
+            self.assertIn("people=off", data["embed_url"])
+            self.assertFalse(data["host_controls"])
+        finally:
+            os.environ["WHEREBY_LIVE_ROOM_TEST_PARTICIPANT_URL"] = previous
 
     def test_handoff_is_single_use_and_expires(self):
         handoff = self.client.post(
