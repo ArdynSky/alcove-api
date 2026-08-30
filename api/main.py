@@ -44,6 +44,7 @@ from .custom_rewards import router as custom_rewards_router
 from .debate_games import router as debate_games_router
 from .agendas import router as agendas_router
 from .live_room_test import apply_authorization_identity, router as live_room_test_router
+from .member_progress import router as member_progress_router
 
 try:
     from dotenv import load_dotenv
@@ -66,6 +67,7 @@ app.include_router(custom_rewards_router)
 app.include_router(debate_games_router)
 app.include_router(agendas_router)
 app.include_router(live_room_test_router)
+app.include_router(member_progress_router)
 
 CORS_ALLOWED_ORIGINS = [
     "null",
@@ -407,6 +409,12 @@ MAX_PULSE_DISABLED_QUESTIONS = env_int("ALCOVE_MAX_PULSE_DISABLED_QUESTIONS", 10
 MAX_MINIAPP_VERIFICATIONS = env_int("ALCOVE_MAX_MINIAPP_VERIFICATIONS", 2000, 100, 10000)
 MAX_WHEEL_REACTION_HISTORY = env_int("ALCOVE_MAX_WHEEL_REACTION_HISTORY", 2000, 100, 10000)
 MAX_WHEEL_REVIEW_HISTORY = env_int("ALCOVE_MAX_WHEEL_REVIEW_HISTORY", 2000, 100, 10000)
+MAX_ARCHIVED_WHEEL_ENTRIES = env_int("ALCOVE_MAX_ARCHIVED_WHEEL_ENTRIES", 80, 20, 400)
+LIVE_VIEW_COMMENT_LIMIT = env_int("ALCOVE_LIVE_VIEW_COMMENT_LIMIT", 40, 10, 120)
+LIVE_ROOM_PERSIST_DEBOUNCE_S = float(os.getenv("ALCOVE_LIVE_ROOM_PERSIST_DEBOUNCE_S", "0.75") or 0.75)
+
+_persist_live_room_lock = threading.Lock()
+_persist_live_room_timer: threading.Timer | None = None
 
 _last_saved_runtime_fingerprint: str | None = None
 _last_pulse_prune_day: str | None = None
@@ -511,6 +519,7 @@ def trim_runtime_state_collections() -> None:
     trim_list_in_place(approved_comments, MAX_APPROVED_COMMENTS)
     trim_list_in_place(pending_comments, MAX_PENDING_COMMENTS)
     trim_list_in_place(video_reviews, MAX_VIDEO_REVIEWS)
+    trim_list_in_place(archived_wheel_entries, MAX_ARCHIVED_WHEEL_ENTRIES)
 
 
 def ensure_state_store() -> None:
@@ -2150,9 +2159,31 @@ def load_live_room_state() -> None:
     apply_live_room_payload(payload)
 
 
-def persist_live_room() -> None:
+def persist_live_room_now() -> None:
     save_live_room_state()
     ws_broadcast_bundle()
+
+
+def persist_live_room(immediate: bool = False) -> None:
+    global _persist_live_room_timer
+    delay = max(0.0, float(LIVE_ROOM_PERSIST_DEBOUNCE_S or 0))
+    with _persist_live_room_lock:
+        if _persist_live_room_timer is not None:
+            _persist_live_room_timer.cancel()
+            _persist_live_room_timer = None
+        if immediate or delay <= 0:
+            persist_live_room_now()
+            return
+
+        def flush() -> None:
+            global _persist_live_room_timer
+            with _persist_live_room_lock:
+                _persist_live_room_timer = None
+            persist_live_room_now()
+
+        _persist_live_room_timer = threading.Timer(delay, flush)
+        _persist_live_room_timer.daemon = True
+        _persist_live_room_timer.start()
 
 
 load_live_room_state()
@@ -6766,10 +6797,10 @@ def ws_broadcast(event: str, data):
 def ws_broadcast_bundle():
     try:
         payload = {
-            "app_state": get_app_state(),
+            "app_state": get_app_state("live"),
             "ready_entries": current_round_ready_entries(),
             "current_winner": get_current_winner(),
-            "notifications": notification_feed,
+            "notifications": notification_feed[-20:],
         }
         ws_broadcast("state_bundle", payload)
     except Exception:
@@ -6787,7 +6818,7 @@ async def websocket_endpoint(websocket: WebSocket):
         await websocket.send_text(json.dumps({
             "event": "state_bundle",
             "data": {
-                "app_state": get_app_state(),
+                "app_state": get_app_state("live"),
                 "ready_entries": current_round_ready_entries(),
                 "current_winner": get_current_winner(),
                 "notifications": notification_feed,
@@ -7117,8 +7148,77 @@ def bot_update_miniapp_verification(
     return {"status": "ok", "verification": miniapp_verification_payload(entry)}
 
 
-@app.get("/api/app-state")
-def get_app_state():
+def _slim_entry_identity(entry) -> dict:
+    if not isinstance(entry, dict):
+        return {}
+    data = entry.get("data") if isinstance(entry.get("data"), dict) else {}
+    return {
+        "id": entry.get("id"),
+        "approval_status": entry.get("approval_status"),
+        "played": bool(entry.get("played")),
+        "data": {
+            "user_id": data.get("user_id") or data.get("telegram_id"),
+            "telegram_id": data.get("telegram_id") or data.get("user_id"),
+            "username": data.get("username"),
+            "display_name": data.get("display_name"),
+            "video_title": data.get("video_title"),
+        },
+    }
+
+
+def compact_live_app_state(full: dict) -> dict:
+    entries = full.get("entries") if isinstance(full.get("entries"), list) else []
+    comments = full.get("approved_comments_list") if isinstance(full.get("approved_comments_list"), list) else []
+    now_playing = full.get("current_now_playing")
+    winner = full.get("current_winner")
+    return {
+        "view": "live",
+        "current_round": full.get("current_round"),
+        "round_status": full.get("round_status"),
+        "modules": full.get("modules"),
+        "counts": full.get("counts") or {},
+        "entries": [_slim_entry_identity(entry) for entry in entries],
+        "pending_comments_list": [],
+        "approved_comments_list": comments[-LIVE_VIEW_COMMENT_LIMIT:],
+        "notifications": [],
+        "room_users": [],
+        "current_winner": _slim_entry_identity(winner) if isinstance(winner, dict) else winner,
+        "current_now_playing": now_playing if not isinstance(now_playing, dict) else {
+            **{key: now_playing.get(key) for key in ("id", "entry_id", "played_at") if key in now_playing},
+            "id": now_playing.get("id") or now_playing.get("entry_id"),
+            "data": (now_playing.get("data") if isinstance(now_playing.get("data"), dict) else {})
+            | {
+                "user_id": (now_playing.get("data") or {}).get("user_id") or (now_playing.get("data") or {}).get("telegram_id"),
+                "telegram_id": (now_playing.get("data") or {}).get("telegram_id") or (now_playing.get("data") or {}).get("user_id"),
+                "username": (now_playing.get("data") or {}).get("username"),
+                "display_name": (now_playing.get("data") or {}).get("display_name"),
+                "video_title": (now_playing.get("data") or {}).get("video_title"),
+            } if isinstance(now_playing.get("data"), dict) else now_playing.get("data"),
+        },
+        "room_open": full.get("room_open"),
+        "closing_soon": full.get("closing_soon"),
+        "review_prompt_open": full.get("review_prompt_open"),
+        "review_reveal_active": full.get("review_reveal_active"),
+        "review_score_reveal_active": full.get("review_score_reveal_active"),
+        "winner_intro_loaded": full.get("winner_intro_loaded"),
+        "video_reviews": [],
+        "video_review_average": full.get("video_review_average"),
+        "active_wheel_reaction": full.get("active_wheel_reaction"),
+        "active_wheel_reactions": full.get("active_wheel_reactions"),
+        "active_review_overlay": full.get("active_review_overlay"),
+        "room_discussion": full.get("room_discussion"),
+        "active_poll": full.get("active_poll"),
+        "room_qa_items": full.get("room_qa_items") or [],
+        "room_qa_archive": [],
+        "poll_history": [],
+        "media_submissions": [],
+        "now_showing_media": full.get("now_showing_media"),
+        "room_game": full.get("room_game"),
+        "team_feeds": {},
+    }
+
+
+def build_app_state() -> dict:
     current_round = state["current_round"]
     round_entries = get_round_entries(current_round)
     ready_entries = get_ready_unplayed_entries(current_round)
@@ -7187,6 +7287,14 @@ def get_app_state():
         "room_game": room_game,
         "team_feeds": team_feeds if (room_game or {}).get("mode") == "collaborate" else {},
     }
+
+
+@app.get("/api/app-state")
+def get_app_state(view: str | None = None):
+    payload = build_app_state()
+    if str(view or "").strip().lower() in {"live", "compact"}:
+        return compact_live_app_state(payload)
+    return payload
 
 
 @app.post("/api/session/hard-reset")
@@ -10051,6 +10159,7 @@ def archive_wheel_entry(entry_id: int):
             archived["review_count"] = len(related_reviews)
             archived["average_rating"] = round(sum(ratings) / len(ratings), 2) if ratings else 0.0
             archived_wheel_entries.append(archived)
+            trim_list_in_place(archived_wheel_entries, MAX_ARCHIVED_WHEEL_ENTRIES)
 
             if archive_path:
                 metadata_path = os.path.splitext(archive_path)[0] + ".json"
