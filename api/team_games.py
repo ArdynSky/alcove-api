@@ -34,6 +34,27 @@ def _iso(dt: Optional[datetime] = None) -> str:
     return (dt or _utcnow()).isoformat()
 
 
+def _parse_iso(value: Optional[str]) -> Optional[datetime]:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+
+
+def _timer_expired(state: dict) -> bool:
+    ends = _parse_iso(state.get("ends_at"))
+    return bool(ends and _utcnow() >= ends)
+
+
+def _apply_hold_if_expired(state: dict) -> dict:
+    if state.get("status") == "running" and _timer_expired(state):
+        state["status"] = "holding"
+        _save_state(state)
+    return state
+
+
 def _conn():
     con = sqlite3.connect(DB_PATH)
     con.row_factory = sqlite3.Row
@@ -80,7 +101,7 @@ def _load_state():
         except Exception:
             return _default_state()
         state.setdefault("background_filename", None)
-        return state
+    return _apply_hold_if_expired(state)
 
 
 def _save_state(state):
@@ -292,6 +313,16 @@ def team_game_begin():
     return _public_state(state)
 
 
+@router.post("/hold")
+def team_game_hold():
+    state = _load_state()
+    if state.get("status") not in {"running", "assigned", "holding"}:
+        raise HTTPException(status_code=409, detail="Start the drawing challenge first")
+    state["status"] = "holding"
+    _save_state(state)
+    return _public_state(state)
+
+
 @router.post("/end")
 def team_game_end():
     state = _load_state()
@@ -352,8 +383,11 @@ async def team_game_submit(
     state = _load_state()
     uid = _clean_user_id(user_id)
     team = _find_team_for_user(state, uid)
-    if not team or state.get("status") != "running":
-        raise HTTPException(status_code=403, detail="You are not in a running drawing challenge")
+    if not team or state.get("status") != "running" or _timer_expired(state):
+        if state.get("status") == "running" and _timer_expired(state):
+            state["status"] = "holding"
+            _save_state(state)
+        raise HTTPException(status_code=403, detail="Uploads are closed while the host collects artwork")
     content_type = (file.content_type or "").lower()
     if not content_type.startswith("image/"):
         raise HTTPException(status_code=400, detail="Please upload an image")
