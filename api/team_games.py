@@ -67,6 +67,9 @@ def _conn():
     con.execute(
         "CREATE TABLE IF NOT EXISTS team_game_submissions (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, team_id TEXT NOT NULL, user_id TEXT NOT NULL, display_name TEXT NOT NULL, filename TEXT NOT NULL, original_name TEXT, caption TEXT, created_at TEXT NOT NULL)"
     )
+    con.execute(
+        "CREATE TABLE IF NOT EXISTS team_game_votes (session_id TEXT NOT NULL, user_id TEXT NOT NULL, submission_id TEXT NOT NULL, created_at TEXT NOT NULL, PRIMARY KEY (session_id, user_id))"
+    )
     con.commit()
     return con
 
@@ -85,6 +88,8 @@ def _default_state():
         "participants": [],
         "teams": [],
         "reveal": {"visible": False, "submission_id": None},
+        "obs_mode": "hidden",
+        "voting": {"open": False, "opened_at": None, "closed_at": None},
         "background_filename": None,
     }
 
@@ -101,6 +106,8 @@ def _load_state():
         except Exception:
             return _default_state()
         state.setdefault("background_filename", None)
+        state.setdefault("obs_mode", "hidden")
+        state.setdefault("voting", {"open": False, "opened_at": None, "closed_at": None})
     return _apply_hold_if_expired(state)
 
 
@@ -136,6 +143,45 @@ def _find_team_for_user(state, user_id: str):
     return None
 
 
+def _ensure_votes_table(con):
+    con.execute(
+        "CREATE TABLE IF NOT EXISTS team_game_votes (session_id TEXT NOT NULL, user_id TEXT NOT NULL, submission_id TEXT NOT NULL, created_at TEXT NOT NULL, PRIMARY KEY (session_id, user_id))"
+    )
+    con.commit()
+
+
+def _session_submissions(state):
+    with _LOCK:
+        con = _conn()
+        rows = con.execute(
+            "SELECT id,team_id,user_id,display_name,filename,original_name,caption,created_at FROM team_game_submissions WHERE session_id=? ORDER BY created_at ASC",
+            (state.get("session_id") or "",),
+        ).fetchall()
+        con.close()
+    return [dict(r) for r in rows]
+
+
+def _session_votes(state):
+    with _LOCK:
+        con = _conn()
+        _ensure_votes_table(con)
+        rows = con.execute(
+            "SELECT user_id,submission_id FROM team_game_votes WHERE session_id=?",
+            (state.get("session_id") or "",),
+        ).fetchall()
+        con.close()
+    return {str(row["user_id"]): str(row["submission_id"]) for row in rows}
+
+
+def _decorate_submission(item, state):
+    out = dict(item)
+    out["media_url"] = f"/api/team-game/media/{out['filename']}" if out.get("filename") else None
+    team = next((t for t in state.get("teams", []) if t.get("id") == out.get("team_id")), None)
+    out["team_label"] = team.get("label") if team else ""
+    out["team_members"] = [m.get("display_name") for m in (team or {}).get("members", [])]
+    return out
+
+
 def _public_state(state, user_id: Optional[str] = None):
     out = dict(state)
     out["participants"] = list(state.get("participants", []))
@@ -147,14 +193,17 @@ def _public_state(state, user_id: Optional[str] = None):
     out["joined"] = bool(uid and _find_participant(state, uid))
     out["my_team"] = mine
     out["team_chat_enabled"] = bool(mine and state.get("status") == "running")
-    with _LOCK:
-        con = _conn()
-        rows = con.execute(
-            "SELECT id,team_id,user_id,display_name,filename,original_name,caption,created_at FROM team_game_submissions WHERE session_id=? ORDER BY created_at DESC",
-            (state.get("session_id") or "",),
-        ).fetchall()
-        con.close()
-    out["submissions"] = [dict(r) for r in rows]
+    submissions = _session_submissions(state)
+    votes = _session_votes(state)
+    counts = {}
+    for submission_id in votes.values():
+        counts[submission_id] = counts.get(submission_id, 0) + 1
+    out["submissions"] = submissions
+    out["voting"] = dict(state.get("voting") or {"open": False, "opened_at": None, "closed_at": None})
+    out["my_vote"] = votes.get(uid)
+    out["vote_counts"] = counts
+    out["vote_total"] = len(votes)
+    out["obs_mode"] = state.get("obs_mode") or "hidden"
     return out
 
 
@@ -184,6 +233,16 @@ class ChatPayload(BaseModel):
 class RevealPayload(BaseModel):
     submission_id: Optional[str] = None
     visible: bool = True
+
+
+class VotePayload(BaseModel):
+    user_id: str
+    submission_id: str
+
+
+class ObsFocusPayload(BaseModel):
+    mode: Optional[str] = None
+    submission_id: Optional[str] = None
 
 
 @router.get("/state")
@@ -328,6 +387,8 @@ def team_game_end():
     state = _load_state()
     state["status"] = "ended"
     state["reveal"] = {"visible": False, "submission_id": None}
+    state["obs_mode"] = "hidden"
+    state["voting"] = {"open": False, "opened_at": None, "closed_at": None}
     _save_state(state)
     return _public_state(state)
 
@@ -436,6 +497,7 @@ def team_game_reveal(payload: RevealPayload):
     state = _load_state()
     if not payload.visible:
         state["reveal"] = {"visible": False, "submission_id": None}
+        state["obs_mode"] = "gallery" if state.get("status") == "voting" else "hidden"
         _save_state(state)
         return _public_state(state)
     sid = str(payload.submission_id or "").strip()
@@ -451,6 +513,84 @@ def team_game_reveal(payload: RevealPayload):
     if not row:
         raise HTTPException(status_code=404, detail="Submission not found")
     state["reveal"] = {"visible": True, "submission_id": sid}
+    state["obs_mode"] = "single"
+    _save_state(state)
+    return _public_state(state)
+
+
+@router.post("/voting/open")
+def team_game_voting_open():
+    state = _load_state()
+    if state.get("status") not in {"holding", "voting", "assigned", "running"}:
+        raise HTTPException(status_code=409, detail="Collect artwork before opening votes")
+    submissions = _session_submissions(state)
+    if len(submissions) < 1:
+        raise HTTPException(status_code=409, detail="No drawings have been submitted yet")
+    now = _iso()
+    voting = dict(state.get("voting") or {})
+    voting.update({"open": True, "opened_at": now, "closed_at": None})
+    state["status"] = "voting"
+    state["voting"] = voting
+    state["obs_mode"] = "gallery"
+    _save_state(state)
+    return _public_state(state)
+
+
+@router.post("/voting/close")
+def team_game_voting_close():
+    state = _load_state()
+    if state.get("status") != "voting":
+        raise HTTPException(status_code=409, detail="Voting is not open")
+    voting = dict(state.get("voting") or {})
+    voting.update({"open": False, "closed_at": _iso()})
+    state["voting"] = voting
+    _save_state(state)
+    return _public_state(state)
+
+
+@router.post("/vote")
+def team_game_vote(payload: VotePayload):
+    state = _load_state()
+    voting = state.get("voting") or {}
+    if state.get("status") != "voting" or not voting.get("open"):
+        raise HTTPException(status_code=409, detail="Voting is closed")
+    uid = _clean_user_id(payload.user_id)
+    sid = str(payload.submission_id or "").strip()
+    submissions = _session_submissions(state)
+    if not any(str(item.get("id")) == sid for item in submissions):
+        raise HTTPException(status_code=404, detail="Drawing not found")
+    with _LOCK:
+        con = _conn()
+        _ensure_votes_table(con)
+        con.execute(
+            "INSERT INTO team_game_votes(session_id,user_id,submission_id,created_at) VALUES(?,?,?,?) ON CONFLICT(session_id,user_id) DO UPDATE SET submission_id=excluded.submission_id, created_at=excluded.created_at",
+            (state.get("session_id"), uid, sid, _iso()),
+        )
+        con.commit()
+        con.close()
+    return _public_state(state, uid)
+
+
+@router.post("/obs-focus")
+def team_game_obs_focus(payload: ObsFocusPayload):
+    state = _load_state()
+    mode = str(payload.mode or "").strip().lower()
+    sid = str(payload.submission_id or "").strip()
+    if mode not in {"", "hidden", "gallery", "single"}:
+        raise HTTPException(status_code=400, detail="mode must be gallery, single, or hidden")
+    if mode == "single" or (not mode and sid):
+        if not sid:
+            raise HTTPException(status_code=400, detail="submission_id is required")
+        if not any(str(item.get("id")) == sid for item in _session_submissions(state)):
+            raise HTTPException(status_code=404, detail="Drawing not found")
+        state["obs_mode"] = "single"
+        state["reveal"] = {"visible": True, "submission_id": sid}
+    elif mode == "gallery":
+        state["obs_mode"] = "gallery"
+        state["reveal"] = {"visible": False, "submission_id": None}
+    else:
+        state["obs_mode"] = "hidden"
+        state["reveal"] = {"visible": False, "submission_id": None}
     _save_state(state)
     return _public_state(state)
 
@@ -458,24 +598,28 @@ def team_game_reveal(payload: RevealPayload):
 @router.get("/obs-state")
 def team_game_obs_state():
     state = _load_state()
+    submissions = [_decorate_submission(item, state) for item in _session_submissions(state)]
     reveal = state.get("reveal") or {}
-    if not reveal.get("visible") or not reveal.get("submission_id"):
-        return {"visible": False, "game": {"title": state.get("title"), "prompt": state.get("prompt")}}
-    with _LOCK:
-        con = _conn()
-        row = con.execute(
-            "SELECT id,team_id,user_id,display_name,filename,caption,created_at FROM team_game_submissions WHERE id=?",
-            (reveal.get("submission_id"),),
-        ).fetchone()
-        con.close()
-    if not row:
-        return {"visible": False}
-    item = dict(row)
-    item["media_url"] = f"/api/team-game/media/{item['filename']}"
-    team = next((t for t in state.get("teams", []) if t.get("id") == item.get("team_id")), None)
-    item["team_label"] = team.get("label") if team else ""
-    item["team_members"] = [m.get("display_name") for m in (team or {}).get("members", [])]
-    return {"visible": True, "game": {"title": state.get("title"), "prompt": state.get("prompt")}, "submission": item}
+    mode = str(state.get("obs_mode") or "hidden")
+    if mode == "gallery":
+        focused = None
+    elif reveal.get("visible") and reveal.get("submission_id"):
+        mode = "single"
+        focused = next((item for item in submissions if str(item.get("id")) == str(reveal.get("submission_id") or "")), None)
+    elif state.get("status") == "voting" and mode == "hidden":
+        mode = "gallery"
+        focused = None
+    else:
+        focused = next((item for item in submissions if str(item.get("id")) == str(reveal.get("submission_id") or "")), None)
+    visible = bool(submissions) and mode in {"gallery", "single"}
+    return {
+        "visible": visible,
+        "mode": mode if visible else "hidden",
+        "game": {"title": state.get("title"), "prompt": state.get("prompt")},
+        "voting": dict(state.get("voting") or {}),
+        "submissions": submissions,
+        "submission": focused if mode == "single" else None,
+    }
 
 
 class ActivityTemplatePayload(BaseModel):

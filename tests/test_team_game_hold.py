@@ -67,3 +67,53 @@ class TeamGameHoldTests(unittest.TestCase):
         state = team_games._load_state()
         self.assertEqual(state["status"], "holding")
         self.assertTrue(state.get("status") != "running" or team_games._timer_expired(state))
+
+    def _seed_submission(self, submission_id, user_id, name):
+        con = team_games._conn()
+        con.execute(
+            "INSERT INTO team_game_submissions(id,session_id,team_id,user_id,display_name,filename,original_name,caption,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
+            (submission_id, "draw-1", "pair-1", user_id, name, f"{submission_id}.png", "art.png", "", team_games._iso()),
+        )
+        con.commit()
+        con.close()
+
+    def test_favourite_vote_can_change_until_closed(self):
+        self._running_state()
+        team_games.team_game_hold()
+        self._seed_submission("art-a", "10", "Sam")
+        self._seed_submission("art-b", "20", "Alex")
+        opened = team_games.team_game_voting_open()
+        self.assertEqual(opened["status"], "voting")
+        self.assertTrue(opened["voting"]["open"])
+        self.assertEqual(opened["obs_mode"], "gallery")
+        first = team_games.team_game_vote(team_games.VotePayload(user_id="99", submission_id="art-a"))
+        self.assertEqual(first["my_vote"], "art-a")
+        self.assertEqual(first["vote_counts"]["art-a"], 1)
+        changed = team_games.team_game_vote(team_games.VotePayload(user_id="99", submission_id="art-b"))
+        self.assertEqual(changed["my_vote"], "art-b")
+        self.assertEqual(changed["vote_total"], 1)
+        closed = team_games.team_game_voting_close()
+        self.assertFalse(closed["voting"]["open"])
+        with self.assertRaises(team_games.HTTPException):
+            team_games.team_game_vote(team_games.VotePayload(user_id="99", submission_id="art-a"))
+
+    def test_obs_gallery_and_single_focus(self):
+        self._running_state()
+        team_games.team_game_hold()
+        self._seed_submission("art-a", "10", "Sam")
+        team_games.team_game_voting_open()
+        gallery = team_games.team_game_obs_state()
+        self.assertTrue(gallery["visible"])
+        self.assertEqual(gallery["mode"], "gallery")
+        self.assertEqual(len(gallery["submissions"]), 1)
+        focused = team_games.team_game_obs_focus(team_games.ObsFocusPayload(mode="single", submission_id="art-a"))
+        self.assertEqual(focused["obs_mode"], "single")
+        single = team_games.team_game_obs_state()
+        self.assertEqual(single["mode"], "single")
+        self.assertEqual(single["submission"]["id"], "art-a")
+        gallery_again = team_games.team_game_obs_focus(team_games.ObsFocusPayload(mode="gallery"))
+        self.assertEqual(gallery_again["obs_mode"], "gallery")
+        self.assertFalse((gallery_again.get("reveal") or {}).get("visible"))
+        back = team_games.team_game_obs_state()
+        self.assertEqual(back["mode"], "gallery")
+        self.assertIsNone(back["submission"])

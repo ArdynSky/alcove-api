@@ -222,3 +222,28 @@ class AgendaHttpTests(unittest.TestCase):
         self.assertEqual(again.json()["schedule_image_url"], "https://cdn.example/agenda.png")
         self.assertEqual(again.json()["holding_video_url"], "https://cdn.example/hold.mp4")
         self.assertEqual(again.json()["items"][0]["title_1"], "Welcome")
+
+    def test_schedule_image_normalizes_share_links(self):
+        created = self.client.post("/api/agendas", json={
+            "title": "Friday Live VC",
+            "event_date": "2026-08-21",
+            "start_time": "19:00",
+            "timezone": "Europe/London",
+            "schedule_image": "https://drive.google.com/file/d/abc123xyz/view?usp=sharing",
+            "items": [{"title": "Welcome", "duration_minutes": 5}],
+        })
+        self.assertEqual(created.status_code, 200, created.text)
+        self.assertEqual(
+            created.json()["schedule_image_url"],
+            "https://drive.google.com/uc?export=view&id=abc123xyz",
+        )
+        bare = self.client.post("/api/agendas", json={
+            "title": "Saturday",
+            "event_date": "2026-08-22",
+            "start_time": "19:00",
+            "timezone": "Europe/London",
+            "schedule_image": "cdn.example/agenda.png",
+            "items": [{"title": "Welcome", "duration_minutes": 5}],
+        })
+        self.assertEqual(bare.status_code, 200, bare.text)
+        self.assertEqual(bare.json()["schedule_image_url"], "https://cdn.example/agenda.png")
