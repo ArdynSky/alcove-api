@@ -148,6 +148,7 @@ def normalize_profile(raw: Any) -> dict:
         "progressionResetToken": str(data.get("progressionResetToken") or "")[:120],
         "stats": clean_stats,
         "memberSince": str(data.get("memberSince") or "")[:80],
+        "equippedAchievements": _public_equipped(data.get("equippedAchievements") or data.get("equipped_achievements")),
     }
 
 
@@ -205,6 +206,7 @@ def merge_profiles(base: dict | None, incoming: dict | None) -> dict:
         "achievementsClaimed": _union_str_list(left["achievementsClaimed"], right["achievementsClaimed"]),
         "achievementsNotified": _union_str_list(left["achievementsNotified"], right["achievementsNotified"]),
         "stats": stats,
+        "equippedAchievements": newer.get("equippedAchievements") or older.get("equippedAchievements") or [],
         "updated_at": newer.get("updated_at") or _now(),
     }
     return normalize_profile(merged)
@@ -264,6 +266,49 @@ def _init_data(
     return (x_telegram_init_data or init_data or "").strip()
 
 
+def _public_equipped(raw: Any) -> list[dict]:
+    out: list[dict] = []
+    for item in _as_list(raw)[:3]:
+        if isinstance(item, dict):
+            out.append({
+                "key": str(item.get("key") or "")[:80],
+                "name": str(item.get("name") or item.get("title") or "Achievement")[:120],
+                "title": str(item.get("title") or item.get("name") or "")[:120],
+                "description": str(item.get("description") or item.get("desc") or "")[:400],
+                "image": str(item.get("image") or item.get("src") or item.get("image_url") or "")[:500],
+                "art": str(item.get("art") or "")[:8000],
+            })
+        elif str(item or "").strip():
+            key = str(item).strip()[:80]
+            out.append({"key": key, "name": key, "title": key, "description": "", "image": "", "art": ""})
+    return out
+
+
+def public_card(user_id: str) -> dict:
+    key = str(user_id or "").strip()
+    profile = load_profile(key) if key else None
+    if not profile:
+        return {
+            "found": False,
+            "user_id": key,
+            "profile": None,
+            "feed_style": {},
+            "equipped_achievements": [],
+        }
+    return {
+        "found": True,
+        "user_id": key,
+        "profile": {
+            "level": profile.get("level") or 1,
+            "memberSince": profile.get("memberSince") or "",
+            "title": profile.get("title") or "none",
+            "feed": profile.get("feed") or {},
+        },
+        "feed_style": profile.get("feed") or {},
+        "equipped_achievements": _public_equipped(profile.get("equippedAchievements")),
+    }
+
+
 def _member_id(init_data: str) -> str:
     user = resolve_telegram_user(init_data)
     user_id = user.get("id")
@@ -302,6 +347,11 @@ def put_my_profile(
     user_id = _member_id(_init_data(payload.init_data, x_telegram_init_data))
     stored = save_profile(user_id, payload.profile, replace=bool(payload.replace))
     return {"status": "ok", "user_id": user_id, "profile": stored}
+
+
+@router.get("/public-profile")
+def get_public_profile(user_id: str):
+    return {"status": "ok", **public_card(user_id)}
 
 
 @router.get("/{user_id}/profile")
