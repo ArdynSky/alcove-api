@@ -7,11 +7,11 @@ from pathlib import Path
 import sqlite3
 import threading
 import uuid
-from typing import Literal, Optional
+from typing import Any, Literal, Optional
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 router = APIRouter(prefix="/api/agendas", tags=["agendas"])
@@ -49,11 +49,31 @@ def _conn():
         con.execute("ALTER TABLE agendas ADD COLUMN current_item_id TEXT")
     if "completed_item_ids_json" not in columns:
         con.execute("ALTER TABLE agendas ADD COLUMN completed_item_ids_json TEXT NOT NULL DEFAULT '[]'")
+    if "session_name" not in columns:
+        con.execute("ALTER TABLE agendas ADD COLUMN session_name TEXT NOT NULL DEFAULT ''")
+    if "schedule_image_url" not in columns:
+        con.execute("ALTER TABLE agendas ADD COLUMN schedule_image_url TEXT NOT NULL DEFAULT ''")
+    if "holding_video_url" not in columns:
+        con.execute("ALTER TABLE agendas ADD COLUMN holding_video_url TEXT NOT NULL DEFAULT ''")
     con.commit()
     return con
 
 
+def _clean_url(value: Any) -> str:
+    return str(value or "").strip()[:500]
+
+
+def _first_text(*values: Any) -> str:
+    for value in values:
+        text = str(value or "").strip()
+        if text:
+            return text
+    return ""
+
+
 class AgendaItem(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     content_id: Optional[str] = None
     content_snapshot: Optional[dict] = None
@@ -64,12 +84,39 @@ class AgendaItem(BaseModel):
 
 class AgendaPayload(BaseModel):
     title: str
+    session_name: str = ""
     event_date: str
     start_time: str
     timezone: str = "Europe/London"
     status: Literal["draft", "future", "active", "finished"] = "draft"
     show_in_app: bool = False
+    schedule_image_url: str = ""
+    holding_video_url: str = ""
     items: list[AgendaItem] = Field(default_factory=list)
+    current_item_id: Optional[str] = None
+    completed_item_ids: Optional[list[str]] = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _media_aliases(cls, data: Any):
+        if not isinstance(data, dict):
+            return data
+        payload = dict(data)
+        payload["schedule_image_url"] = _clean_url(
+            payload.get("schedule_image_url")
+            or payload.get("schedule_image")
+            or payload.get("holding_backdrop_url")
+            or payload.get("backdrop_url")
+            or payload.get("image")
+        )
+        payload["holding_video_url"] = _clean_url(
+            payload.get("holding_video_url")
+            or payload.get("holdingVideoUrl")
+            or payload.get("background_video_url")
+            or payload.get("backgroundVideoUrl")
+        )
+        payload["session_name"] = _first_text(payload.get("session_name"), payload.get("title"))[:160]
+        return payload
 
 
 class AgendaStatusPayload(BaseModel):
@@ -162,10 +209,11 @@ def create_agenda(payload: AgendaPayload):
     with _LOCK:
         con = _conn()
         con.execute(
-            "INSERT INTO agendas(id,title,event_date,start_time,timezone,status,show_in_app,items_json,created_at,updated_at,current_item_id,completed_item_ids_json) VALUES(?,?,?,?,?,?,?,?,?,?,NULL,'[]')",
-            (agenda_id, payload.title.strip()[:160], payload.event_date, payload.start_time,
-             payload.timezone, payload.status, int(payload.show_in_app),
-             json.dumps([x.model_dump() for x in payload.items]), now, now),
+            "INSERT INTO agendas(id,title,session_name,event_date,start_time,timezone,status,show_in_app,schedule_image_url,holding_video_url,items_json,created_at,updated_at,current_item_id,completed_item_ids_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,NULL,'[]')",
+            (agenda_id, payload.title.strip()[:160], (payload.session_name or payload.title).strip()[:160],
+             payload.event_date, payload.start_time, payload.timezone, payload.status, int(payload.show_in_app),
+             _clean_url(payload.schedule_image_url), _clean_url(payload.holding_video_url),
+             json.dumps([x.model_dump(exclude={"starts_at"}) for x in payload.items]), now, now),
         )
         con.commit()
         con.close()
@@ -174,18 +222,28 @@ def create_agenda(payload: AgendaPayload):
 
 @router.put("/{agenda_id}")
 def update_agenda(agenda_id: str, payload: AgendaPayload):
-    _get(agenda_id)
+    existing = _public(_get(agenda_id))
     _validate(payload)
     if payload.status == "active":
         _deactivate_all(except_id=agenda_id)
+    fields_set = payload.model_fields_set
+    current_item_id = existing.get("current_item_id")
+    completed_item_ids = list(existing.get("completed_item_ids") or [])
+    if "current_item_id" in fields_set:
+        current_item_id = str(payload.current_item_id or "").strip() or None
+    if "completed_item_ids" in fields_set:
+        completed_item_ids = [str(item_id) for item_id in (payload.completed_item_ids or []) if str(item_id).strip()]
     with _LOCK:
         con = _conn()
         con.execute(
-            "UPDATE agendas SET title=?,event_date=?,start_time=?,timezone=?,status=?,"
-            "show_in_app=?,items_json=?,updated_at=? WHERE id=?",
-            (payload.title.strip()[:160], payload.event_date, payload.start_time,
-             payload.timezone, payload.status, int(payload.show_in_app),
-             json.dumps([x.model_dump() for x in payload.items]), _now(), agenda_id),
+            "UPDATE agendas SET title=?,session_name=?,event_date=?,start_time=?,timezone=?,status=?,"
+            "show_in_app=?,schedule_image_url=?,holding_video_url=?,items_json=?,"
+            "current_item_id=?,completed_item_ids_json=?,updated_at=? WHERE id=?",
+            (payload.title.strip()[:160], (payload.session_name or payload.title).strip()[:160],
+             payload.event_date, payload.start_time, payload.timezone, payload.status, int(payload.show_in_app),
+             _clean_url(payload.schedule_image_url), _clean_url(payload.holding_video_url),
+             json.dumps([x.model_dump(exclude={"starts_at"}) for x in payload.items]),
+             current_item_id, json.dumps(completed_item_ids), _now(), agenda_id),
         )
         con.commit()
         con.close()
@@ -259,9 +317,16 @@ def set_progress(agenda_id: str, payload: AgendaProgressPayload):
 def duplicate_agenda(agenda_id: str):
     source = _public(_get(agenda_id))
     payload = AgendaPayload(
-        title=f"{source['title']} Copy", event_date=source["event_date"],
-        start_time=source["start_time"], timezone=source["timezone"], status="draft",
-        show_in_app=False, items=[AgendaItem(**{k: v for k, v in item.items() if k != "starts_at"}) for item in source["items"]],
+        title=f"{source['title']} Copy",
+        session_name=source.get("session_name") or source["title"],
+        event_date=source["event_date"],
+        start_time=source["start_time"],
+        timezone=source["timezone"],
+        status="draft",
+        show_in_app=False,
+        schedule_image_url=source.get("schedule_image_url") or "",
+        holding_video_url=source.get("holding_video_url") or "",
+        items=[AgendaItem(**{k: v for k, v in item.items() if k != "starts_at"}) for item in source["items"]],
     )
     return create_agenda(payload)
 

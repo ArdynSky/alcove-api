@@ -173,6 +173,14 @@ def _load():
     return _normalize_timers(_raw_load())
 
 
+def _archive_session(state=None):
+    try:
+        from . import debate_audience
+        debate_audience.archive_session(state)
+    except Exception:
+        return None
+
+
 def _votes(state):
     sid = state.get("session_id") or ""
     with _LOCK:
@@ -310,6 +318,7 @@ def start(payload: StartPayload):
     if not statement:
         raise HTTPException(status_code=400, detail="Debate statement is required")
     previous = _raw_load()
+    _archive_session(previous)
     now = _now()
     registration_seconds = max(15, min(int(payload.registration_seconds or 60), 600))
     new_state = _default_state()
@@ -592,6 +601,8 @@ def results(payload: ResultsPayload):
         if state.get("status") == "results":
             state["status"] = "results_ready"
     _save(state)
+    if payload.visible:
+        _archive_session(state)
     return _public(state)
 
 
@@ -608,4 +619,5 @@ def end():
     state.setdefault("voting", {})["open"] = False
     state.setdefault("results", {})["visible"] = False
     _save(state)
+    _archive_session(state)
     return _public(state)

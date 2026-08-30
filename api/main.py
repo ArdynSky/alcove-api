@@ -42,6 +42,7 @@ from .home_alerts import router as home_alerts_router
 from .team_games import router as team_games_router
 from .custom_rewards import router as custom_rewards_router
 from .debate_games import router as debate_games_router
+from . import debate_audience  # noqa: F401 — registers audience/archive routes on the debate router
 from .agendas import router as agendas_router
 from .live_room_test import apply_authorization_identity, router as live_room_test_router
 from .member_progress import router as member_progress_router
@@ -2392,7 +2393,10 @@ class RoomQASubmit(BaseModel):
     user_id: int | None = None
     username: str | None = None
     display_name: str
-    question: str
+    question: str = ""
+    comment: str | None = None
+    text: str | None = None
+    kind: str = "question"
 
 
 class RoomPollCreate(BaseModel):
@@ -9466,11 +9470,15 @@ def submit_room_qa(payload: RoomQASubmit):
     discussion_id = current_discussion_id()
     if not discussion_id:
         return {"status": "error", "message": "No active discussion right now."}
-    question = (payload.question or "").strip()
+    kind = (payload.kind or "question").strip().lower()
+    if kind not in {"question", "comment"}:
+        return {"status": "error", "message": "Kind must be question or comment."}
+    question = (payload.question or payload.comment or payload.text or "").strip()
     if not question:
-        return {"status": "error", "message": "Question cannot be empty."}
-    if len(question) > 300:
-        return {"status": "error", "message": "Question must be 300 characters or fewer."}
+        return {"status": "error", "message": "Question cannot be empty." if kind == "question" else "Comment cannot be empty."}
+    limit = 220 if kind == "comment" else 300
+    if len(question) > limit:
+        return {"status": "error", "message": f"{'Comment' if kind == 'comment' else 'Question'} must be {limit} characters or fewer."}
     display_name = (payload.display_name or "Viewer").strip() or "Viewer"
     meta = discussion_meta()
     item = {
@@ -9480,13 +9488,14 @@ def submit_room_qa(payload: RoomQASubmit):
         "user_id": payload.user_id,
         "username": payload.username,
         "display_name": display_name,
+        "kind": kind,
         "question": question,
         "answer": None,
         "status": "active",
         "created_at": now_iso(),
     }
     room_qa_items.append(item)
-    room_qa_items[:] = room_qa_items[-100:]
+    room_qa_items[:] = room_qa_items[-200:]
     persist_live_room()
     return {"status": "ok", "item": item}
 
@@ -9529,6 +9538,8 @@ def answer_room_qa(item_id: int, payload: dict | None = None):
         return {"status": "error", "message": "Answer cannot be empty."}
     for item in room_qa_items:
         if int(item.get("id") or 0) == int(item_id):
+            if str(item.get("kind") or "question") == "comment":
+                return {"status": "error", "message": "Comments do not take an answer."}
             item["answer"] = answer
             item["answered_at"] = now_iso()
             persist_live_room()

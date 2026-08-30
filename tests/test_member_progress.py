@@ -144,6 +144,50 @@ class MemberProgressTests(unittest.TestCase):
         self.assertEqual(reset["owned"]["feedColors"], ["base"])
         self.assertEqual(reset["progressionResetToken"], "new-reset")
 
+    def test_public_profile_returns_safe_card(self):
+        missing = self.client.get("/api/members/public-profile", params={"user_id": "9999"})
+        self.assertEqual(missing.status_code, 200)
+        self.assertFalse(missing.json()["found"])
+        self.assertIsNone(missing.json()["profile"])
+        self.assertEqual(missing.json()["equipped_achievements"], [])
+
+        saved = self.client.put(
+            "/api/members/profile",
+            json={
+                "init_data": "member-init",
+                "profile": {
+                    "level": 7,
+                    "memberSince": "2026-01-15T00:00:00+00:00",
+                    "title": "Pulse",
+                    "feed": {"color": "gold", "skin": "foxlove"},
+                    "equippedAchievements": [
+                        {
+                            "key": "first-pulse",
+                            "name": "First Pulse",
+                            "description": "Submit your first pulse question",
+                            "image": "assets/icons/pulse.png",
+                        }
+                    ],
+                    "pendingRewards": [{"id": "secret"}],
+                    "claimReceipts": {"x": 1},
+                    "updated_at": "2026-08-30T12:00:00+00:00",
+                },
+            },
+        )
+        self.assertEqual(saved.status_code, 200)
+        self.assertEqual(saved.json()["profile"]["equippedAchievements"][0]["name"], "First Pulse")
+
+        card = self.client.get("/api/members/public-profile", params={"user_id": "4242"}).json()
+        self.assertTrue(card["found"])
+        self.assertEqual(card["profile"]["level"], 7)
+        self.assertEqual(card["profile"]["memberSince"], "2026-01-15T00:00:00+00:00")
+        self.assertEqual(card["feed_style"]["color"], "gold")
+        self.assertEqual(card["equipped_achievements"][0]["name"], "First Pulse")
+        self.assertEqual(card["equipped_achievements"][0]["description"], "Submit your first pulse question")
+        self.assertNotIn("pendingRewards", card)
+        self.assertNotIn("pendingRewards", card["profile"])
+        self.assertNotIn("claimReceipts", card["profile"])
+
 
 class LiveAppStateBandwidthTests(unittest.TestCase):
     def test_live_view_omits_heavy_collections(self):
