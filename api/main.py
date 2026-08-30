@@ -42,6 +42,7 @@ from .home_alerts import router as home_alerts_router
 from .team_games import router as team_games_router
 from .custom_rewards import router as custom_rewards_router
 from .debate_games import router as debate_games_router
+from . import debate_audience  # noqa: F401 — registers audience/archive routes on the debate router
 from .agendas import router as agendas_router
 from .live_room_test import apply_authorization_identity, router as live_room_test_router
 from .member_progress import router as member_progress_router

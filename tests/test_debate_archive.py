@@ -87,3 +87,33 @@ class DebateArchiveTests(unittest.TestCase):
         self.assertEqual(archived[0]["audience_thoughts"][0]["reason"], "It is sweet and salty")
         listed = debate_audience.archive_debates()
         self.assertEqual(listed["debates"][0]["vote_total"], 3)
+
+    def test_starting_next_debate_archives_previous_without_end(self):
+        self._seed_finished_debate()
+        started = debate_games.start(debate_games.StartPayload(statement="Cats are better than dogs"))
+        self.assertNotEqual(started["session_id"], "debate-archive-1")
+        archived = debate_audience.archive_debates()["debates"]
+        self.assertEqual(len(archived), 1)
+        self.assertEqual(archived[0]["session_id"], "debate-archive-1")
+        self.assertEqual(archived[0]["statement"], "Pineapple belongs on pizza")
+        self.assertEqual(archived[0]["audience_thoughts"][0]["reason"], "It is sweet and salty")
+
+    def test_archive_http_routes_are_registered(self):
+        from fastapi.testclient import TestClient
+        from api import main
+
+        self._seed_finished_debate()
+        client = TestClient(main.app)
+        finalized = client.post("/api/debate/archive/finalize")
+        self.assertEqual(finalized.status_code, 200, finalized.text)
+        self.assertEqual(finalized.json()["statement"], "Pineapple belongs on pizza")
+        listed = client.get("/api/debate/archive/debates")
+        self.assertEqual(listed.status_code, 200, listed.text)
+        debates = listed.json()["debates"]
+        self.assertEqual(len(debates), 1)
+        self.assertEqual(debates[0]["topic"], "Pineapple belongs on pizza")
+        self.assertEqual(debates[0]["audience_thoughts"][0]["reason"], "It is sweet and salty")
+        ended = client.post("/api/debate/end")
+        self.assertEqual(ended.status_code, 200, ended.text)
+        again = client.get("/api/debate/archive/debates")
+        self.assertEqual(len(again.json()["debates"]), 1)

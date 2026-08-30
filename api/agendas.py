@@ -93,6 +93,8 @@ class AgendaPayload(BaseModel):
     schedule_image_url: str = ""
     holding_video_url: str = ""
     items: list[AgendaItem] = Field(default_factory=list)
+    current_item_id: Optional[str] = None
+    completed_item_ids: Optional[list[str]] = None
 
     @model_validator(mode="before")
     @classmethod
@@ -220,19 +222,28 @@ def create_agenda(payload: AgendaPayload):
 
 @router.put("/{agenda_id}")
 def update_agenda(agenda_id: str, payload: AgendaPayload):
-    _get(agenda_id)
+    existing = _public(_get(agenda_id))
     _validate(payload)
     if payload.status == "active":
         _deactivate_all(except_id=agenda_id)
+    fields_set = payload.model_fields_set
+    current_item_id = existing.get("current_item_id")
+    completed_item_ids = list(existing.get("completed_item_ids") or [])
+    if "current_item_id" in fields_set:
+        current_item_id = str(payload.current_item_id or "").strip() or None
+    if "completed_item_ids" in fields_set:
+        completed_item_ids = [str(item_id) for item_id in (payload.completed_item_ids or []) if str(item_id).strip()]
     with _LOCK:
         con = _conn()
         con.execute(
             "UPDATE agendas SET title=?,session_name=?,event_date=?,start_time=?,timezone=?,status=?,"
-            "show_in_app=?,schedule_image_url=?,holding_video_url=?,items_json=?,updated_at=? WHERE id=?",
+            "show_in_app=?,schedule_image_url=?,holding_video_url=?,items_json=?,"
+            "current_item_id=?,completed_item_ids_json=?,updated_at=? WHERE id=?",
             (payload.title.strip()[:160], (payload.session_name or payload.title).strip()[:160],
              payload.event_date, payload.start_time, payload.timezone, payload.status, int(payload.show_in_app),
              _clean_url(payload.schedule_image_url), _clean_url(payload.holding_video_url),
-             json.dumps([x.model_dump(exclude={"starts_at"}) for x in payload.items]), _now(), agenda_id),
+             json.dumps([x.model_dump(exclude={"starts_at"}) for x in payload.items]),
+             current_item_id, json.dumps(completed_item_ids), _now(), agenda_id),
         )
         con.commit()
         con.close()
