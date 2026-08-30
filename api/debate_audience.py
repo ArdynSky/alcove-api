@@ -240,37 +240,61 @@ def audience_overlay(payload: AudienceOverlayPayload):
     return {"session_id": sid, "overlay": _overlay(sid, settings)}
 
 
-@router.post("/archive/finalize")
-def archive_finalize():
-    state = _load()
-    sid = str(state.get("session_id") or "")
+def _worth_archiving(state: dict, thoughts: list) -> bool:
+    status = str((state or {}).get("status") or "")
+    if status in {"results", "results_ready", "ended", "voting", "holding_vote"}:
+        return True
+    if (state or {}).get("contestants"):
+        return True
+    return bool(thoughts)
+
+
+def archive_session(state: dict | None = None, *, require: bool = False):
+    snapshot = state if isinstance(state, dict) else _load()
+    sid = str((snapshot or {}).get("session_id") or "").strip()
     if not sid:
-        raise HTTPException(status_code=409, detail="No debate session is available")
-    public_state = _public(state)
+        if require:
+            raise HTTPException(status_code=409, detail="No debate session is available")
+        return None
+    public_state = _public(snapshot)
     thoughts = _thoughts(sid)
+    if not _worth_archiving(snapshot, thoughts):
+        if require and not (snapshot.get("statement") or snapshot.get("title")):
+            raise HTTPException(status_code=409, detail="No debate session is available")
+        if not require:
+            return None
     contestants = []
     percentages = public_state.get("vote_percentages") or {}
-    for c in state.get("contestants", []):
+    counts = public_state.get("vote_counts") or {}
+    for c in snapshot.get("contestants") or []:
+        user_id = str(c.get("user_id") or "")
         contestants.append({
-            "user_id": str(c.get("user_id") or ""),
+            "user_id": user_id,
             "display_name": c.get("display_name") or "Member",
             "username": c.get("username") or "",
             "side": c.get("side") or "",
-            "percentage": float(percentages.get(str(c.get("user_id")), 0) or 0),
+            "percentage": float(percentages.get(user_id, 0) or 0),
+            "votes": int(counts.get(user_id, 0) or 0),
         })
     winner = None
     if len(contestants) == 2 and contestants[0]["percentage"] != contestants[1]["percentage"]:
         winner = max(contestants, key=lambda x: x["percentage"])["user_id"]
+    statement = str(snapshot.get("statement") or "").strip()
+    title = str(snapshot.get("title") or "Live Debate").strip() or "Live Debate"
     payload = {
         "session_id": sid,
-        "title": state.get("title") or "Live Debate",
-        "statement": state.get("statement") or "",
-        "description": state.get("description") or "",
-        "created_at": state.get("created_at"),
+        "title": title,
+        "statement": statement,
+        "topic": statement or title,
+        "description": snapshot.get("description") or "",
+        "created_at": snapshot.get("created_at"),
         "archived_at": _iso(),
+        "status": snapshot.get("status") or "",
         "contestants": contestants,
         "winner_user_id": winner,
         "vote_total": int(public_state.get("vote_total") or 0),
+        "vote_percentages": percentages,
+        "vote_counts": counts,
         "audience_thoughts": thoughts,
     }
     with _LOCK:
@@ -282,6 +306,15 @@ def archive_finalize():
         con.commit()
         con.close()
     return payload
+
+
+@router.post("/archive/finalize")
+def archive_finalize():
+    state = _load()
+    payload = archive_session(state)
+    if payload is None and not str(state.get("session_id") or "").strip():
+        raise HTTPException(status_code=409, detail="No debate session is available")
+    return payload or {"archived": False, "session_id": state.get("session_id")}
 
 
 @router.get("/archive/debates")
