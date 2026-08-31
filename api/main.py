@@ -5086,6 +5086,16 @@ def pulse_user_red_answers_today(user_id=None, username=None, day_key: str | Non
     return len([entry for entry in sent if (entry.get("pulse_type") or "green") == "red"])
 
 
+def pulse_user_contributed_today(user_id=None, username=None, day_key: str | None = None) -> bool:
+    sent = pulse_user_sent_entries(user_id, username, day_key)
+    return any((entry.get("pulse_type") or "green") == "green" for entry in sent)
+
+
+RED_PULSE_CONTRIBUTE_MESSAGE = (
+    "Answer at least one Pulse question today before you can take the Red Pulse."
+)
+
+
 def pulse_red_unlock_notify_usernames() -> set[str] | None:
     """Return allowlist of usernames, or None to notify everyone."""
     raw = PULSE_RED_UNLOCK_NOTIFY_USERNAMES_RAW
@@ -5106,6 +5116,36 @@ def pulse_red_unlock_notify_allowed(user: dict) -> bool:
     return username in allowlist
 
 
+def queue_red_pulse_unlock_notification_for_user(day_key: str, cycle_number: int, user: dict):
+    if not PULSE_RED_UNLOCK_DMS_ENABLED:
+        return
+    if not user or not pulse_red_unlock_notify_allowed(user):
+        return
+    user_id = user.get("user_id")
+    if not user_id:
+        return
+    if not pulse_user_contributed_today(user_id, user.get("username"), day_key):
+        return
+    dedupe_key = f"{day_key}:{cycle_number}:{int(user_id)}"
+    if any(
+        item.get("dedupe_key") == dedupe_key
+        for item in pulse_red_unlock_notifications
+    ):
+        return
+    pulse_red_unlock_notifications.append({
+        "notification_id": f"red-unlock-{len(pulse_red_unlock_notifications) + 1}",
+        "dedupe_key": dedupe_key,
+        "kind": "red_pulse_active",
+        "day_key": day_key,
+        "cycle_number": cycle_number,
+        "recipient_user_id": int(user_id),
+        "recipient_username": user.get("username"),
+        "recipient_display_name": user.get("display_name") or user.get("label"),
+        "created_at": now_iso(),
+        "notified_at": None,
+    })
+
+
 def queue_red_pulse_unlock_notifications(day_key: str, cycle_number: int):
     if not PULSE_RED_UNLOCK_DMS_ENABLED:
         return
@@ -5113,29 +5153,7 @@ def queue_red_pulse_unlock_notifications(day_key: str, cycle_number: int):
     if not users:
         return
     for user in users:
-        if not pulse_red_unlock_notify_allowed(user):
-            continue
-        user_id = user.get("user_id")
-        if not user_id:
-            continue
-        dedupe_key = f"{day_key}:{cycle_number}:{int(user_id)}"
-        if any(
-            item.get("dedupe_key") == dedupe_key
-            for item in pulse_red_unlock_notifications
-        ):
-            continue
-        pulse_red_unlock_notifications.append({
-            "notification_id": f"red-unlock-{len(pulse_red_unlock_notifications) + 1}",
-            "dedupe_key": dedupe_key,
-            "kind": "red_pulse_active",
-            "day_key": day_key,
-            "cycle_number": cycle_number,
-            "recipient_user_id": int(user_id),
-            "recipient_username": user.get("username"),
-            "recipient_display_name": user.get("display_name"),
-            "created_at": now_iso(),
-            "notified_at": None,
-        })
+        queue_red_pulse_unlock_notification_for_user(day_key, cycle_number, user)
 
 
 def maybe_queue_red_pulse_unlock_notifications(day_key: str, previous_cycles: int, new_cycles: int):
@@ -5260,10 +5278,12 @@ def pulse_slot_state(user_id=None, username=None, now: datetime.datetime | None 
     green_interval_hours = pulse_green_unlock_interval_hours()
     unlocked_cycles = pulse_red_unlocked_cycles(day)
     community_red_unlocked = unlocked_cycles > 0
-    red_available = max(0, unlocked_cycles - red_used)
-    red_ready = red_available > 0
+    contributed_today = green_used > 0
     red_unlocked = community_red_unlocked
-    red_activated = community_red_unlocked and red_available > 0
+    red_eligible = community_red_unlocked and contributed_today
+    red_available = max(0, unlocked_cycles - red_used) if red_eligible else 0
+    red_ready = red_available > 0
+    red_activated = red_ready
     remainder = sent_today % threshold if threshold else 0
     if community_red_unlocked:
         cycle_completed = threshold
@@ -5283,6 +5303,8 @@ def pulse_slot_state(user_id=None, username=None, now: datetime.datetime | None 
         "red_activated": red_activated,
         "red_used": red_used,
         "red_available": red_available,
+        "contributed_today": contributed_today,
+        "red_eligible": red_eligible,
         "red_unlocked_cycles": unlocked_cycles,
         "red_activated_cycles": red_used,
         "community_red_unlocked": community_red_unlocked,
@@ -10890,6 +10912,12 @@ def activate_pulse_red(payload: PulseReceiptAck):
             "message": "Red Pulse has not been unlocked yet.",
             "slots": slots,
         }
+    if not slots.get("contributed_today"):
+        return {
+            "status": "error",
+            "message": RED_PULSE_CONTRIBUTE_MESSAGE,
+            "slots": slots,
+        }
     if slots["red_available"] <= 0:
         return {
             "status": "error",
@@ -10948,6 +10976,9 @@ def submit_pulse(entry: PulseEntry):
     if pulse_type == "red" and not slots["red_unlocked"]:
         print(f"[{now_iso()}] pulse submit rejected: red pulse not unlocked", flush=True)
         return {"status": "error", "message": "Red Pulse has not been unlocked by the community yet."}
+    if pulse_type == "red" and not slots.get("contributed_today"):
+        print(f"[{now_iso()}] pulse submit rejected: red pulse requires a Pulse answer today", flush=True)
+        return {"status": "error", "message": RED_PULSE_CONTRIBUTE_MESSAGE}
     if pulse_type == "red" and slots["red_available"] <= 0:
         print(f"[{now_iso()}] pulse submit rejected: red pulse already used", flush=True)
         return {"status": "error", "message": "You have already answered today's Red Pulse."}
@@ -11007,6 +11038,8 @@ def submit_pulse(entry: PulseEntry):
         pulse_receipts.append(receipt)
     new_cycles = pulse_red_unlocked_cycles(day)
     maybe_queue_red_pulse_unlock_notifications(day, previous_cycles, new_cycles)
+    if pulse_type == "green" and new_cycles > 0:
+        queue_red_pulse_unlock_notification_for_user(day, new_cycles, identity)
     save_runtime_state()
     if pulse_type != "red":
         pulse_admin_notify(
