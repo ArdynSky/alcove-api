@@ -60,7 +60,26 @@ def _conn():
 
 
 def _clean_url(value: Any) -> str:
-    return str(value or "").strip()[:500]
+    text = str(value or "").strip().strip("'\"")[:2000]
+    if text.startswith("//"):
+        text = f"https:{text}"
+    elif text and not text.startswith(("/", "http://", "https://", "data:", "blob:", "assets")):
+        host = text.split("/", 1)[0]
+        if "." in host and " " not in host:
+            text = f"https://{text}"
+    if "drive.google.com/file/d/" in text:
+        start = text.find("drive.google.com/file/d/") + len("drive.google.com/file/d/")
+        file_id = text[start:].split("/", 1)[0].split("?", 1)[0]
+        if file_id:
+            return f"https://drive.google.com/uc?export=view&id={file_id}"
+    if "dropbox.com/" in text:
+        text = text.replace("www.dropbox.com", "dl.dropboxusercontent.com").replace("?dl=0", "").replace("&dl=0", "")
+    if "imgur.com/" in text and "i.imgur.com/" not in text:
+        slug = text.rstrip("/").rsplit("/", 1)[-1].split("?", 1)[0]
+        slug = slug.replace("gallery/", "").replace("a/", "")
+        if slug:
+            return f"https://i.imgur.com/{slug}.jpg"
+    return text
 
 
 def _first_text(*values: Any) -> str:
