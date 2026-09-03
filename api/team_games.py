@@ -55,6 +55,22 @@ def _apply_hold_if_expired(state: dict) -> dict:
     return state
 
 
+def _vote_timer_expired(state: dict) -> bool:
+    ends = _parse_iso((state.get("voting") or {}).get("ends_at"))
+    return bool(ends and _utcnow() >= ends)
+
+
+def _apply_vote_close_if_expired(state: dict) -> dict:
+    voting = dict(state.get("voting") or {})
+    if state.get("status") == "voting" and voting.get("open") and _vote_timer_expired(state):
+        voting["open"] = False
+        voting["closed_at"] = _iso()
+        state["voting"] = voting
+        state["status"] = "results_ready"
+        _save_state(state)
+    return state
+
+
 def _conn():
     con = sqlite3.connect(DB_PATH)
     con.row_factory = sqlite3.Row
@@ -89,7 +105,8 @@ def _default_state():
         "teams": [],
         "reveal": {"visible": False, "submission_id": None},
         "obs_mode": "hidden",
-        "voting": {"open": False, "opened_at": None, "closed_at": None},
+        "voting": {"open": False, "opened_at": None, "closed_at": None, "ends_at": None},
+        "results": {"visible": False, "reveal_started_at": None, "animation_seconds": 7},
         "background_filename": None,
     }
 
@@ -107,8 +124,9 @@ def _load_state():
             return _default_state()
         state.setdefault("background_filename", None)
         state.setdefault("obs_mode", "hidden")
-        state.setdefault("voting", {"open": False, "opened_at": None, "closed_at": None})
-    return _apply_hold_if_expired(state)
+        state.setdefault("voting", {"open": False, "opened_at": None, "closed_at": None, "ends_at": None})
+        state.setdefault("results", {"visible": False, "reveal_started_at": None, "animation_seconds": 7})
+    return _apply_vote_close_if_expired(_apply_hold_if_expired(state))
 
 
 def _save_state(state):
@@ -203,6 +221,14 @@ def _public_state(state, user_id: Optional[str] = None):
     out["my_vote"] = votes.get(uid)
     out["vote_counts"] = counts
     out["vote_total"] = len(votes)
+    percentages = {}
+    total = len(votes)
+    for item in submissions:
+        sid = str(item.get("id") or "")
+        n = int(counts.get(sid) or 0)
+        percentages[sid] = int(round((n * 100) / total)) if total else 0
+    out["vote_percentages"] = percentages
+    out["results"] = dict(state.get("results") or {"visible": False, "reveal_started_at": None, "animation_seconds": 7})
     out["obs_mode"] = state.get("obs_mode") or "hidden"
     return out
 
@@ -238,6 +264,11 @@ class RevealPayload(BaseModel):
 class VotePayload(BaseModel):
     user_id: str
     submission_id: str
+
+
+class ResultsPayload(BaseModel):
+    visible: bool = True
+    animation_seconds: int = 7
 
 
 class ObsFocusPayload(BaseModel):
@@ -388,7 +419,8 @@ def team_game_end():
     state["status"] = "ended"
     state["reveal"] = {"visible": False, "submission_id": None}
     state["obs_mode"] = "hidden"
-    state["voting"] = {"open": False, "opened_at": None, "closed_at": None}
+    state["voting"] = {"open": False, "opened_at": None, "closed_at": None, "ends_at": None}
+    state["results"] = {"visible": False, "reveal_started_at": None, "animation_seconds": 7}
     _save_state(state)
     return _public_state(state)
 
@@ -519,18 +551,26 @@ def team_game_reveal(payload: RevealPayload):
 
 
 @router.post("/voting/open")
-def team_game_voting_open():
+def team_game_voting_open(duration_seconds: int = 45):
     state = _load_state()
-    if state.get("status") not in {"holding", "voting", "assigned", "running"}:
+    if state.get("status") not in {"holding", "voting", "assigned", "running", "results_ready"}:
         raise HTTPException(status_code=409, detail="Collect artwork before opening votes")
     submissions = _session_submissions(state)
     if len(submissions) < 1:
         raise HTTPException(status_code=409, detail="No drawings have been submitted yet")
     now = _iso()
+    duration = max(5, min(int(duration_seconds or 45), 600))
     voting = dict(state.get("voting") or {})
-    voting.update({"open": True, "opened_at": now, "closed_at": None})
+    voting.update({
+        "open": True,
+        "opened_at": now,
+        "closed_at": None,
+        "ends_at": _iso(_utcnow() + timedelta(seconds=duration)),
+        "duration_seconds": duration,
+    })
     state["status"] = "voting"
     state["voting"] = voting
+    state["results"] = {"visible": False, "reveal_started_at": None, "animation_seconds": 7}
     state["obs_mode"] = "gallery"
     _save_state(state)
     return _public_state(state)
@@ -539,11 +579,12 @@ def team_game_voting_open():
 @router.post("/voting/close")
 def team_game_voting_close():
     state = _load_state()
-    if state.get("status") != "voting":
+    if state.get("status") not in {"voting", "results_ready"}:
         raise HTTPException(status_code=409, detail="Voting is not open")
     voting = dict(state.get("voting") or {})
     voting.update({"open": False, "closed_at": _iso()})
     state["voting"] = voting
+    state["status"] = "results_ready"
     _save_state(state)
     return _public_state(state)
 
@@ -569,6 +610,30 @@ def team_game_vote(payload: VotePayload):
         con.commit()
         con.close()
     return _public_state(state, uid)
+
+
+@router.post("/results")
+def team_game_results(payload: ResultsPayload):
+    state = _load_state()
+    if state.get("status") not in {"voting", "results_ready", "results"}:
+        raise HTTPException(status_code=409, detail="Close votes before revealing results")
+    voting = dict(state.get("voting") or {})
+    if voting.get("open"):
+        voting["open"] = False
+        voting["closed_at"] = _iso()
+        state["voting"] = voting
+    if payload.visible:
+        state["status"] = "results"
+        state["results"] = {
+            "visible": True,
+            "reveal_started_at": _iso(),
+            "animation_seconds": max(3, min(int(payload.animation_seconds or 7), 20)),
+        }
+    else:
+        state["status"] = "results_ready"
+        state["results"] = {"visible": False, "reveal_started_at": None, "animation_seconds": 7}
+    _save_state(state)
+    return _public_state(state)
 
 
 @router.post("/obs-focus")

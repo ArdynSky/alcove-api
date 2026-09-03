@@ -94,8 +94,34 @@ class TeamGameHoldTests(unittest.TestCase):
         self.assertEqual(changed["vote_total"], 1)
         closed = team_games.team_game_voting_close()
         self.assertFalse(closed["voting"]["open"])
+        self.assertEqual(closed["status"], "results_ready")
         with self.assertRaises(team_games.HTTPException):
             team_games.team_game_vote(team_games.VotePayload(user_id="99", submission_id="art-a"))
+
+    def test_vote_timer_locks_and_results_reveal(self):
+        self._running_state()
+        team_games.team_game_hold()
+        self._seed_submission("art-a", "10", "Sam")
+        self._seed_submission("art-b", "20", "Alex")
+        opened = team_games.team_game_voting_open(duration_seconds=45)
+        self.assertTrue(opened["voting"]["open"])
+        self.assertTrue(opened["voting"]["ends_at"])
+        team_games.team_game_vote(team_games.VotePayload(user_id="1", submission_id="art-a"))
+        team_games.team_game_vote(team_games.VotePayload(user_id="2", submission_id="art-a"))
+        team_games.team_game_vote(team_games.VotePayload(user_id="3", submission_id="art-b"))
+        state = team_games._load_state()
+        voting = dict(state.get("voting") or {})
+        voting["ends_at"] = (datetime.now(timezone.utc) - timedelta(seconds=2)).isoformat()
+        state["voting"] = voting
+        team_games._save_state(state)
+        locked = team_games._public_state(team_games._load_state())
+        self.assertEqual(locked["status"], "results_ready")
+        self.assertFalse(locked["voting"]["open"])
+        revealed = team_games.team_game_results(team_games.ResultsPayload(visible=True, animation_seconds=5))
+        self.assertEqual(revealed["status"], "results")
+        self.assertTrue(revealed["results"]["visible"])
+        self.assertEqual(revealed["vote_percentages"]["art-a"], 67)
+        self.assertEqual(revealed["vote_percentages"]["art-b"], 33)
 
     def test_obs_gallery_and_single_focus(self):
         self._running_state()
