@@ -3,6 +3,7 @@ from __future__ import annotations
 import datetime
 import json
 import os
+import re
 import sqlite3
 import threading
 from pathlib import Path
@@ -26,6 +27,8 @@ OWNED_LIST_KEYS = (
     "titles",
     "foxItems",
 )
+SPOTLIGHT_COLOURS = ("purple", "blue", "green", "gold")
+_RESET_TOKEN_MS = re.compile(r"(\d{13,})")
 
 
 def _db_path() -> Path:
@@ -79,6 +82,23 @@ def _parse_ts(value: Any) -> float:
         return 0.0
 
 
+def _reset_token_ms(token: Any) -> int:
+    match = _RESET_TOKEN_MS.search(str(token or ""))
+    return int(match.group(1)) if match else 0
+
+
+def _spotlight_colours(value: Any) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for item in _as_list(value):
+        key = str(item or "").strip().lower()
+        if key not in SPOTLIGHT_COLOURS or key in seen:
+            continue
+        seen.add(key)
+        out.append(key)
+    return out
+
+
 def _as_dict(value: Any) -> dict:
     return value if isinstance(value, dict) else {}
 
@@ -122,6 +142,8 @@ def normalize_profile(raw: Any) -> dict:
             clean_stats[str(key)[:80]] = max(0, int(value or 0))
         except (TypeError, ValueError):
             continue
+    colour_set = _spotlight_colours(data.get("spotlightColourSet"))
+    clean_stats["spotlightColours"] = len(colour_set)
     return {
         "version": PROFILE_VERSION,
         "updated_at": str(data.get("updated_at") or data.get("updatedAt") or "").strip(),
@@ -146,6 +168,8 @@ def normalize_profile(raw: Any) -> dict:
         "achievementsClaimed": _union_str_list(data.get("achievementsClaimed"))[:200],
         "achievementsNotified": _union_str_list(data.get("achievementsNotified"))[:200],
         "progressionResetToken": str(data.get("progressionResetToken") or "")[:120],
+        "progressionResetAt": str(data.get("progressionResetAt") or "")[:80],
+        "spotlightColourSet": colour_set,
         "stats": clean_stats,
         "memberSince": str(data.get("memberSince") or "")[:80],
         "equippedAchievements": _public_equipped(data.get("equippedAchievements") or data.get("equipped_achievements")),
@@ -164,19 +188,33 @@ def merge_profiles(base: dict | None, incoming: dict | None) -> dict:
     right_ts = _parse_ts(right.get("updated_at"))
     newer, older = (right, left) if right_ts >= left_ts else (left, right)
 
-    if (
-        newer.get("progressionResetToken")
-        and newer.get("progressionResetToken") != older.get("progressionResetToken")
-        and right_ts != left_ts
-    ):
-        merged = dict(newer)
-        merged["updated_at"] = newer.get("updated_at") or _now()
-        return normalize_profile(merged)
+    left_token = str(left.get("progressionResetToken") or "")
+    right_token = str(right.get("progressionResetToken") or "")
+    if left_token != right_token:
+        left_reset = _reset_token_ms(left_token)
+        right_reset = _reset_token_ms(right_token)
+        winner = None
+        if left_reset != right_reset:
+            winner = right if right_reset > left_reset else left
+        elif right_ts != left_ts:
+            # Tokens like "old" / "new-reset" have no epoch ms; keep the later write.
+            winner = newer
+        if winner is not None:
+            merged = dict(winner)
+            merged["updated_at"] = winner.get("updated_at") or _now()
+            return normalize_profile(merged)
 
     owned = {key: _union_str_list(left["owned"].get(key), right["owned"].get(key)) for key in OWNED_LIST_KEYS}
     stats = {}
     for key in set(left["stats"]) | set(right["stats"]):
         stats[key] = max(int(left["stats"].get(key) or 0), int(right["stats"].get(key) or 0))
+    colour_set = _spotlight_colours(
+        _union_str_list(left.get("spotlightColourSet"), right.get("spotlightColourSet"))
+    )
+    stats["spotlightColours"] = len(colour_set)
+    left_reset_at = str(left.get("progressionResetAt") or "")
+    right_reset_at = str(right.get("progressionResetAt") or "")
+    reset_at = right_reset_at if _parse_ts(right_reset_at) >= _parse_ts(left_reset_at) else left_reset_at
 
     if left["level"] > right["level"]:
         level, exp, exp_max, exp_view = left["level"], left["exp"], left["expMax"], left["expView"]
@@ -197,7 +235,8 @@ def merge_profiles(base: dict | None, incoming: dict | None) -> dict:
         "expView": exp_view,
         "owned": owned,
         "ownedMeta": {**left["ownedMeta"], **right["ownedMeta"]},
-        "newUnlocks": _union_str_list(left["newUnlocks"], right["newUnlocks"]),
+        # Remaining-set: a dismissed New! token must not come back from the older copy.
+        "newUnlocks": list(newer.get("newUnlocks") or []),
         "pendingRewards": (_as_list(older.get("pendingRewards")) + _as_list(newer.get("pendingRewards")))[-40:],
         "levelRewardsClaimed": _union_str_list(left["levelRewardsClaimed"], right["levelRewardsClaimed"]),
         "claimReceipts": {**left["claimReceipts"], **right["claimReceipts"]},
@@ -205,6 +244,8 @@ def merge_profiles(base: dict | None, incoming: dict | None) -> dict:
         "expHistory": (_as_list(older.get("expHistory")) + _as_list(newer.get("expHistory")))[-MAX_EXP_HISTORY:],
         "achievementsClaimed": _union_str_list(left["achievementsClaimed"], right["achievementsClaimed"]),
         "achievementsNotified": _union_str_list(left["achievementsNotified"], right["achievementsNotified"]),
+        "progressionResetAt": reset_at,
+        "spotlightColourSet": colour_set,
         "stats": stats,
         "equippedAchievements": newer.get("equippedAchievements") or older.get("equippedAchievements") or [],
         "updated_at": newer.get("updated_at") or _now(),
