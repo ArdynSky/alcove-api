@@ -197,7 +197,10 @@ def merge_profiles(base: dict | None, incoming: dict | None) -> dict:
         "expView": exp_view,
         "owned": owned,
         "ownedMeta": {**left["ownedMeta"], **right["ownedMeta"]},
-        "newUnlocks": _union_str_list(left["newUnlocks"], right["newUnlocks"]),
+        # Unseen badges are a remaining-set, not a union. Tapping New removes a
+        # token on the newer profile; unioning the older copy would bring it back
+        # after leaving Profile.
+        "newUnlocks": list(newer.get("newUnlocks") or [])[:200],
         "pendingRewards": (_as_list(older.get("pendingRewards")) + _as_list(newer.get("pendingRewards")))[-40:],
         "levelRewardsClaimed": _union_str_list(left["levelRewardsClaimed"], right["levelRewardsClaimed"]),
         "claimReceipts": {**left["claimReceipts"], **right["claimReceipts"]},

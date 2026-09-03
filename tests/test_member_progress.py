@@ -93,6 +93,65 @@ class MemberProgressTests(unittest.TestCase):
         self.assertEqual(merged["owned"]["feedSkins"], ["pulse"])
         self.assertEqual(merged["feed"]["color"], "rose")
 
+    def test_new_unlocks_follow_newer_profile(self):
+        seen = member_progress.merge_profiles(
+            {
+                "newUnlocks": ["sticker:heart", "sticker:star"],
+                "updated_at": "2026-09-03T10:00:00+00:00",
+            },
+            {
+                "newUnlocks": ["sticker:heart"],
+                "updated_at": "2026-09-03T11:00:00+00:00",
+            },
+        )
+        self.assertEqual(seen["newUnlocks"], ["sticker:heart"])
+
+        claimed = member_progress.merge_profiles(
+            {
+                "newUnlocks": [],
+                "updated_at": "2026-09-03T10:00:00+00:00",
+            },
+            {
+                "newUnlocks": ["skin:pulse", "sticker:heart"],
+                "updated_at": "2026-09-03T11:00:00+00:00",
+            },
+        )
+        self.assertEqual(claimed["newUnlocks"], ["skin:pulse", "sticker:heart"])
+
+        tied = member_progress.merge_profiles(
+            {
+                "newUnlocks": ["sticker:heart", "sticker:star"],
+                "updated_at": "2026-09-03T12:00:00+00:00",
+            },
+            {
+                "newUnlocks": ["sticker:heart"],
+                "updated_at": "2026-09-03T12:00:00+00:00",
+            },
+        )
+        self.assertEqual(tied["newUnlocks"], ["sticker:heart"])
+
+        self.client.put(
+            "/api/members/profile",
+            json={
+                "init_data": "member-init",
+                "profile": {
+                    "newUnlocks": ["sticker:heart", "sticker:star"],
+                    "updated_at": "2026-09-03T10:00:00+00:00",
+                },
+            },
+        )
+        persisted = self.client.put(
+            "/api/members/profile",
+            json={
+                "init_data": "member-init",
+                "profile": {
+                    "newUnlocks": ["sticker:heart"],
+                    "updated_at": "2026-09-03T11:00:00+00:00",
+                },
+            },
+        ).json()["profile"]
+        self.assertEqual(persisted["newUnlocks"], ["sticker:heart"])
+
     def test_admin_can_read_and_write_any_user(self):
         written = self.client.put(
             "/api/members/8385145826/profile",
