@@ -144,6 +144,89 @@ class MemberProgressTests(unittest.TestCase):
         self.assertEqual(reset["owned"]["feedColors"], ["base"])
         self.assertEqual(reset["progressionResetToken"], "new-reset")
 
+    def test_newer_reset_token_wins_over_later_stale_timestamp(self):
+        self.client.put(
+            "/api/members/profile",
+            json={
+                "init_data": "member-init",
+                "profile": {
+                    "level": 1,
+                    "exp": 0,
+                    "stats": {"pulseSubmitted": 0},
+                    "progressionResetToken": "reset-1756710999999",
+                    "progressionResetAt": "2026-09-01T08:00:00+00:00",
+                    "updated_at": "2026-08-29T10:00:00+00:00",
+                },
+            },
+        )
+        stale = self.client.put(
+            "/api/members/profile",
+            json={
+                "init_data": "member-init",
+                "profile": {
+                    "level": 12,
+                    "exp": 400,
+                    "stats": {"pulseSubmitted": 10},
+                    "progressionResetToken": "reset-1756700000000",
+                    "updated_at": "2026-09-01T12:00:00+00:00",
+                },
+            },
+        ).json()["profile"]
+        self.assertEqual(stale["level"], 1)
+        self.assertEqual(stale["exp"], 0)
+        self.assertEqual(stale["stats"].get("pulseSubmitted"), 0)
+        self.assertEqual(stale["progressionResetToken"], "reset-1756710999999")
+
+    def test_dismissed_new_unlocks_are_not_unioned_back(self):
+        self.client.put(
+            "/api/members/profile",
+            json={
+                "init_data": "member-init",
+                "profile": {
+                    "level": 2,
+                    "newUnlocks": ["sticker:heart", "sticker:star"],
+                    "updated_at": "2026-09-01T10:00:00+00:00",
+                },
+            },
+        )
+        remaining = self.client.put(
+            "/api/members/profile",
+            json={
+                "init_data": "member-init",
+                "profile": {
+                    "level": 2,
+                    "newUnlocks": ["sticker:heart"],
+                    "updated_at": "2026-09-01T12:00:00+00:00",
+                },
+            },
+        ).json()["profile"]
+        self.assertEqual(remaining["newUnlocks"], ["sticker:heart"])
+
+    def test_spotlight_colour_set_unions_and_counts(self):
+        self.client.put(
+            "/api/members/profile",
+            json={
+                "init_data": "member-init",
+                "profile": {
+                    "spotlightColourSet": ["purple", "pink", "blue"],
+                    "updated_at": "2026-09-01T10:00:00+00:00",
+                },
+            },
+        )
+        merged = self.client.put(
+            "/api/members/profile",
+            json={
+                "init_data": "member-init",
+                "profile": {
+                    "spotlightColourSet": ["green", "gold"],
+                    "updated_at": "2026-09-01T11:00:00+00:00",
+                },
+            },
+        ).json()["profile"]
+        self.assertEqual(sorted(merged["spotlightColourSet"]), ["blue", "gold", "green", "purple"])
+        self.assertEqual(merged["stats"]["spotlightColours"], 4)
+        self.assertNotIn("pink", merged["spotlightColourSet"])
+
     def test_public_profile_returns_safe_card(self):
         missing = self.client.get("/api/members/public-profile", params={"user_id": "9999"})
         self.assertEqual(missing.status_code, 200)
