@@ -14,6 +14,8 @@ from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
+from .image_compress import compress_image_bytes
+
 router = APIRouter(prefix="/api/custom-packs", tags=["custom-packs"])
 _LOCK = threading.RLock()
 
@@ -136,6 +138,7 @@ async def upload_custom_pack_asset(admin_secret: str = Form(...), file: UploadFi
         raise HTTPException(status_code=400, detail="Image file is empty")
     if len(data) > MAX_IMAGE_BYTES:
         raise HTTPException(status_code=413, detail="Image must be 5 MB or smaller")
+    data = compress_image_bytes(data, original.name)
     stem = re.sub(r"[^a-zA-Z0-9_-]+", "-", original.stem).strip("-")[:50] or "reward"
     filename = f"{stem}-{uuid.uuid4().hex[:10]}{ext}"
     path = ASSET_DIR / filename

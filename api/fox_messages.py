@@ -900,6 +900,9 @@ def save_banner_upload(content: bytes, original_name: str, label: str, state: di
     ext = os.path.splitext(original_name or "")[1].lower()
     if ext not in ALLOWED_BANNER_EXTENSIONS:
         raise ValueError("Banner must be PNG, JPEG, WebP, or GIF")
+    from .image_compress import compress_image_bytes
+
+    content = compress_image_bytes(content, original_name or "banner.png")
     stem = sanitize_banner_stem(original_name)
     filename = f"{stem}-{uuid.uuid4().hex[:8]}{ext}"
     file_path = os.path.join(fox_banners_dir(), filename)

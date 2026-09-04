@@ -44,6 +44,7 @@ from .custom_rewards import router as custom_rewards_router
 from .debate_games import router as debate_games_router
 from . import debate_audience  # noqa: F401 — registers audience/archive routes on the debate router
 from .agendas import router as agendas_router
+from .image_compress import compress_image_bytes, recompress_image_directory, update_manifest_sizes
 from .live_room_test import apply_authorization_identity, router as live_room_test_router
 from .member_progress import router as member_progress_router
 
@@ -6943,6 +6944,33 @@ async def cards_websocket_endpoint(websocket: WebSocket):
 
 
 @app.on_event("startup")
+async def recompress_admin_images_startup():
+    def work():
+        try:
+            reward_changes = recompress_image_directory(REWARD_ASSETS_DIR)
+            if reward_changes:
+                manifest = load_reward_assets_manifest()
+                save_reward_assets_manifest(update_manifest_sizes(manifest, reward_changes))
+            from .custom_rewards import ASSET_DIR as custom_pack_dir
+
+            pack_changes = recompress_image_directory(custom_pack_dir)
+            from .fox_messages import fox_banners_dir
+
+            banner_changes = recompress_image_directory(fox_banners_dir())
+            saved = sum(item["before_bytes"] - item["after_bytes"] for item in reward_changes + pack_changes + banner_changes)
+            print(
+                f"[{now_iso()}] Admin image compress: "
+                f"{len(reward_changes)} reward, {len(pack_changes)} pack, {len(banner_changes)} banner files "
+                f"({saved} bytes saved).",
+                flush=True,
+            )
+        except Exception as exc:
+            print(f"[{now_iso()}] Admin image compress skipped: {exc}", flush=True)
+
+    asyncio.get_running_loop().run_in_executor(None, work)
+
+
+@app.on_event("startup")
 async def cards_startup_tasks():
     if not cards_api_enabled():
         print(f"[{now_iso()}] Cards API disabled; skipping cards cleanup loop.", flush=True)
@@ -8170,6 +8198,7 @@ async def admin_reward_asset_upload(
     ext = Path(file.filename or "icon.png").suffix.lower()
     if ext not in REWARD_ASSET_EXTENSIONS:
         raise HTTPException(status_code=400, detail="Use PNG, JPEG, WebP, or GIF")
+    content = compress_image_bytes(content, file.filename or "icon.png")
     stem = sanitize_reward_asset_stem(file.filename or label or "reward")
     filename = f"{stem}-{uuid.uuid4().hex[:8]}{ext}"
     file_path = os.path.join(REWARD_ASSETS_DIR, filename)
