@@ -127,10 +127,25 @@ def _clean_url(value: Any) -> str:
     return text
 
 
+PREVIEW_OPACITY_OPTIONS = {25, 50, 75}
+DEFAULT_PREVIEW_OPACITY = 50
+
+
+def _normalize_preview_opacity(raw: Any) -> int:
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return DEFAULT_PREVIEW_OPACITY
+    if value in PREVIEW_OPACITY_OPTIONS:
+        return value
+    return DEFAULT_PREVIEW_OPACITY
+
+
 def _default_tile(key: str) -> dict:
     copy = DEFAULT_TILE_COPY[key]
     return {
         "preview_video_url": "",
+        "preview_opacity": DEFAULT_PREVIEW_OPACITY,
         "cta": "LET'S GO!",
         "info_title": copy["info_title"],
         "info_description": copy["info_description"],
@@ -163,6 +178,9 @@ def _normalize_tile(key: str, raw: Any) -> dict:
             or raw.get("video_url")
             or raw.get("videoUrl")
             or ""
+        ),
+        "preview_opacity": _normalize_preview_opacity(
+            raw.get("preview_opacity", raw.get("previewOpacity", base["preview_opacity"]))
         ),
         "cta": cta,
         "info_title": title.upper() if title.isascii() else title,
@@ -251,6 +269,7 @@ def _media_type_for(path: Path) -> str:
 
 class HomepageTileUpdate(BaseModel):
     preview_video_url: Optional[str] = ""
+    preview_opacity: Optional[int] = DEFAULT_PREVIEW_OPACITY
     cta: Optional[str] = "LET'S GO!"
     info_title: Optional[str] = ""
     info_description: Optional[str] = ""
@@ -283,6 +302,9 @@ def update_homepage_settings(payload: HomepageSettingsUpdate):
         data = tile_payload.model_dump()
         tiles[key] = {
             "preview_video_url": data.get("preview_video_url", ""),
+            "preview_opacity": _normalize_preview_opacity(
+                data.get("preview_opacity", current_tile.get("preview_opacity"))
+            ),
             "cta": data.get("cta") or current_tile["cta"],
             "info_title": data.get("info_title") or current_tile["info_title"],
             "info_description": data.get("info_description") or current_tile["info_description"],

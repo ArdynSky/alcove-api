@@ -43,6 +43,7 @@ class HomepageSettingsTests(unittest.TestCase):
         self.assertEqual(settings["fallback_image_url"], "")
         self.assertEqual(settings["logo_url"], "")
         self.assertEqual(settings["tiles"]["live_room"]["cta"], "LET'S GO!")
+        self.assertEqual(settings["tiles"]["live_room"]["preview_opacity"], 50)
         self.assertEqual(settings["tiles"]["archive"]["info_title"], "ARCHIVE")
 
     def test_post_round_trip(self):
@@ -54,18 +55,21 @@ class HomepageSettingsTests(unittest.TestCase):
             "tiles": {
                 "live_room": {
                     "preview_video_url": "https://example.com/live.mp4",
+                    "preview_opacity": 75,
                     "cta": "LET'S GO!",
                     "info_title": "LIVE ROOM",
                     "info_description": "Custom live room copy.",
                 },
                 "profile": {
                     "preview_video_url": "",
+                    "preview_opacity": 25,
                     "cta": "LET'S GO!",
                     "info_title": "PROFILE",
                     "info_description": "Custom profile copy.",
                 },
                 "connect": {
                     "preview_video_url": "",
+                    "preview_opacity": 99,
                     "cta": "ENTER",
                     "info_title": "CONNECT",
                     "info_description": "Custom connect copy.",
@@ -84,6 +88,10 @@ class HomepageSettingsTests(unittest.TestCase):
         self.assertEqual(loaded["background_video_url"], "https://example.com/bg.mp4")
         self.assertEqual(loaded["tiles"]["connect"]["cta"], "ENTER")
         self.assertEqual(loaded["tiles"]["live_room"]["info_description"], "Custom live room copy.")
+        self.assertEqual(loaded["tiles"]["live_room"]["preview_opacity"], 75)
+        self.assertEqual(loaded["tiles"]["profile"]["preview_opacity"], 25)
+        self.assertEqual(loaded["tiles"]["connect"]["preview_opacity"], 50)
+        self.assertEqual(loaded["tiles"]["archive"]["preview_opacity"], 50)
 
     def test_upload_rejects_unsupported_type(self):
         response = self.client.post(
