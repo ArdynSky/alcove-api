@@ -46,6 +46,7 @@ from . import debate_audience  # noqa: F401 — registers audience/archive route
 from .agendas import router as agendas_router
 from .live_room_test import apply_authorization_identity, router as live_room_test_router
 from .member_progress import router as member_progress_router
+from .homepage_settings import router as homepage_settings_router
 
 try:
     from dotenv import load_dotenv
@@ -69,6 +70,7 @@ app.include_router(debate_games_router)
 app.include_router(agendas_router)
 app.include_router(live_room_test_router)
 app.include_router(member_progress_router)
+app.include_router(homepage_settings_router)
 
 CORS_ALLOWED_ORIGINS = [
     "null",
