@@ -157,6 +157,7 @@ def default_homepage_settings() -> dict:
         "background_video_url": "",
         "fallback_image_url": "",
         "logo_url": "",
+        "bottom_banner_url": "",
         "tiles": {key: _default_tile(key) for key in TILE_KEYS},
     }
 
@@ -207,6 +208,12 @@ def normalize_homepage_settings(raw: Any) -> dict:
             or ""
         ),
         "logo_url": _clean_url(raw.get("logo_url") or raw.get("logoUrl") or ""),
+        "bottom_banner_url": _clean_url(
+            raw.get("bottom_banner_url")
+            or raw.get("bottomBannerUrl")
+            or raw.get("bottom_banner")
+            or ""
+        ),
         "tiles": {key: _normalize_tile(key, tiles_raw.get(key)) for key in TILE_KEYS},
     }
 
@@ -280,6 +287,7 @@ class HomepageSettingsUpdate(BaseModel):
     background_video_url: Optional[str] = ""
     fallback_image_url: Optional[str] = ""
     logo_url: Optional[str] = ""
+    bottom_banner_url: Optional[str] = ""
     tiles: dict[str, HomepageTileUpdate] = Field(default_factory=dict)
 
 
@@ -314,6 +322,7 @@ def update_homepage_settings(payload: HomepageSettingsUpdate):
             "background_video_url": payload.background_video_url or "",
             "fallback_image_url": payload.fallback_image_url or "",
             "logo_url": payload.logo_url or "",
+            "bottom_banner_url": payload.bottom_banner_url or "",
             "tiles": tiles,
         }
     )
