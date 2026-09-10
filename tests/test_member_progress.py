@@ -227,6 +227,90 @@ class MemberProgressTests(unittest.TestCase):
         self.assertEqual(merged["stats"]["spotlightColours"], 4)
         self.assertNotIn("pink", merged["spotlightColourSet"])
 
+    def test_login_streak_resets_after_a_gap_and_keeps_unique_days(self):
+        self.client.put(
+            "/api/members/profile",
+            json={
+                "init_data": "member-init",
+                "profile": {
+                    "stats": {"loginDays": 4, "loginStreak": 4},
+                    "loginDayLast": "2026-09-04",
+                    "updated_at": "2026-09-04T21:00:00+00:00",
+                },
+            },
+        )
+        resumed = self.client.put(
+            "/api/members/profile",
+            json={
+                "init_data": "member-init",
+                "profile": {
+                    "stats": {"loginDays": 5, "loginStreak": 1},
+                    "loginDayLast": "2026-09-10",
+                    "updated_at": "2026-09-10T09:00:00+00:00",
+                },
+            },
+        ).json()["profile"]
+        self.assertEqual(resumed["loginDayLast"], "2026-09-10")
+        self.assertEqual(resumed["stats"]["loginStreak"], 1)
+        self.assertGreaterEqual(resumed["stats"]["loginDays"], 5)
+
+        fetched = self.client.get("/api/members/profile", headers={"X-Telegram-Init-Data": "member-init"})
+        self.assertEqual(fetched.json()["profile"]["loginDayLast"], "2026-09-10")
+        self.assertEqual(fetched.json()["profile"]["stats"]["loginStreak"], 1)
+
+    def test_login_streak_is_not_restored_when_cloud_copy_lacks_login_day(self):
+        self.client.put(
+            "/api/members/profile",
+            json={
+                "init_data": "member-init",
+                "profile": {
+                    "stats": {"loginDays": 4, "loginStreak": 4},
+                    "updated_at": "2026-09-04T21:00:00+00:00",
+                },
+            },
+        )
+        resumed = self.client.put(
+            "/api/members/profile",
+            json={
+                "init_data": "member-init",
+                "profile": {
+                    "stats": {"loginDays": 5, "loginStreak": 1},
+                    "loginDayLast": "2026-09-10",
+                    "updated_at": "2026-09-10T09:00:00+00:00",
+                },
+            },
+        ).json()["profile"]
+        self.assertEqual(resumed["loginDayLast"], "2026-09-10")
+        self.assertEqual(resumed["stats"]["loginStreak"], 1)
+        self.assertGreaterEqual(resumed["stats"]["loginDays"], 5)
+
+    def test_consecutive_login_days_keep_the_running_streak(self):
+        self.client.put(
+            "/api/members/profile",
+            json={
+                "init_data": "member-init",
+                "profile": {
+                    "stats": {"loginDays": 29, "loginStreak": 29},
+                    "loginDayLast": "2026-09-01",
+                    "updated_at": "2026-09-01T21:00:00+00:00",
+                },
+            },
+        )
+        continued = self.client.put(
+            "/api/members/profile",
+            json={
+                "init_data": "member-init",
+                "profile": {
+                    "stats": {"loginDays": 1, "loginStreak": 1},
+                    "loginDayLast": "2026-09-02",
+                    "updated_at": "2026-09-02T08:00:00+00:00",
+                },
+            },
+        ).json()["profile"]
+        self.assertEqual(continued["loginDayLast"], "2026-09-02")
+        self.assertEqual(continued["stats"]["loginStreak"], 30)
+        self.assertEqual(continued["stats"]["loginDays"], 30)
+
     def test_public_profile_returns_safe_card(self):
         missing = self.client.get("/api/members/public-profile", params={"user_id": "9999"})
         self.assertEqual(missing.status_code, 200)

@@ -28,6 +28,7 @@ OWNED_LIST_KEYS = (
     "foxItems",
 )
 SPOTLIGHT_COLOURS = ("purple", "blue", "green", "gold")
+_DAY_KEY = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 _RESET_TOKEN_MS = re.compile(r"(\d{13,})")
 
 
@@ -85,6 +86,67 @@ def _parse_ts(value: Any) -> float:
 def _reset_token_ms(token: Any) -> int:
     match = _RESET_TOKEN_MS.search(str(token or ""))
     return int(match.group(1)) if match else 0
+
+
+def _day_key(value: Any) -> str:
+    raw = str(value or "").strip()
+    return raw if _DAY_KEY.fullmatch(raw) else ""
+
+
+def _previous_local_day(day_key: str) -> str:
+    raw = _day_key(day_key)
+    if not raw:
+        return ""
+    year, month, day = (int(part) for part in raw.split("-"))
+    try:
+        previous = datetime.date(year, month, day) - datetime.timedelta(days=1)
+    except ValueError:
+        return ""
+    return previous.isoformat()
+
+
+def _merge_login_progress(left: dict, right: dict, stats: dict) -> str:
+    """Keep unique login days monotonic, but never restore a broken streak."""
+    left_day = _day_key(left.get("loginDayLast"))
+    right_day = _day_key(right.get("loginDayLast"))
+    left_stats = _as_dict(left.get("stats"))
+    right_stats = _as_dict(right.get("stats"))
+    left_streak = int(left_stats.get("loginStreak") or 0)
+    right_streak = int(right_stats.get("loginStreak") or 0)
+    left_days = int(left_stats.get("loginDays") or 0)
+    right_days = int(right_stats.get("loginDays") or 0)
+
+    if not left_day and not right_day:
+        left_ts = _parse_ts(left.get("updated_at"))
+        right_ts = _parse_ts(right.get("updated_at"))
+        stats["loginStreak"] = right_streak if right_ts >= left_ts else left_streak
+        stats["loginDays"] = max(left_days, right_days)
+        stats["memberDays"] = max(int(stats.get("memberDays") or 0), stats["loginDays"])
+        return ""
+
+    if not right_day or (left_day and left_day >= right_day):
+        later_day, later_streak, later_days = left_day, left_streak, left_days
+        earlier_day, earlier_streak, earlier_days = right_day, right_streak, right_days
+    else:
+        later_day, later_streak, later_days = right_day, right_streak, right_days
+        earlier_day, earlier_streak, earlier_days = left_day, left_streak, left_days
+
+    login_days = max(later_days, earlier_days)
+    if not earlier_day:
+        login_streak = later_streak
+    elif later_day == earlier_day:
+        login_streak = max(later_streak, earlier_streak)
+    elif earlier_day == _previous_local_day(later_day):
+        login_streak = max(later_streak, earlier_streak + 1)
+        login_days = max(login_days, earlier_days + 1)
+    else:
+        login_streak = later_streak
+        login_days = max(login_days, earlier_days + 1)
+
+    stats["loginStreak"] = login_streak
+    stats["loginDays"] = login_days
+    stats["memberDays"] = max(int(stats.get("memberDays") or 0), login_days)
+    return later_day
 
 
 def _spotlight_colours(value: Any) -> list[str]:
@@ -171,6 +233,8 @@ def normalize_profile(raw: Any) -> dict:
         "progressionResetAt": str(data.get("progressionResetAt") or "")[:80],
         "spotlightColourSet": colour_set,
         "stats": clean_stats,
+        "loginDayLast": _day_key(data.get("loginDayLast")),
+        "redPulseActivationLast": _day_key(data.get("redPulseActivationLast")),
         "memberSince": str(data.get("memberSince") or "")[:80],
         "equippedAchievements": _public_equipped(data.get("equippedAchievements") or data.get("equipped_achievements")),
     }
@@ -212,6 +276,10 @@ def merge_profiles(base: dict | None, incoming: dict | None) -> dict:
         _union_str_list(left.get("spotlightColourSet"), right.get("spotlightColourSet"))
     )
     stats["spotlightColours"] = len(colour_set)
+    login_day_last = _merge_login_progress(left, right, stats)
+    left_red = _day_key(left.get("redPulseActivationLast"))
+    right_red = _day_key(right.get("redPulseActivationLast"))
+    red_pulse_activation_last = left_red if left_red >= right_red else right_red
     left_reset_at = str(left.get("progressionResetAt") or "")
     right_reset_at = str(right.get("progressionResetAt") or "")
     reset_at = right_reset_at if _parse_ts(right_reset_at) >= _parse_ts(left_reset_at) else left_reset_at
@@ -247,6 +315,8 @@ def merge_profiles(base: dict | None, incoming: dict | None) -> dict:
         "progressionResetAt": reset_at,
         "spotlightColourSet": colour_set,
         "stats": stats,
+        "loginDayLast": login_day_last,
+        "redPulseActivationLast": red_pulse_activation_last,
         "equippedAchievements": newer.get("equippedAchievements") or older.get("equippedAchievements") or [],
         "updated_at": newer.get("updated_at") or _now(),
     }
