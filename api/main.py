@@ -47,6 +47,7 @@ from .agendas import router as agendas_router
 from .live_room_test import apply_authorization_identity, router as live_room_test_router
 from .member_progress import router as member_progress_router
 from .homepage_settings import router as homepage_settings_router
+from .homepage_settings import ensure_homepage_media_optimized
 
 try:
     from dotenv import load_dotenv
@@ -6946,6 +6947,10 @@ async def cards_websocket_endpoint(websocket: WebSocket):
 
 @app.on_event("startup")
 async def cards_startup_tasks():
+    try:
+        ensure_homepage_media_optimized()
+    except Exception as exc:
+        print(f"[{now_iso()}] homepage media optimize schedule failed: {exc!r}", flush=True)
     if not cards_api_enabled():
         print(f"[{now_iso()}] Cards API disabled; skipping cards cleanup loop.", flush=True)
         return

@@ -132,6 +132,26 @@ class HomepageSettingsTests(unittest.TestCase):
         )
         self.assertEqual(cleaned, "https://drive.google.com/uc?export=view&id=abc123")
 
+    def test_video_upload_remuxes_to_faststart_when_ffmpeg_available(self):
+        ffmpeg = homepage_settings._ffmpeg_exe()
+        if not ffmpeg:
+            self.skipTest("ffmpeg unavailable")
+        source = Path("/tmp/lobby-src.mp4")
+        if not source.is_file():
+            self.skipTest("sample lobby source missing")
+        self.assertFalse(homepage_settings._mp4_is_faststart(source))
+        with source.open("rb") as handle:
+            upload = self.client.post(
+                "/api/admin/homepage-media/upload",
+                data={"admin_secret": "test-admin-secret", "label": "lobby", "slot": "background_video_url"},
+                files={"file": ("lobby.mp4", handle, "video/mp4")},
+            )
+        self.assertEqual(upload.status_code, 200, upload.text)
+        asset = upload.json()["asset"]
+        self.assertTrue(asset.get("faststart"))
+        stored = Path(os.environ["HOMEPAGE_MEDIA_DIR"]) / asset["filename"]
+        self.assertTrue(homepage_settings._mp4_is_faststart(stored))
+
 
 if __name__ == "__main__":
     unittest.main()

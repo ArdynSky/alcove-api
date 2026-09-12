@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
+import shutil
+import subprocess
+import tempfile
 import threading
 import uuid
 from datetime import datetime, timezone
@@ -15,6 +19,8 @@ from pydantic import BaseModel, Field
 
 router = APIRouter(tags=["homepage"])
 _LOCK = threading.RLock()
+_LOG = logging.getLogger("alcove.homepage")
+_OPTIMIZE_STARTED = False
 
 TILE_KEYS = ("live_room", "profile", "connect", "archive")
 
@@ -274,6 +280,136 @@ def _media_type_for(path: Path) -> str:
     }.get(ext, "application/octet-stream")
 
 
+def _ffmpeg_exe() -> str | None:
+    found = shutil.which("ffmpeg")
+    if found:
+        return found
+    try:
+        import imageio_ffmpeg
+
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
+        return None
+
+
+def _mp4_is_faststart(path: Path) -> bool:
+    try:
+        with path.open("rb") as handle:
+            head = handle.read(262144)
+    except OSError:
+        return False
+    moov = head.find(b"moov")
+    mdat = head.find(b"mdat")
+    return moov >= 0 and (mdat < 0 or moov < mdat)
+
+
+def _remux_video_faststart(source: Path) -> Path:
+    """Rewrite MP4/M4V/WebM so metadata comes first (mobile WebView friendly).
+
+    Returns the path to use. On success this replaces ``source`` in place.
+    If ffmpeg is unavailable or remux fails, returns ``source`` unchanged.
+    """
+    ffmpeg = _ffmpeg_exe()
+    if not ffmpeg:
+        _LOG.warning("homepage media: ffmpeg unavailable; skipping faststart remux")
+        return source
+    if source.suffix.lower() == ".mp4" and _mp4_is_faststart(source):
+        return source
+
+    tmp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            prefix=f"{source.stem}-faststart-",
+            suffix=source.suffix.lower() or ".mp4",
+            dir=str(source.parent),
+            delete=False,
+        ) as tmp:
+            tmp_path = Path(tmp.name)
+        cmd = [
+            ffmpeg,
+            "-y",
+            "-i",
+            str(source),
+            "-c",
+            "copy",
+            "-movflags",
+            "+faststart",
+            str(tmp_path),
+        ]
+        result = subprocess.run(
+            cmd,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        if result.returncode != 0 or not tmp_path.is_file() or tmp_path.stat().st_size < 32:
+            detail = (result.stderr or result.stdout or "").strip().splitlines()
+            _LOG.warning(
+                "homepage media: faststart remux failed for %s (%s)",
+                source.name,
+                detail[-1] if detail else f"exit {result.returncode}",
+            )
+            if tmp_path and tmp_path.exists():
+                tmp_path.unlink(missing_ok=True)
+            return source
+        tmp_path.replace(source)
+        return source
+    except Exception as exc:
+        _LOG.warning("homepage media: faststart remux error for %s: %s", source.name, exc)
+        if tmp_path and tmp_path.exists():
+            tmp_path.unlink(missing_ok=True)
+        return source
+
+
+def optimize_homepage_media_videos() -> dict:
+    """Remux existing homepage videos that are missing faststart metadata."""
+    media_dir = _media_dir()
+    optimized: list[str] = []
+    skipped: list[str] = []
+    failed: list[str] = []
+    for path in sorted(media_dir.iterdir()):
+        if not path.is_file() or path.suffix.lower() not in VIDEO_EXTENSIONS:
+            continue
+        if path.suffix.lower() == ".mp4" and _mp4_is_faststart(path):
+            skipped.append(path.name)
+            continue
+        before = path.stat().st_size
+        result = _remux_video_faststart(path)
+        if result.is_file() and (
+            path.suffix.lower() != ".mp4" or _mp4_is_faststart(result) or result.stat().st_size != before
+        ):
+            # Treat successful rewrite or already-good output as optimized/skipped.
+            if path.suffix.lower() == ".mp4" and _mp4_is_faststart(result):
+                if path.name not in skipped:
+                    optimized.append(path.name)
+            else:
+                optimized.append(path.name)
+        else:
+            failed.append(path.name)
+    return {
+        "optimized": optimized,
+        "skipped": skipped,
+        "failed": failed,
+    }
+
+
+def ensure_homepage_media_optimized() -> None:
+    global _OPTIMIZE_STARTED
+    if _OPTIMIZE_STARTED:
+        return
+    _OPTIMIZE_STARTED = True
+
+    def _run() -> None:
+        try:
+            summary = optimize_homepage_media_videos()
+            _LOG.info("homepage media optimize: %s", summary)
+        except Exception as exc:
+            _LOG.warning("homepage media optimize failed: %s", exc)
+
+    threading.Thread(target=_run, name="homepage-media-optimize", daemon=True).start()
+
+
 class HomepageTileUpdate(BaseModel):
     preview_video_url: Optional[str] = ""
     preview_opacity: Optional[int] = DEFAULT_PREVIEW_OPACITY
@@ -357,6 +493,9 @@ async def upload_homepage_media(
     path = _media_dir() / filename
     with path.open("wb") as handle:
         handle.write(content)
+    if kind == "video":
+        path = _remux_video_faststart(path)
+        filename = path.name
     entry = {
         "id": uuid.uuid4().hex[:12],
         "filename": filename,
@@ -365,13 +504,26 @@ async def upload_homepage_media(
         "kind": kind,
         "url": _public_media_url(filename),
         "uploaded_at": datetime.now(timezone.utc).isoformat(),
-        "size_bytes": len(content),
+        "size_bytes": path.stat().st_size if path.is_file() else len(content),
+        "faststart": bool(
+            kind == "video"
+            and path.suffix.lower() == ".mp4"
+            and _mp4_is_faststart(path)
+        ),
     }
     return {"status": "ok", "asset": entry}
 
 
+@router.post("/api/admin/homepage-media/optimize")
+def optimize_homepage_media(admin_secret: str = Form(...)):
+    _admin(admin_secret)
+    summary = optimize_homepage_media_videos()
+    return {"status": "ok", **summary}
+
+
 @router.get("/api/homepage-media/{filename}")
 def get_homepage_media(filename: str):
+    ensure_homepage_media_optimized()
     path = _resolve_media_file(filename)
     return FileResponse(path, media_type=_media_type_for(path))
 
