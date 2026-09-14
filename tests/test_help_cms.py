@@ -1,0 +1,81 @@
+import importlib
+import os
+import tempfile
+import unittest
+
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+
+
+class HelpCmsTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        os.environ["HELP_CMS_DB_PATH"] = os.path.join(self.temp.name, "help.sqlite3")
+        os.environ["HELP_MEDIA_DIR"] = os.path.join(self.temp.name, "media")
+        os.environ["BOT_SYNC_SECRET"] = "test-secret"
+        from api import help_cms
+        self.help_cms = importlib.reload(help_cms)
+        app = FastAPI()
+        app.include_router(self.help_cms.router)
+        self.client = TestClient(app)
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def test_seed_preserves_legacy_telegram_menu_and_adds_app_roots(self):
+        telegram = self.client.get("/api/help", params={"destination": "telegram"}).json()
+        self.assertEqual(
+            [item["button_text"] for item in telegram["items"]],
+            ["🔵 ┃ Group Rules", "🟣 ┃ Message from Ardyn", "🟢 ┃ Mini App Guide", "🟠 ┃ F.A.Q.'s"],
+        )
+        app = self.client.get("/api/help", params={"destination": "app"}).json()
+        self.assertEqual([item["title"] for item in app["items"]], ["LIVE ROOM", "PROFILE", "CONNECT", "ARCHIVE"])
+
+    def test_draft_and_platform_visibility_are_filtered(self):
+        created = self.client.post("/api/admin/help/items", json={
+            "admin_secret": "test-secret", "internal_name": "Draft", "title": "DRAFT",
+            "button_text": "Draft", "type": "content", "status": "draft",
+            "show_in_app": True, "show_in_telegram": True,
+        })
+        self.assertEqual(created.status_code, 200, created.text)
+        for destination in ("app", "telegram"):
+            payload = self.client.get("/api/help", params={"destination": destination}).json()
+            self.assertNotIn("DRAFT", [item["title"] for item in payload["items"]])
+
+    def test_reparent_rejects_descendant_cycle(self):
+        def create(title, parent_id=None):
+            response = self.client.post("/api/admin/help/items", json={
+                "admin_secret": "test-secret", "internal_name": title, "title": title,
+                "button_text": title, "type": "container", "status": "published",
+                "show_in_app": True, "show_in_telegram": True, "parent_id": parent_id,
+            })
+            self.assertEqual(response.status_code, 200, response.text)
+            return response.json()["item"]
+        parent = create("Parent")
+        child = create("Child", parent["id"])
+        response = self.client.patch(f"/api/admin/help/items/{parent['id']}/position", json={
+            "admin_secret": "test-secret", "parent_id": child["id"], "sort_order": 0,
+        })
+        self.assertEqual(response.status_code, 400)
+
+    def test_launcher_media_settings_round_trip(self):
+        response = self.client.put("/api/admin/help/settings", json={
+            "admin_secret": "test-secret", "terminal_title": "F.O.X HELP TERMINAL",
+            "introduction": "How can I help today?", "default_back_wording": "BACK",
+            "default_home_wording": "HELP HOME", "default_button_style": "primary",
+            "published": True, "launcher_video_url": "/api/help/media/fox.mp4",
+            "launcher_fallback_image_url": "/api/help/media/fox.webp",
+        })
+        self.assertEqual(response.status_code, 200, response.text)
+        public = self.client.get("/api/help", params={"destination": "app"}).json()
+        self.assertEqual(public["settings"]["launcher_video_url"], "/api/help/media/fox.mp4")
+
+    def test_main_application_registers_help_routes(self):
+        from api import main
+        client = TestClient(main.app)
+        self.assertEqual(client.get("/api/help").status_code, 200)
+        self.assertEqual(client.get("/api/admin/help", params={"admin_secret": "wrong"}).status_code, 403)
+
+
+if __name__ == "__main__":
+    unittest.main()
