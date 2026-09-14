@@ -9,6 +9,7 @@ from fastapi.testclient import TestClient
 
 class HelpCmsTests(unittest.TestCase):
     def setUp(self):
+        self.previous_env = {key: os.environ.get(key) for key in ("HELP_CMS_DB_PATH", "HELP_MEDIA_DIR", "BOT_SYNC_SECRET")}
         self.temp = tempfile.TemporaryDirectory()
         os.environ["HELP_CMS_DB_PATH"] = os.path.join(self.temp.name, "help.sqlite3")
         os.environ["HELP_MEDIA_DIR"] = os.path.join(self.temp.name, "media")
@@ -21,6 +22,11 @@ class HelpCmsTests(unittest.TestCase):
 
     def tearDown(self):
         self.temp.cleanup()
+        for key, value in self.previous_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
 
     def test_seed_preserves_legacy_telegram_menu_and_adds_app_roots(self):
         telegram = self.client.get("/api/help", params={"destination": "telegram"}).json()
