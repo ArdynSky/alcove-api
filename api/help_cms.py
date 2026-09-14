@@ -147,6 +147,10 @@ class PositionPayload(BaseModel):
     sort_order: int = 0
 
 
+class AdminPayload(BaseModel):
+    admin_secret: str
+
+
 def _validate_parent(con, item_id, parent_id):
     if not parent_id:
         return
@@ -213,6 +217,51 @@ def move_item(item_id: str, payload: PositionPayload):
         con.execute("UPDATE help_items SET parent_id=?,sort_order=?,updated_at=? WHERE id=?",(payload.parent_id,max(0,payload.sort_order),_now(),item_id)); con.commit()
         row=con.execute("SELECT * FROM help_items WHERE id=?",(item_id,)).fetchone(); con.close()
     return {"item":_row(row)}
+
+
+@router.put("/admin/help/items/{item_id}")
+def update_item(item_id: str, payload: ItemPayload):
+    _admin(payload.admin_secret)
+    with _LOCK:
+        con = _conn()
+        if not con.execute("SELECT id FROM help_items WHERE id=?", (item_id,)).fetchone():
+            con.close(); raise HTTPException(404, "Help item not found")
+        _validate_parent(con, item_id, payload.parent_id)
+        data = payload.model_dump(exclude={"admin_secret"})
+        if data.pop("sort_order") is None:
+            data.pop("sort_order", None)
+        data["updated_at"] = _now()
+        con.execute("UPDATE help_items SET " + ",".join(f"{key}=?" for key in data) + " WHERE id=?", tuple(data.values()) + (item_id,))
+        con.commit(); row = con.execute("SELECT * FROM help_items WHERE id=?", (item_id,)).fetchone(); con.close()
+    return {"item": _row(row)}
+
+
+@router.post("/admin/help/items/{item_id}/duplicate")
+def duplicate_item(item_id: str, payload: AdminPayload):
+    _admin(payload.admin_secret)
+    with _LOCK:
+        con = _conn(); source = con.execute("SELECT * FROM help_items WHERE id=?", (item_id,)).fetchone()
+        if not source: con.close(); raise HTTPException(404, "Help item not found")
+        def copy_node(row, parent_id):
+            new_id = uuid.uuid4().hex[:16]; now = _now(); values = dict(row)
+            values.update(id=new_id, parent_id=parent_id, internal_name=values["internal_name"] + " — Copy", status="draft", legacy_key=None, created_at=now, updated_at=now)
+            keys = list(values); con.execute(f"INSERT INTO help_items({','.join(keys)}) VALUES({','.join('?' for _ in keys)})", tuple(values[k] for k in keys))
+            for child in con.execute("SELECT * FROM help_items WHERE parent_id=? ORDER BY sort_order", (row["id"],)).fetchall(): copy_node(child, new_id)
+            return new_id
+        new_id = copy_node(source, source["parent_id"]); con.commit(); row = con.execute("SELECT * FROM help_items WHERE id=?", (new_id,)).fetchone(); con.close()
+    return {"item": _row(row)}
+
+
+@router.delete("/admin/help/items/{item_id}")
+def delete_item(item_id: str, admin_secret: str):
+    _admin(admin_secret)
+    with _LOCK:
+        con = _conn()
+        if con.execute("SELECT 1 FROM help_items WHERE parent_id=? LIMIT 1", (item_id,)).fetchone():
+            con.close(); raise HTTPException(409, "Move or delete child items first")
+        changed = con.execute("DELETE FROM help_items WHERE id=?", (item_id,)).rowcount; con.commit(); con.close()
+    if not changed: raise HTTPException(404, "Help item not found")
+    return {"ok": True}
 
 
 @router.post("/admin/help/media")
