@@ -76,6 +76,19 @@ class HelpCmsTests(unittest.TestCase):
         self.assertEqual(client.get("/api/help").status_code, 200)
         self.assertEqual(client.get("/api/admin/help", params={"admin_secret": "wrong"}).status_code, 403)
 
+    def test_item_can_be_updated_duplicated_hidden_and_deleted(self):
+        created = self.client.post("/api/admin/help/items", json={
+            "admin_secret":"test-secret","type":"content","internal_name":"Guide","title":"GUIDE",
+            "button_text":"Guide","body":"Original","status":"published","show_in_app":True,"show_in_telegram":True,
+        }).json()["item"]
+        update = dict(created, admin_secret="test-secret", title="UPDATED", body="Changed")
+        update.pop("id"); update.pop("children", None); update.pop("legacy_key", None); update.pop("created_at", None); update.pop("updated_at", None)
+        self.assertEqual(self.client.put(f"/api/admin/help/items/{created['id']}", json=update).json()["item"]["title"], "UPDATED")
+        duplicate = self.client.post(f"/api/admin/help/items/{created['id']}/duplicate", json={"admin_secret":"test-secret"})
+        self.assertEqual(duplicate.status_code, 200, duplicate.text)
+        self.assertEqual(duplicate.json()["item"]["status"], "draft")
+        self.assertEqual(self.client.delete(f"/api/admin/help/items/{created['id']}", params={"admin_secret":"test-secret"}).status_code, 200)
+
 
 if __name__ == "__main__":
     unittest.main()
