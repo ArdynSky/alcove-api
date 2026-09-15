@@ -151,6 +151,16 @@ class HelpCmsTests(unittest.TestCase):
         })
         self.assertEqual(response.status_code, 422)
 
+    def test_telegram_root_settings_respect_caption_and_button_limits(self):
+        base = {
+            "admin_secret": "test-secret", "terminal_title": "F.O.X HELP TERMINAL",
+            "default_button_style": "primary", "default_back_wording": "BACK",
+            "default_home_wording": "HELP HOME", "published": True,
+        }
+        self.assertEqual(self.client.put("/api/admin/help/settings", json={**base, "introduction": "x" * 1001}).status_code, 422)
+        self.assertEqual(self.client.put("/api/admin/help/settings", json={**base, "default_back_wording": "🦊" * 33}).status_code, 422)
+        self.assertEqual(self.client.put("/api/admin/help/settings", json={**base, "default_home_wording": "x" * 65}).status_code, 422)
+
     def test_telegram_visible_items_respect_caption_and_button_limits(self):
         base = {
             "admin_secret": "test-secret", "internal_name": "Long", "title": "LONG",
