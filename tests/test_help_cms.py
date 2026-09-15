@@ -108,6 +108,28 @@ class HelpCmsTests(unittest.TestCase):
         })
         self.assertEqual(response.status_code, 400)
 
+    def test_editing_parent_places_item_at_end_and_renumbers_old_parent(self):
+        def create(title, item_type="container", parent_id=None):
+            response = self.client.post("/api/admin/help/items", json={
+                "admin_secret": "test-secret", "internal_name": title, "title": title,
+                "button_text": title, "type": item_type, "status": "published",
+                "show_in_app": True, "show_in_telegram": True, "parent_id": parent_id,
+            })
+            self.assertEqual(response.status_code, 200, response.text)
+            return response.json()["item"]
+        first_parent = create("FIRST")
+        second_parent = create("SECOND")
+        moving = create("MOVING", "content", first_parent["id"])
+        sibling = create("SIBLING", "content", second_parent["id"])
+        body = {key: value for key, value in moving.items() if key not in {"id", "children", "legacy_key", "created_at", "updated_at"}}
+        body.update(admin_secret="test-secret", parent_id=second_parent["id"], sort_order=None)
+        response = self.client.put(f"/api/admin/help/items/{moving['id']}", json=body)
+        self.assertEqual(response.status_code, 200, response.text)
+        admin = self.client.get("/api/admin/help", params={"admin_secret": "test-secret"}).json()
+        second = next(item for item in admin["items"] if item["id"] == second_parent["id"])
+        self.assertEqual([item["id"] for item in second["children"]], [sibling["id"], moving["id"]])
+        self.assertEqual([item["sort_order"] for item in second["children"]], [0, 1])
+
     def test_launcher_media_settings_round_trip(self):
         response = self.client.put("/api/admin/help/settings", json={
             "admin_secret": "test-secret", "terminal_title": "F.O.X HELP TERMINAL",
@@ -129,11 +151,26 @@ class HelpCmsTests(unittest.TestCase):
         })
         self.assertEqual(response.status_code, 422)
 
+    def test_telegram_visible_items_respect_caption_and_button_limits(self):
+        base = {
+            "admin_secret": "test-secret", "internal_name": "Long", "title": "LONG",
+            "button_text": "Guide", "type": "content", "status": "published",
+            "show_in_app": True, "show_in_telegram": True,
+        }
+        self.assertEqual(self.client.post("/api/admin/help/items", json={**base, "body": "x" * 1100}).status_code, 422)
+        self.assertEqual(self.client.post("/api/admin/help/items", json={**base, "button_text": "x" * 65}).status_code, 422)
+        app_only = self.client.post("/api/admin/help/items", json={**base, "body": "x" * 1100, "show_in_telegram": False})
+        self.assertEqual(app_only.status_code, 200, app_only.text)
+
     def test_main_application_registers_help_routes(self):
         from api import main
         client = TestClient(main.app)
         self.assertEqual(client.get("/api/help").status_code, 200)
         self.assertEqual(client.get("/api/admin/help", params={"admin_secret": "wrong"}).status_code, 403)
+
+    def test_admin_read_accepts_secret_header_without_query_string(self):
+        response = self.client.get("/api/admin/help", headers={"X-Admin-Secret": "test-secret"})
+        self.assertEqual(response.status_code, 200, response.text)
 
     def test_item_can_be_updated_duplicated_hidden_and_deleted(self):
         created = self.client.post("/api/admin/help/items", json={
