@@ -71,10 +71,19 @@ class HelpCmsTests(unittest.TestCase):
             "default_home_wording": "HELP HOME", "default_button_style": "primary",
             "published": True, "launcher_video_url": "/api/help/media/fox.mp4",
             "launcher_fallback_image_url": "/api/help/media/fox.webp",
+            "launcher_video_opacity": 75,
         })
         self.assertEqual(response.status_code, 200, response.text)
         public = self.client.get("/api/help", params={"destination": "app"}).json()
         self.assertEqual(public["settings"]["launcher_video_url"], "/api/help/media/fox.mp4")
+        self.assertEqual(public["settings"]["launcher_video_opacity"], 75)
+
+    def test_launcher_video_opacity_only_accepts_admin_options(self):
+        response = self.client.put("/api/admin/help/settings", json={
+            "admin_secret": "test-secret", "terminal_title": "F.O.X HELP TERMINAL",
+            "launcher_video_opacity": 40,
+        })
+        self.assertEqual(response.status_code, 422)
 
     def test_main_application_registers_help_routes(self):
         from api import main
