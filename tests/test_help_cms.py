@@ -159,6 +159,7 @@ class HelpCmsTests(unittest.TestCase):
         }
         self.assertEqual(self.client.post("/api/admin/help/items", json={**base, "body": "x" * 1100}).status_code, 422)
         self.assertEqual(self.client.post("/api/admin/help/items", json={**base, "button_text": "x" * 65}).status_code, 422)
+        self.assertEqual(self.client.post("/api/admin/help/items", json={**base, "button_text": "🦊" * 33}).status_code, 422)
         app_only = self.client.post("/api/admin/help/items", json={**base, "body": "x" * 1100, "show_in_telegram": False})
         self.assertEqual(app_only.status_code, 200, app_only.text)
 
