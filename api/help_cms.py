@@ -29,6 +29,148 @@ LEGACY_ITEMS = (
 )
 APP_ROOTS = ("LIVE ROOM", "PROFILE", "CONNECT", "ARCHIVE")
 
+APP_HELP_CONTENT_MIGRATION = "app-help-content-v1"
+APP_HELP_CONTENT = (
+    {
+        "id": "help-live-room-lobby", "parent_id": "app-live-room", "title": "LOBBY",
+        "subtitle": "Enter the Live Room, check the schedule and join the conversation.", "theme": "#38a9e8",
+        "tutorials": (
+            ("help-lobby-overview", "WHAT IS THE LIVE ROOM?", "What is the Live Room?", "The Live Room is The Alcove's space for scheduled video sessions, interactive activities and live community conversation. You can see what is happening now, check what is coming next and choose how you would like to take part."),
+            ("help-lobby-schedule", "VIEW THE SCHEDULE", "View the Schedule", "Open **View Schedule** to see upcoming sessions and the current activity. Completed activities may be marked as finished so you can quickly find what is happening next."),
+            ("help-lobby-join", "JOIN A LIVE SESSION", "Join a Live Session", "Open the Live Room from the homepage and follow the on-screen join controls. Camera and microphone permissions are controlled by your device, and participating on camera is always your choice."),
+            ("help-lobby-feed", "USE THE LIVE FEED", "Use the Live Feed", "Use the Live Feed to follow the room and contribute alongside the current activity. Keep messages relevant, give others space to join in and follow the host's guidance."),
+            ("help-lobby-rules", "LIVE ROOM RULES", "Live Room Rules", "Respect everyone in the room. Do not record or take screenshots without permission. Avoid disruptive noise or repeatedly speaking over others. Debate ideas rather than attacking people, and follow the host's instructions. Nudity, threatening behaviour and inappropriate material are not permitted."),
+        ),
+    },
+    {
+        "id": "help-live-room-debate", "parent_id": "app-live-room", "title": "DEBATE",
+        "subtitle": "Join structured debates, share your thoughts and cast your vote.", "theme": "#c76c5c",
+        "tutorials": (
+            ("help-debate-overview", "WHAT IS A DEBATE?", "What is a Debate?", "Debates are hosted Live Room activities where members explore different sides of a topic. The aim is thoughtful conversation, not personal conflict: challenge the idea, never the person."),
+            ("help-debate-join", "JOIN A DEBATE", "Join a Debate", "When a debate is open, use the participation control to register your interest. The host selects speakers and manages the speaking order so everyone gets a fair opportunity."),
+            ("help-debate-thought", "SUBMIT A THOUGHT", "Submit a Thought", "Use the Thoughts box to share a point during the debate. Once sent, the control confirms that your thought was submitted. If you edit the text, you can submit the updated version again."),
+            ("help-debate-vote", "VOTE IN A DEBATE", "Vote in a Debate", "When voting opens, choose the option that best reflects your view. Submit one considered vote and wait for the host to reveal the final result."),
+            ("help-debate-results", "VIEW THE RESULT", "View the Result", "The result is revealed after voting closes. The display shows the final community vote while the host brings the activity to a close."),
+        ),
+    },
+    {
+        "id": "help-live-room-drawing", "parent_id": "app-live-room", "title": "DRAWING CHALLENGE",
+        "subtitle": "Create, submit and vote in a community drawing challenge.", "theme": "#d68a3c",
+        "tutorials": (
+            ("help-drawing-overview", "WHAT IS A DRAWING CHALLENGE?", "What is a Drawing Challenge?", "Drawing Challenge is a light-hearted Live Room activity. Members respond to a shared prompt, submit their creation and enjoy the results together."),
+            ("help-drawing-join", "JOIN THE CHALLENGE", "Join the Challenge", "Join while registrations are open. The host will introduce the prompt, explain the round and start the activity when everyone is ready."),
+            ("help-drawing-submit", "SUBMIT YOUR DRAWING", "Submit Your Drawing", "Create your response to the current prompt and use the on-screen submission control before the round closes. Follow any format or time guidance shown by the host."),
+            ("help-drawing-vote", "VOTE FOR A DRAWING", "Vote for a Drawing", "When voting opens, review the eligible drawings and choose your favourite. Vote fairly and celebrate the effort behind every entry."),
+            ("help-drawing-results", "VIEW THE RESULTS", "View the Results", "After voting closes, the host reveals the results in the Live Room. Winning and participation activity may also contribute to your Alcove progress."),
+        ),
+    },
+    {
+        "id": "help-live-room-discussions", "parent_id": "app-live-room", "title": "DISCUSSIONS",
+        "subtitle": "Take part in guided conversations with other Alcove members.", "theme": "#6f86d8",
+        "tutorials": (
+            ("help-discussions-overview", "WHAT IS A DISCUSSION?", "What is a Discussion?", "Discussions are hosted conversations built around a subject or question. They are less competitive than debates and focus on sharing experiences, ideas and different perspectives."),
+            ("help-discussions-join", "JOIN A DISCUSSION", "Join a Discussion", "Enter the Live Room during a scheduled discussion and follow the host's guidance. Listen to others, avoid dominating the conversation and contribute when you feel comfortable."),
+            ("help-discussions-thought", "SHARE A THOUGHT", "Share a Thought", "Use the Thoughts box when it is available to contribute alongside the spoken discussion. Keep your message relevant, respectful and easy for the room to follow."),
+        ),
+    },
+    {
+        "id": "help-profile-exp", "parent_id": "app-profile", "title": "EXPERIENCE POINTS",
+        "subtitle": "Understand EXP, levels and how your participation is recognised.", "theme": "#4d9bd6",
+        "tutorials": (
+            ("help-exp-overview", "WHAT ARE EXPERIENCE POINTS?", "What are Experience Points?", "Experience Points, or **EXP**, recognise positive participation across The Alcove. Your EXP contributes to your Alcove level and unlocks rewards as you continue taking part."),
+            ("help-exp-earn", "EARN EXP", "Earn EXP", "Earn EXP by taking part in eligible Alcove activities, such as Live Room sessions, Pulse, Spotlight and other community features. The amount awarded depends on the activity."),
+            ("help-exp-summary", "DAILY EXP SUMMARY", "Daily EXP Summary", "Open **Daily EXP Summary** on your Profile to review the EXP recorded from your recent activity and see how it contributed to your progress."),
+            ("help-exp-levels", "LEVELS AND REWARDS", "Levels and Rewards", "Your Alcove level increases as your EXP grows. When a new level includes a reward, a present marked **NEW** appears on your Profile until you open it."),
+        ),
+    },
+    {
+        "id": "help-profile-reward-packs", "parent_id": "app-profile", "title": "REWARD PACKS",
+        "subtitle": "Open earned packs and discover new profile rewards.", "theme": "#d39a37",
+        "tutorials": (
+            ("help-rewards-overview", "WHAT ARE REWARD PACKS?", "What are Reward Packs?", "Reward Packs contain customisation items earned through your Alcove progress. Available rewards may include visual items that can be used across your Profile and experience."),
+            ("help-rewards-open", "OPEN A REWARD PACK", "Open a Reward Pack", "Open the reward area from your Profile and select an available pack. Follow the reveal to see what you have received; the item is then added to your available rewards."),
+            ("help-rewards-level-up", "CLAIM A LEVEL-UP REWARD", "Claim a Level-Up Reward", "When the **NEW** present appears on your Profile, open it to view the rewards waiting from your latest level. The indicator remains until the reward has been viewed."),
+            ("help-rewards-use", "USE YOUR REWARDS", "Use Your Rewards", "Open the relevant Profile customisation area, select an available reward and apply it. You can return later to change or remove equipped items."),
+        ),
+    },
+    {
+        "id": "help-profile-achievements", "parent_id": "app-profile", "title": "ACHIEVEMENTS",
+        "subtitle": "Track milestones and display completed achievements on your Profile.", "theme": "#8d71c9",
+        "tutorials": (
+            ("help-achievements-overview", "WHAT ARE ACHIEVEMENTS?", "What are Achievements?", "Achievements mark milestones reached through your activity in The Alcove. Some achievement families progress through one-star, two-star and three-star tiers."),
+            ("help-achievements-unlock", "UNLOCK ACHIEVEMENTS", "Unlock Achievements", "Complete the requirement shown on an achievement to unlock it. Progress updates as eligible activity is recorded, and a completion notice appears when a new achievement is earned."),
+            ("help-achievements-equip", "EQUIP AN ACHIEVEMENT", "Equip an Achievement", "Open **Achievements**, choose a completed achievement and select **EQUIP**. It will appear in one of the available achievement positions on your Profile. Select **UNEQUIP** to remove it."),
+            ("help-achievements-filter", "FILTER ACHIEVEMENTS", "Filter Achievements", "Use **All**, **In Progress** and **Completed** to quickly find the achievements you want to view or equip."),
+        ),
+    },
+    {
+        "id": "help-profile-customisation", "parent_id": "app-profile", "title": "CUSTOMISATION",
+        "subtitle": "Personalise your Profile and use the rewards you have unlocked.", "theme": "#55a994",
+        "tutorials": (
+            ("help-customisation-profile", "CUSTOMISE YOUR PROFILE", "Customise Your Profile", "Open your Profile to manage the personal and visual options currently available to you. Your changes are saved to your Alcove account."),
+            ("help-customisation-skins", "APPLY MESSAGE SKINS", "Apply Message Skins", "Choose an unlocked message skin from the relevant customisation control and apply it. The selected texture or design is then used across supported messages."),
+            ("help-customisation-equipped", "MANAGE EQUIPPED ITEMS", "Manage Equipped Items", "Review the items currently displayed on your Profile. Equip an available item to use it, or unequip it when you want to make space for something different."),
+        ),
+    },
+    {
+        "id": "help-connect-pulse", "parent_id": "app-connect", "title": "PULSE",
+        "subtitle": "Ask anonymous questions and respond using daily Pulse orbs.", "theme": "#39b977",
+        "tutorials": (
+            ("help-pulse-overview", "WHAT IS PULSE?", "What is Pulse?", "Pulse is The Alcove's anonymous question and reflection space. Members can submit thoughtful questions and use daily orbs to respond to questions from the community."),
+            ("help-pulse-submit", "SUBMIT A PULSE QUESTION", "Submit a Pulse Question", "Choose Mental, Physical or General, then write and submit your question. You can submit up to two questions per day. Questions are anonymous and require approval before they appear to members."),
+            ("help-pulse-answer", "ANSWER A QUESTION", "Answer a Question", "Choose an available community question and submit your response with an orb. You cannot answer your own question. Questions remain open for responses for their configured availability period."),
+            ("help-pulse-green", "GREEN ORBS", "Green Orbs", "Green orbs are used for your everyday Pulse answers. You begin with one available orb, with another becoming available every four hours until you have up to six. A maximum of six green orbs can be used each day."),
+            ("help-pulse-red", "RED PULSE", "Red Pulse", "Red Pulse is unlocked by the community reaching the daily green-answer target. To take part, you must also have answered at least one green Pulse question that day. When eligible, you can submit one Red Pulse response for that unlocked cycle."),
+        ),
+    },
+    {
+        "id": "help-connect-spotlight", "parent_id": "app-connect", "title": "SPOTLIGHT",
+        "subtitle": "Recognise the care, character and contributions of fellow members.", "theme": "#b986da",
+        "tutorials": (
+            ("help-spotlight-overview", "WHAT IS SPOTLIGHT?", "What is Spotlight?", "Spotlight is The Alcove's member-recognition feature. It gives you a thoughtful way to acknowledge people who have made a positive difference to the community."),
+            ("help-spotlight-nominate", "NOMINATE A MEMBER", "Nominate a Member", "Open Spotlight, choose an eligible member and select the award that best reflects what you want to recognise. Add any supporting message requested and confirm your nomination."),
+            ("help-spotlight-awards", "THE FOUR SPOTLIGHT AWARDS", "The Four Spotlight Awards", "Spotlight includes four forms of recognition: **Recognition**, **Appreciation**, **Respect** and **Support**. Choose the one that most closely matches the contribution you want to celebrate."),
+            ("help-spotlight-send", "SEND A SPOTLIGHT AWARD", "Send a Spotlight Award", "Review the member, award and message you selected, then submit it. F.O.X and the app will use the same Spotlight activity when displaying the result."),
+            ("help-spotlight-activity", "VIEW SPOTLIGHT ACTIVITY", "View Spotlight Activity", "Use Spotlight and the Archive to see relevant recognition activity, including awards that have been published or received."),
+        ),
+    },
+    {
+        "id": "help-connect-check-in", "parent_id": "app-connect", "title": "DAILY CHECK-IN",
+        "subtitle": "A quick space to pause and record how you are feeling.", "theme": "#5b9cb8",
+        "tutorials": (
+            ("help-check-in-overview", "WHAT IS DAILY CHECK-IN?", "What is Daily Check-In?", "Daily Check-In offers a quick, low-pressure moment to pause and record how you are feeling. It helps you reflect without needing to begin a longer conversation."),
+            ("help-check-in-complete", "COMPLETE A CHECK-IN", "Complete a Check-In", "Open **Daily Check-In** from Connect and follow the short on-screen prompts. Submit your response when you are ready, and only share what feels comfortable to you."),
+        ),
+    },
+    {
+        "id": "help-archive-pulse", "parent_id": "app-archive", "title": "PULSE HISTORY",
+        "subtitle": "Revisit previous Pulse questions, answers and activity.", "theme": "#3eaa7a",
+        "tutorials": (
+            ("help-pulse-history-overview", "WHAT IS PULSE HISTORY?", "What is Pulse History?", "Pulse History brings together the previous Pulse activity available to your account, making it easier to revisit questions and responses without returning to the active daily flow."),
+            ("help-pulse-history-find", "FIND PAST PULSE QUESTIONS", "Find Past Pulse Questions", "Open **Archive**, choose **Pulse History** and browse the available entries. Select an item to view the information retained for that question."),
+            ("help-pulse-history-yours", "VIEW YOUR PULSE ACTIVITY", "View Your Pulse Activity", "Use Pulse History to review the activity associated with your account, subject to Pulse's anonymity and privacy rules."),
+        ),
+    },
+    {
+        "id": "help-archive-spotlight", "parent_id": "app-archive", "title": "SPOTLIGHT HISTORY",
+        "subtitle": "Browse past recognition and awards recorded in The Alcove.", "theme": "#9470c2",
+        "tutorials": (
+            ("help-spotlight-history-overview", "WHAT IS SPOTLIGHT HISTORY?", "What is Spotlight History?", "Spotlight History provides an archive of eligible published recognition activity from across The Alcove."),
+            ("help-spotlight-history-browse", "BROWSE PAST RECOGNITION", "Browse Past Recognition", "Open **Archive**, select **Spotlight History** and use the available categories to browse previous Spotlight activity."),
+            ("help-spotlight-history-yours", "VIEW YOUR AWARDS", "View Your Awards", "Open your relevant Spotlight history to review awards associated with your account and the recognition shared by the community."),
+        ),
+    },
+    {
+        "id": "help-archive-live-room", "parent_id": "app-archive", "title": "LIVE ROOM HISTORY",
+        "subtitle": "Review previous sessions, activities and published results.", "theme": "#4b82bd",
+        "tutorials": (
+            ("help-live-history-overview", "WHAT IS LIVE ROOM HISTORY?", "What is Live Room History?", "Live Room History collects available records from previous sessions and activities so you can look back at what happened in The Alcove."),
+            ("help-live-history-sessions", "VIEW PAST SESSIONS", "View Past Sessions", "Open **Archive**, choose **Live Room History** and browse the available session records. Select a session to view its saved details."),
+            ("help-live-history-results", "REVIEW ACTIVITY RESULTS", "Review Activity Results", "Where results have been retained, select a past activity to review its outcome, such as a debate vote or Drawing Challenge result."),
+        ),
+    },
+)
+
 LEGACY_BODY = {
     "rules": "🌿 Welcome to The Alcove\n\nA calmer space for wellbeing, respect, and real conversation — seeing each other as whole people, not just profiles.\n\nBy joining, you agree to:\n\n**Group Rules**\nRespect all members. Harassment, hate speech, bullying, or intimidation may lead to removal.\n• No spam, adverts, promo posts, group links, or text-bombing. F.O.X will remove these.\n• No illegal, violent, or pornographic content. You are responsible for what you post.\n• Do not dox, expose, or share anyone's personal details.\n• Ardyn and F.O.X may remove content or members to keep the space safe.\n\n**Video Chat Rules**\n• Cameras and mics should be on where possible.\n• Let everyone speak. Don't dominate the conversation.\n• Take part; calls are interactive and inclusive.\n• Respect the host. Rudeness or disruption may result in being muted.\n\n💚 Have fun, be kind, and look after each other.",
     "ardyn": "Hey everyone, Ardyn Sky here.\n\nI created The Alcove because I wanted to build something different from the usual Telegram spaces — somewhere warmer, safer, more thoughtful, and more human.\n\nIt's a place where people can still laugh, flirt, be cheeky, and have fun, but where connection, care, and respect sit at the heart of everything.\n\nThe Alcove is for people who want to be seen as more than a profile picture, a body, or a quick message in a busy chat. It's about creating space for real conversation, honest questions, mutual support, and deeper connections.\n\nF.O.X is our little guardian, here to welcome new residents, protect the vibe, guide the space, and add a bit of whimsy along the way.\n\nThe Alcove is still growing, and it will continue to be shaped by the people who join it. My hope is that it becomes a place where people can show up as they are, feel they belong, and connect without pressure or judgement.",
@@ -54,6 +196,103 @@ def _media_dir() -> Path:
 
 def _now() -> str:
     return dt.datetime.now(dt.timezone.utc).isoformat()
+
+
+def _seed_app_help_content(con: sqlite3.Connection, now: str) -> None:
+    con.execute(
+        "CREATE TABLE IF NOT EXISTS help_content_migrations "
+        "(name TEXT PRIMARY KEY, applied_at TEXT NOT NULL)"
+    )
+    if con.execute(
+        "SELECT 1 FROM help_content_migrations WHERE name=?",
+        (APP_HELP_CONTENT_MIGRATION,),
+    ).fetchone():
+        return
+
+    def existing_id(
+        item_id: str,
+        parent_id: Optional[str],
+        internal_name: str,
+        item_type: str,
+        sort_order: int,
+    ) -> Optional[str]:
+        row = con.execute("SELECT id,parent_id,type FROM help_items WHERE id=?", (item_id,)).fetchone()
+        if row:
+            if row["parent_id"] != parent_id or row["type"] != item_type:
+                con.execute(
+                    "UPDATE help_items SET parent_id=?,type=?,sort_order=?,updated_at=? WHERE id=?",
+                    (parent_id, item_type, sort_order, now, row["id"]),
+                )
+            return row["id"]
+        row = con.execute(
+            "SELECT id,parent_id,type FROM help_items WHERE parent_id IS ? AND internal_name=? LIMIT 1",
+            (parent_id, internal_name),
+        ).fetchone()
+        if row and row["type"] != item_type:
+            con.execute(
+                "UPDATE help_items SET type=?,sort_order=?,updated_at=? WHERE id=?",
+                (item_type, sort_order, now, row["id"]),
+            )
+        return row["id"] if row else None
+
+    for root_order, title in enumerate(APP_ROOTS):
+        root_id = "app-" + title.lower().replace(" ", "-")
+        root = con.execute("SELECT id,parent_id,type FROM help_items WHERE id=?", (root_id,)).fetchone()
+        if not root:
+            con.execute(
+                "INSERT INTO help_items("
+                "id,parent_id,type,internal_name,title,button_text,sort_order,show_in_app,"
+                "show_in_telegram,status,created_at,updated_at"
+                ") VALUES(?,NULL,'container',?,?,?,?,1,0,'draft',?,?)",
+                (root_id, title, title, title, root_order, now, now),
+            )
+        elif root["parent_id"] is not None or root["type"] != "container":
+            con.execute(
+                "UPDATE help_items SET parent_id=NULL,type='container',updated_at=? WHERE id=?",
+                (now, root_id),
+            )
+
+    section_orders = {}
+    for section in APP_HELP_CONTENT:
+        section_order = section_orders.get(section["parent_id"], 0)
+        section_orders[section["parent_id"]] = section_order + 1
+        internal_name = section["title"].title()
+        section_id = existing_id(
+            section["id"], section["parent_id"], internal_name, "container", section_order
+        )
+        if not section_id:
+            section_id = section["id"]
+            con.execute(
+                "INSERT INTO help_items("
+                "id,parent_id,type,internal_name,title,button_text,subtitle,theme,sort_order,"
+                "show_in_app,show_in_telegram,status,created_at,updated_at"
+                ") VALUES(?,?, 'container',?,?,?,?,?,?,1,1,'draft',?,?)",
+                (
+                    section_id, section["parent_id"], internal_name, section["title"],
+                    section["title"].title(), section["subtitle"], section["theme"],
+                    section_order, now, now,
+                ),
+            )
+
+        for tutorial_order, (item_id, title, button_text, body) in enumerate(section["tutorials"]):
+            tutorial_name = f"{section['title'].title()} — {button_text}"
+            if existing_id(item_id, section_id, tutorial_name, "content", tutorial_order):
+                continue
+            con.execute(
+                "INSERT INTO help_items("
+                "id,parent_id,type,internal_name,title,button_text,body,sort_order,"
+                "show_in_app,show_in_telegram,status,created_at,updated_at"
+                ") VALUES(?,?, 'content',?,?,?,?,?,1,1,'draft',?,?)",
+                (
+                    item_id, section_id, tutorial_name, title, button_text, body,
+                    tutorial_order, now, now,
+                ),
+            )
+
+    con.execute(
+        "INSERT INTO help_content_migrations(name,applied_at) VALUES(?,?)",
+        (APP_HELP_CONTENT_MIGRATION, now),
+    )
 
 
 def _admin(secret: Optional[str]):
@@ -84,6 +323,7 @@ def _conn():
         for order, title in enumerate(APP_ROOTS):
             item_id = "app-" + title.lower().replace(" ", "-")
             con.execute("INSERT INTO help_items(id,parent_id,type,internal_name,title,button_text,sort_order,show_in_app,show_in_telegram,status,created_at,updated_at) VALUES(?,NULL,'container',?,?,?,?,1,0,'published',?,?)", (item_id,title,title,title,order,now,now))
+    _seed_app_help_content(con, now)
     con.commit()
     return con
 

@@ -38,6 +38,110 @@ class HelpCmsTests(unittest.TestCase):
         app = self.client.get("/api/help", params={"destination": "app"}).json()
         self.assertEqual([item["title"] for item in app["items"]], ["LIVE ROOM", "PROFILE", "CONNECT", "ARCHIVE"])
 
+    def test_seed_populates_draft_help_sections_without_exposing_them(self):
+        admin = self.client.get("/api/admin/help", params={"admin_secret": "test-secret"}).json()
+        roots = {item["title"]: item for item in admin["items"] if item["id"].startswith("app-")}
+
+        self.assertEqual(
+            [child["title"] for child in roots["LIVE ROOM"]["children"]],
+            ["LOBBY", "DEBATE", "DRAWING CHALLENGE", "DISCUSSIONS"],
+        )
+        self.assertEqual(
+            [child["title"] for child in roots["PROFILE"]["children"]],
+            ["EXPERIENCE POINTS", "REWARD PACKS", "ACHIEVEMENTS", "CUSTOMISATION"],
+        )
+        self.assertEqual(
+            [child["title"] for child in roots["CONNECT"]["children"]],
+            ["PULSE", "SPOTLIGHT", "DAILY CHECK-IN"],
+        )
+        self.assertEqual(
+            [child["title"] for child in roots["ARCHIVE"]["children"]],
+            ["PULSE HISTORY", "SPOTLIGHT HISTORY", "LIVE ROOM HISTORY"],
+        )
+        for root in roots.values():
+            self.assertEqual(
+                [child["sort_order"] for child in root["children"]],
+                list(range(len(root["children"]))),
+            )
+
+        seeded = [
+            item
+            for root in roots.values()
+            for section in root["children"]
+            for item in [section, *section["children"]]
+        ]
+        self.assertTrue(seeded)
+        self.assertTrue(all(item["status"] == "draft" for item in seeded))
+        self.assertTrue(all(item["media_url"] == "" for item in seeded))
+        self.assertTrue(all(item["skin_media_url"] == "" for item in seeded))
+        self.assertTrue(all(section["subtitle"] for root in roots.values() for section in root["children"]))
+        self.assertTrue(all(tutorial["body"] for root in roots.values() for section in root["children"] for tutorial in section["children"]))
+        self.assertEqual(sum(item["type"] == "container" for item in seeded), 14)
+        self.assertEqual(sum(item["type"] == "content" for item in seeded), 54)
+        con = self.help_cms._conn()
+        migration_count = con.execute(
+            "SELECT COUNT(*) FROM help_content_migrations WHERE name='app-help-content-v1'"
+        ).fetchone()[0]
+        con.close()
+        self.assertEqual(migration_count, 1)
+
+        public = self.client.get("/api/help", params={"destination": "app"}).json()
+        self.assertTrue(all(not root["children"] for root in public["items"] if root["id"].startswith("app-")))
+
+    def test_help_content_seed_is_idempotent_and_preserves_admin_edits(self):
+        def flatten(items):
+            return [item for row in items for item in [row, *flatten(row["children"])]]
+
+        first = self.client.get("/api/admin/help", params={"admin_secret": "test-secret"}).json()
+        first_items = flatten(first["items"])
+        pulse = next(
+            child
+            for root in first["items"]
+            for child in root["children"]
+            if child["id"] == "help-connect-pulse"
+        )
+        update = {
+            key: value
+            for key, value in pulse.items()
+            if key not in {"id", "children", "legacy_key", "created_at", "updated_at"}
+        }
+        update.update(admin_secret="test-secret", subtitle="Ardyn's edited Pulse summary")
+        response = self.client.put(f"/api/admin/help/items/{pulse['id']}", json=update)
+        self.assertEqual(response.status_code, 200, response.text)
+
+        self.help_cms._conn().close()
+        second = self.client.get("/api/admin/help", params={"admin_secret": "test-secret"}).json()
+        second_items = flatten(second["items"])
+        edited_pulse = next(
+            child
+            for root in second["items"]
+            for child in root["children"]
+            if child["id"] == "help-connect-pulse"
+        )
+        self.assertEqual(len(second_items), len(first_items))
+        self.assertEqual(edited_pulse["subtitle"], "Ardyn's edited Pulse summary")
+
+    def test_existing_database_seed_repairs_missing_or_invalid_structural_roots(self):
+        con = self.help_cms._conn()
+        con.execute("DELETE FROM help_content_migrations WHERE name='app-help-content-v1'")
+        con.execute("DELETE FROM help_items WHERE parent_id IN (SELECT id FROM help_items WHERE parent_id='app-profile')")
+        con.execute("DELETE FROM help_items WHERE parent_id='app-profile'")
+        con.execute("DELETE FROM help_items WHERE id='app-profile'")
+        con.execute("UPDATE help_items SET type='content',parent_id='app-live-room',subtitle='Keep this edit' WHERE id='app-connect'")
+        con.execute("UPDATE help_items SET type='content',parent_id='app-live-room' WHERE id='help-connect-pulse'")
+        con.commit()
+        con.close()
+
+        self.help_cms._conn().close()
+        admin = self.client.get("/api/admin/help", params={"admin_secret": "test-secret"}).json()
+        roots = {item["id"]: item for item in admin["items"]}
+        self.assertEqual(roots["app-profile"]["type"], "container")
+        self.assertEqual(roots["app-profile"]["status"], "draft")
+        self.assertEqual(roots["app-connect"]["type"], "container")
+        self.assertEqual(roots["app-connect"]["subtitle"], "Keep this edit")
+        pulse = next(child for child in roots["app-connect"]["children"] if child["id"] == "help-connect-pulse")
+        self.assertEqual(pulse["type"], "container")
+
     def test_draft_and_platform_visibility_are_filtered(self):
         created = self.client.post("/api/admin/help/items", json={
             "admin_secret": "test-secret", "internal_name": "Draft", "title": "DRAFT",
