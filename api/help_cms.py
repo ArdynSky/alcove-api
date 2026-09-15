@@ -69,11 +69,14 @@ def _conn():
     con = sqlite3.connect(path)
     con.row_factory = sqlite3.Row
     con.execute("PRAGMA foreign_keys=ON")
-    con.execute("CREATE TABLE IF NOT EXISTS help_settings (id INTEGER PRIMARY KEY CHECK(id=1), terminal_title TEXT NOT NULL, introduction TEXT NOT NULL, default_button_style TEXT NOT NULL, default_back_wording TEXT NOT NULL, default_home_wording TEXT NOT NULL, published INTEGER NOT NULL, root_media_url TEXT NOT NULL, launcher_video_url TEXT NOT NULL, launcher_fallback_image_url TEXT NOT NULL, updated_at TEXT NOT NULL)")
+    con.execute("CREATE TABLE IF NOT EXISTS help_settings (id INTEGER PRIMARY KEY CHECK(id=1), terminal_title TEXT NOT NULL, introduction TEXT NOT NULL, default_button_style TEXT NOT NULL, default_back_wording TEXT NOT NULL, default_home_wording TEXT NOT NULL, published INTEGER NOT NULL, root_media_url TEXT NOT NULL, launcher_video_url TEXT NOT NULL, launcher_fallback_image_url TEXT NOT NULL, launcher_video_opacity INTEGER NOT NULL DEFAULT 50, updated_at TEXT NOT NULL)")
+    settings_columns = {row[1] for row in con.execute("PRAGMA table_info(help_settings)")}
+    if "launcher_video_opacity" not in settings_columns:
+        con.execute("ALTER TABLE help_settings ADD COLUMN launcher_video_opacity INTEGER NOT NULL DEFAULT 50")
     con.execute("CREATE TABLE IF NOT EXISTS help_items (id TEXT PRIMARY KEY, parent_id TEXT REFERENCES help_items(id) ON DELETE RESTRICT, type TEXT NOT NULL CHECK(type IN ('container','content')), internal_name TEXT NOT NULL, title TEXT NOT NULL, button_text TEXT NOT NULL, subtitle TEXT NOT NULL DEFAULT '', body TEXT NOT NULL DEFAULT '', media_type TEXT NOT NULL DEFAULT 'none', media_url TEXT NOT NULL DEFAULT '', skin_media_url TEXT NOT NULL DEFAULT '', image_position TEXT NOT NULL DEFAULT '50% 0%', overlay_strength INTEGER NOT NULL DEFAULT 45, title_color TEXT NOT NULL DEFAULT '#ffffff', theme TEXT NOT NULL DEFAULT '', sort_order INTEGER NOT NULL DEFAULT 0, show_in_app INTEGER NOT NULL DEFAULT 1, show_in_telegram INTEGER NOT NULL DEFAULT 1, show_back INTEGER NOT NULL DEFAULT 1, show_home INTEGER NOT NULL DEFAULT 1, status TEXT NOT NULL DEFAULT 'draft' CHECK(status IN ('draft','published','hidden')), legacy_key TEXT UNIQUE, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)")
     con.execute("CREATE TABLE IF NOT EXISTS help_telegram_media_cache (media_url TEXT NOT NULL, bot_identity TEXT NOT NULL, source_sha256 TEXT NOT NULL, telegram_file_id TEXT NOT NULL, updated_at TEXT NOT NULL, PRIMARY KEY(media_url,bot_identity))")
     now = _now()
-    con.execute("INSERT OR IGNORE INTO help_settings VALUES(1,?,?,?,?,?,?,?,?,?,?)", ("F.O.X HELP TERMINAL", "Thank you for accessing the terminal.\nHow can I help today?", "primary", "↩ ┃ Back to menu", "HELP HOME", 1, "assets/help_terminal_banner.png", "", "", now))
+    con.execute("INSERT OR IGNORE INTO help_settings(id,terminal_title,introduction,default_button_style,default_back_wording,default_home_wording,published,root_media_url,launcher_video_url,launcher_fallback_image_url,launcher_video_opacity,updated_at) VALUES(1,?,?,?,?,?,?,?,?,?,?,?)", ("F.O.X HELP TERMINAL", "Thank you for accessing the terminal.\nHow can I help today?", "primary", "↩ ┃ Back to menu", "HELP HOME", 1, "assets/help_terminal_banner.png", "", "", 50, now))
     count = con.execute("SELECT COUNT(*) FROM help_items").fetchone()[0]
     if count == 0:
         for order, (item_id, name, title, button, key, media) in enumerate(LEGACY_ITEMS):
@@ -115,6 +118,7 @@ class SettingsPayload(BaseModel):
     root_media_url: str = ""
     launcher_video_url: str = ""
     launcher_fallback_image_url: str = ""
+    launcher_video_opacity: Literal[25, 50, 75] = 50
 
 
 class ItemPayload(BaseModel):
