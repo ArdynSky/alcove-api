@@ -76,7 +76,7 @@ def _conn():
     con.execute("CREATE TABLE IF NOT EXISTS help_items (id TEXT PRIMARY KEY, parent_id TEXT REFERENCES help_items(id) ON DELETE RESTRICT, type TEXT NOT NULL CHECK(type IN ('container','content')), internal_name TEXT NOT NULL, title TEXT NOT NULL, button_text TEXT NOT NULL, subtitle TEXT NOT NULL DEFAULT '', body TEXT NOT NULL DEFAULT '', media_type TEXT NOT NULL DEFAULT 'none', media_url TEXT NOT NULL DEFAULT '', skin_media_url TEXT NOT NULL DEFAULT '', image_position TEXT NOT NULL DEFAULT '50% 0%', overlay_strength INTEGER NOT NULL DEFAULT 45, title_color TEXT NOT NULL DEFAULT '#ffffff', theme TEXT NOT NULL DEFAULT '', sort_order INTEGER NOT NULL DEFAULT 0, show_in_app INTEGER NOT NULL DEFAULT 1, show_in_telegram INTEGER NOT NULL DEFAULT 1, show_back INTEGER NOT NULL DEFAULT 1, show_home INTEGER NOT NULL DEFAULT 1, status TEXT NOT NULL DEFAULT 'draft' CHECK(status IN ('draft','published','hidden')), legacy_key TEXT UNIQUE, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)")
     con.execute("CREATE TABLE IF NOT EXISTS help_telegram_media_cache (media_url TEXT NOT NULL, bot_identity TEXT NOT NULL, source_sha256 TEXT NOT NULL, telegram_file_id TEXT NOT NULL, updated_at TEXT NOT NULL, PRIMARY KEY(media_url,bot_identity))")
     now = _now()
-    con.execute("INSERT OR IGNORE INTO help_settings(id,terminal_title,introduction,default_button_style,default_back_wording,default_home_wording,published,root_media_url,launcher_video_url,launcher_fallback_image_url,launcher_video_opacity,updated_at) VALUES(1,?,?,?,?,?,?,?,?,?,?,?)", ("F.O.X HELP TERMINAL", "Thank you for accessing the terminal.\nHow can I help today?", "primary", "↩ ┃ Back to menu", "HELP HOME", 1, "assets/help_terminal_banner.png", "", "", 50, now))
+    con.execute("INSERT OR IGNORE INTO help_settings(id,terminal_title,introduction,default_button_style,default_back_wording,default_home_wording,published,root_media_url,launcher_video_url,launcher_fallback_image_url,launcher_video_opacity,updated_at) VALUES(1,?,?,?,?,?,?,?,?,?,?,?)", ("F.O.X HELP TERMINAL", "_Thank you for accessing the terminal._\n**How can I help today?**", "primary", "↩ ┃ Back to menu", "HELP HOME", 1, "assets/help_terminal_banner.png", "", "", 50, now))
     count = con.execute("SELECT COUNT(*) FROM help_items").fetchone()[0]
     if count == 0:
         for order, (item_id, name, title, button, key, media) in enumerate(LEGACY_ITEMS):
@@ -105,6 +105,19 @@ def _tree(rows):
         parent = by_id.get(item["parent_id"])
         (parent["children"] if parent else roots).append(item)
     return roots
+
+
+def _visible_tree(items, destination):
+    visibility_key = "show_in_app" if destination == "app" else "show_in_telegram"
+
+    def keep(item):
+        if item["status"] != "published" or not item[visibility_key]:
+            return None
+        visible = dict(item)
+        visible["children"] = [child for child in (keep(child) for child in item["children"]) if child]
+        return visible
+
+    return [item for item in (keep(item) for item in items) if item]
 
 
 class SettingsPayload(BaseModel):
@@ -173,11 +186,10 @@ def public_help(destination: Literal["app", "telegram"] = "app"):
     with _LOCK:
         con = _conn()
         settings = dict(con.execute("SELECT * FROM help_settings WHERE id=1").fetchone())
-        column = "show_in_app" if destination == "app" else "show_in_telegram"
-        rows = con.execute(f"SELECT * FROM help_items WHERE status='published' AND {column}=1 ORDER BY parent_id,sort_order,created_at").fetchall()
+        rows = con.execute("SELECT * FROM help_items ORDER BY parent_id,sort_order,created_at").fetchall()
         con.close()
     settings["published"] = bool(settings["published"])
-    return {"settings": settings, "items": _tree(rows) if settings["published"] else []}
+    return {"settings": settings, "items": _visible_tree(_tree(rows), destination) if settings["published"] else []}
 
 
 @router.get("/admin/help")
@@ -215,10 +227,31 @@ def create_item(payload: ItemPayload):
 def move_item(item_id: str, payload: PositionPayload):
     _admin(payload.admin_secret)
     with _LOCK:
-        con=_conn(); current=con.execute("SELECT id FROM help_items WHERE id=?",(item_id,)).fetchone()
+        con=_conn(); current=con.execute("SELECT id,parent_id FROM help_items WHERE id=?",(item_id,)).fetchone()
         if not current: con.close(); raise HTTPException(404,"Help item not found")
         _validate_parent(con,item_id,payload.parent_id)
-        con.execute("UPDATE help_items SET parent_id=?,sort_order=?,updated_at=? WHERE id=?",(payload.parent_id,max(0,payload.sort_order),_now(),item_id)); con.commit()
+        old_parent_id = current["parent_id"]
+        if old_parent_id != payload.parent_id:
+            old_siblings = con.execute(
+                "SELECT id FROM help_items WHERE parent_id IS ? AND id<>? ORDER BY sort_order,created_at",
+                (old_parent_id, item_id),
+            ).fetchall()
+            for order, sibling in enumerate(old_siblings):
+                con.execute("UPDATE help_items SET sort_order=? WHERE id=?", (order, sibling["id"]))
+        siblings = con.execute(
+            "SELECT id FROM help_items WHERE parent_id IS ? AND id<>? ORDER BY sort_order,created_at",
+            (payload.parent_id, item_id),
+        ).fetchall()
+        target_order = min(max(0, payload.sort_order), len(siblings))
+        ordered_ids = [sibling["id"] for sibling in siblings]
+        ordered_ids.insert(target_order, item_id)
+        now = _now()
+        for order, sibling_id in enumerate(ordered_ids):
+            con.execute(
+                "UPDATE help_items SET parent_id=?,sort_order=?,updated_at=? WHERE id=?",
+                (payload.parent_id, order, now, sibling_id),
+            )
+        con.commit()
         row=con.execute("SELECT * FROM help_items WHERE id=?",(item_id,)).fetchone(); con.close()
     return {"item":_row(row)}
 
