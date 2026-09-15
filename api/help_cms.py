@@ -10,9 +10,9 @@ import uuid
 from pathlib import Path
 from typing import Literal, Optional
 
-from fastapi import APIRouter, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, File, Form, Header, HTTPException, UploadFile
 from fastapi.responses import FileResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, model_validator
 
 router = APIRouter(prefix="/api", tags=["help"])
 _LOCK = threading.RLock()
@@ -157,6 +157,19 @@ class ItemPayload(BaseModel):
     show_home: bool = True
     status: Literal["draft", "published", "hidden"] = "draft"
 
+    @model_validator(mode="after")
+    def validate_telegram_limits(self):
+        if not self.show_in_telegram:
+            return self
+        if len(self.button_text) > 64:
+            raise ValueError("Telegram button text must be 64 characters or fewer")
+        caption_length = len(self.body)
+        if not self.internal_name.startswith("legacy-"):
+            caption_length += len(self.title) + len(self.subtitle) + 4
+        if caption_length > 1000:
+            raise ValueError("Telegram Help captions must be 1000 characters or fewer")
+        return self
+
 
 class PositionPayload(BaseModel):
     admin_secret: str
@@ -181,6 +194,38 @@ def _validate_parent(con, item_id, parent_id):
         cursor = con.execute("SELECT id,parent_id,type FROM help_items WHERE id=?", (cursor["parent_id"],)).fetchone() if cursor["parent_id"] else None
 
 
+def _renumber_parent(con, parent_id, excluded_id=None):
+    if excluded_id:
+        rows = con.execute(
+            "SELECT id FROM help_items WHERE parent_id IS ? AND id<>? ORDER BY sort_order,created_at",
+            (parent_id, excluded_id),
+        ).fetchall()
+    else:
+        rows = con.execute(
+            "SELECT id FROM help_items WHERE parent_id IS ? ORDER BY sort_order,created_at",
+            (parent_id,),
+        ).fetchall()
+    for order, row in enumerate(rows):
+        con.execute("UPDATE help_items SET sort_order=? WHERE id=?", (order, row["id"]))
+    return [row["id"] for row in rows]
+
+
+def _place_item(con, item_id, parent_id, target_order):
+    current = con.execute("SELECT parent_id FROM help_items WHERE id=?", (item_id,)).fetchone()
+    old_parent_id = current["parent_id"]
+    if old_parent_id != parent_id:
+        _renumber_parent(con, old_parent_id, item_id)
+    ordered_ids = _renumber_parent(con, parent_id, item_id)
+    target_order = min(max(0, int(target_order)), len(ordered_ids))
+    ordered_ids.insert(target_order, item_id)
+    now = _now()
+    for order, sibling_id in enumerate(ordered_ids):
+        con.execute(
+            "UPDATE help_items SET parent_id=?,sort_order=?,updated_at=? WHERE id=?",
+            (parent_id, order, now, sibling_id),
+        )
+
+
 @router.get("/help")
 def public_help(destination: Literal["app", "telegram"] = "app"):
     with _LOCK:
@@ -193,8 +238,8 @@ def public_help(destination: Literal["app", "telegram"] = "app"):
 
 
 @router.get("/admin/help")
-def admin_help(admin_secret: str):
-    _admin(admin_secret)
+def admin_help(admin_secret: Optional[str] = None, x_admin_secret: Optional[str] = Header(None)):
+    _admin(x_admin_secret or admin_secret)
     with _LOCK:
         con = _conn(); settings = dict(con.execute("SELECT * FROM help_settings WHERE id=1").fetchone())
         rows = con.execute("SELECT * FROM help_items ORDER BY parent_id,sort_order,created_at").fetchall(); con.close()
@@ -230,27 +275,7 @@ def move_item(item_id: str, payload: PositionPayload):
         con=_conn(); current=con.execute("SELECT id,parent_id FROM help_items WHERE id=?",(item_id,)).fetchone()
         if not current: con.close(); raise HTTPException(404,"Help item not found")
         _validate_parent(con,item_id,payload.parent_id)
-        old_parent_id = current["parent_id"]
-        if old_parent_id != payload.parent_id:
-            old_siblings = con.execute(
-                "SELECT id FROM help_items WHERE parent_id IS ? AND id<>? ORDER BY sort_order,created_at",
-                (old_parent_id, item_id),
-            ).fetchall()
-            for order, sibling in enumerate(old_siblings):
-                con.execute("UPDATE help_items SET sort_order=? WHERE id=?", (order, sibling["id"]))
-        siblings = con.execute(
-            "SELECT id FROM help_items WHERE parent_id IS ? AND id<>? ORDER BY sort_order,created_at",
-            (payload.parent_id, item_id),
-        ).fetchall()
-        target_order = min(max(0, payload.sort_order), len(siblings))
-        ordered_ids = [sibling["id"] for sibling in siblings]
-        ordered_ids.insert(target_order, item_id)
-        now = _now()
-        for order, sibling_id in enumerate(ordered_ids):
-            con.execute(
-                "UPDATE help_items SET parent_id=?,sort_order=?,updated_at=? WHERE id=?",
-                (payload.parent_id, order, now, sibling_id),
-            )
+        _place_item(con, item_id, payload.parent_id, payload.sort_order)
         con.commit()
         row=con.execute("SELECT * FROM help_items WHERE id=?",(item_id,)).fetchone(); con.close()
     return {"item":_row(row)}
@@ -261,14 +286,20 @@ def update_item(item_id: str, payload: ItemPayload):
     _admin(payload.admin_secret)
     with _LOCK:
         con = _conn()
-        if not con.execute("SELECT id FROM help_items WHERE id=?", (item_id,)).fetchone():
+        current = con.execute("SELECT id,parent_id,sort_order FROM help_items WHERE id=?", (item_id,)).fetchone()
+        if not current:
             con.close(); raise HTTPException(404, "Help item not found")
         _validate_parent(con, item_id, payload.parent_id)
         data = payload.model_dump(exclude={"admin_secret"})
-        if data.pop("sort_order") is None:
-            data.pop("sort_order", None)
+        requested_order = data.pop("sort_order")
+        requested_parent = data.pop("parent_id")
         data["updated_at"] = _now()
         con.execute("UPDATE help_items SET " + ",".join(f"{key}=?" for key in data) + " WHERE id=?", tuple(data.values()) + (item_id,))
+        if requested_parent != current["parent_id"]:
+            destination_count = con.execute("SELECT COUNT(*) FROM help_items WHERE parent_id IS ? AND id<>?", (requested_parent, item_id)).fetchone()[0]
+            _place_item(con, item_id, requested_parent, destination_count if requested_order is None else requested_order)
+        elif requested_order is not None:
+            _place_item(con, item_id, requested_parent, requested_order)
         con.commit(); row = con.execute("SELECT * FROM help_items WHERE id=?", (item_id,)).fetchone(); con.close()
     return {"item": _row(row)}
 
@@ -285,13 +316,15 @@ def duplicate_item(item_id: str, payload: AdminPayload):
             keys = list(values); con.execute(f"INSERT INTO help_items({','.join(keys)}) VALUES({','.join('?' for _ in keys)})", tuple(values[k] for k in keys))
             for child in con.execute("SELECT * FROM help_items WHERE parent_id=? ORDER BY sort_order", (row["id"],)).fetchall(): copy_node(child, new_id)
             return new_id
-        new_id = copy_node(source, source["parent_id"]); con.commit(); row = con.execute("SELECT * FROM help_items WHERE id=?", (new_id,)).fetchone(); con.close()
+        new_id = copy_node(source, source["parent_id"])
+        _place_item(con, new_id, source["parent_id"], source["sort_order"] + 1)
+        con.commit(); row = con.execute("SELECT * FROM help_items WHERE id=?", (new_id,)).fetchone(); con.close()
     return {"item": _row(row)}
 
 
 @router.delete("/admin/help/items/{item_id}")
-def delete_item(item_id: str, admin_secret: str):
-    _admin(admin_secret)
+def delete_item(item_id: str, admin_secret: Optional[str] = None, x_admin_secret: Optional[str] = Header(None)):
+    _admin(x_admin_secret or admin_secret)
     with _LOCK:
         con = _conn()
         if con.execute("SELECT 1 FROM help_items WHERE parent_id=? LIMIT 1", (item_id,)).fetchone():
@@ -302,8 +335,8 @@ def delete_item(item_id: str, admin_secret: str):
 
 
 @router.post("/admin/help/media")
-async def upload_media(admin_secret: str = Form(...), file: UploadFile = File(...)):
-    _admin(admin_secret); original=Path(file.filename or "help-media"); ext=original.suffix.lower()
+async def upload_media(admin_secret: Optional[str] = Form(None), file: UploadFile = File(...), x_admin_secret: Optional[str] = Header(None)):
+    _admin(x_admin_secret or admin_secret); original=Path(file.filename or "help-media"); ext=original.suffix.lower()
     if ext not in IMAGE_EXTENSIONS | VIDEO_EXTENSIONS: raise HTTPException(400,"Use PNG, JPEG, WebP, GIF, or MP4 media")
     limit=VIDEO_MAX_BYTES if ext in VIDEO_EXTENSIONS else IMAGE_MAX_BYTES
     stem=re.sub(r"[^a-zA-Z0-9_-]+","-",original.stem).strip("-")[:50] or "help"
