@@ -161,11 +161,12 @@ class ItemPayload(BaseModel):
     def validate_telegram_limits(self):
         if not self.show_in_telegram:
             return self
-        if len(self.button_text) > 64:
+        telegram_units = lambda value: len(str(value).encode("utf-16-le")) // 2
+        if telegram_units(self.button_text) > 64:
             raise ValueError("Telegram button text must be 64 characters or fewer")
-        caption_length = len(self.body)
+        caption_length = telegram_units(self.body)
         if not self.internal_name.startswith("legacy-"):
-            caption_length += len(self.title) + len(self.subtitle) + 4
+            caption_length += telegram_units(self.title) + telegram_units(self.subtitle) + 4
         if caption_length > 1000:
             raise ValueError("Telegram Help captions must be 1000 characters or fewer")
         return self
