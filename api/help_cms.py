@@ -133,6 +133,15 @@ class SettingsPayload(BaseModel):
     launcher_fallback_image_url: str = ""
     launcher_video_opacity: Literal[25, 50, 75] = 50
 
+    @model_validator(mode="after")
+    def validate_telegram_limits(self):
+        telegram_units = lambda value: len(str(value).encode("utf-16-le")) // 2
+        if telegram_units(self.introduction) > 1000:
+            raise ValueError("Telegram Help introduction must be 1000 characters or fewer")
+        if telegram_units(self.default_back_wording) > 64 or telegram_units(self.default_home_wording) > 64:
+            raise ValueError("Telegram Help navigation labels must be 64 characters or fewer")
+        return self
+
 
 class ItemPayload(BaseModel):
     admin_secret: str
