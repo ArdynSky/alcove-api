@@ -4755,6 +4755,7 @@ def ensure_fox_read_tables(conn):
             first_name TEXT,
             last_name TEXT,
             display_name TEXT,
+            joined_at TEXT,
             first_seen TEXT,
             last_seen TEXT,
             verified_at TEXT,
@@ -4762,6 +4763,11 @@ def ensure_fox_read_tables(conn):
         )
         """
     )
+    profile_columns = {
+        str(row[1]) for row in conn.execute("PRAGMA table_info(user_profiles)")
+    }
+    if "joined_at" not in profile_columns:
+        conn.execute("ALTER TABLE user_profiles ADD COLUMN joined_at TEXT")
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS verified_users (
@@ -4952,6 +4958,7 @@ def get_verified_alcove_users():
             p.user_id,
             COALESCE(p.username, '') AS username,
             COALESCE(p.display_name, '') AS display_name,
+            COALESCE(p.joined_at, '') AS joined_at,
             COALESCE(p.first_name, '') AS first_name,
             COALESCE(p.last_name, '') AS last_name,
             COALESCE(p.first_seen, '') AS first_seen,
@@ -4999,6 +5006,7 @@ def get_verified_alcove_users():
                 "username": username,
                 "display_name": display_name,
                 "label": f"@{username}" if username else display_name,
+                "joined_at": row.get("joined_at") or None,
                 "first_seen": row.get("first_seen") or None,
                 "last_seen": row.get("last_seen") or None,
                 "verified_at": row.get("verified_at") or None,
