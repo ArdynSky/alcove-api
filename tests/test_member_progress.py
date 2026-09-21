@@ -1,6 +1,10 @@
 import os
+import sqlite3
 import tempfile
+import threading
 import unittest
+from concurrent.futures import ThreadPoolExecutor
+from unittest import mock
 
 _temp_dir = tempfile.TemporaryDirectory()
 os.environ.setdefault("ALCOVE_STATE_DB_PATH", os.path.join(_temp_dir.name, "state.db"))
@@ -34,6 +38,13 @@ class MemberProgressTests(unittest.TestCase):
     def tearDown(self):
         member_progress.resolve_telegram_user = self._orig_resolve
         main.BOT_SYNC_SECRET = self._orig_secret
+
+    def put_profile(self, **profile):
+        return self.client.put(
+            "/api/members/profile",
+            headers={"X-Telegram-Init-Data": "member-init"},
+            json={"profile": profile},
+        ).json()["profile"]
 
     def test_empty_profile_then_put_and_get(self):
         missing = self.client.get("/api/members/profile", headers={"X-Telegram-Init-Data": "member-init"})
@@ -92,6 +103,44 @@ class MemberProgressTests(unittest.TestCase):
         self.assertEqual(sorted(merged["owned"]["feedColors"]), ["base", "gold", "rose"])
         self.assertEqual(merged["owned"]["feedSkins"], ["pulse"])
         self.assertEqual(merged["feed"]["color"], "rose")
+
+    def test_concurrent_saves_preserve_both_progression_updates(self):
+        with mock.patch.object(main, "find_verified_alcove_user", return_value=None):
+            member_progress.save_profile(
+                "4242",
+                {"owned": {"feedColors": ["base"]}},
+            )
+
+            real_load = member_progress.load_profile
+            both_reads_complete = threading.Barrier(2)
+
+            def synchronized_load(user_id):
+                result = real_load(user_id)
+                both_reads_complete.wait(timeout=5)
+                return result
+
+            with mock.patch.object(
+                member_progress,
+                "load_profile",
+                side_effect=synchronized_load,
+            ):
+                with ThreadPoolExecutor(max_workers=2) as pool:
+                    futures = [
+                        pool.submit(
+                            member_progress.save_profile,
+                            "4242",
+                            {"owned": {"feedColors": [colour]}},
+                        )
+                        for colour in ("gold", "rose")
+                    ]
+                    for future in futures:
+                        future.result()
+
+            stored = member_progress.load_profile("4242")
+            self.assertCountEqual(
+                stored["owned"]["feedColors"],
+                ["base", "gold", "rose"],
+            )
 
     def test_admin_can_read_and_write_any_user(self):
         written = self.client.put(
@@ -311,6 +360,128 @@ class MemberProgressTests(unittest.TestCase):
         self.assertEqual(continued["stats"]["loginStreak"], 30)
         self.assertEqual(continued["stats"]["loginDays"], 30)
 
+    def test_server_joined_at_overrides_legacy_profile(self):
+        with mock.patch.object(
+            main,
+            "find_verified_alcove_user",
+            return_value={
+                "user_id": 4242,
+                "joined_at": "2025-11-03T20:15:00+00:00",
+                "first_seen": "2026-06-30T00:00:00+00:00",
+                "verified_at": "2026-07-01T00:00:00+00:00",
+            },
+        ):
+            saved = self.put_profile(memberSince="June 30 2026", level=1)
+
+        self.assertEqual(saved["memberSince"], "2025-11-03T20:15:00+00:00")
+
+    def test_client_cannot_spoof_member_since(self):
+        with mock.patch.object(
+            main,
+            "find_verified_alcove_user",
+            return_value={
+                "user_id": 4242,
+                "joined_at": "2025-11-03T20:15:00+00:00",
+            },
+        ):
+            saved = self.put_profile(memberSince="2040-01-01T00:00:00+00:00")
+
+        self.assertEqual(saved["memberSince"], "2025-11-03T20:15:00+00:00")
+
+    def test_legacy_placeholder_becomes_empty_without_evidence(self):
+        with mock.patch.object(main, "find_verified_alcove_user", return_value=None):
+            saved = self.put_profile(memberSince="June 30 2026")
+
+        self.assertEqual(saved["memberSince"], "")
+
+    def test_member_since_resolver_uses_fallback_order(self):
+        cases = (
+            (
+                {
+                    "joined_at": "2025-11-03T20:15:00Z",
+                    "first_seen": "2026-01-01T00:00:00Z",
+                    "verified_at": "2026-02-01T00:00:00Z",
+                },
+                "2025-11-03T20:15:00+00:00",
+            ),
+            (
+                {
+                    "joined_at": "",
+                    "first_seen": "2026-01-01T00:00:00Z",
+                    "verified_at": "2026-02-01T00:00:00Z",
+                },
+                "2026-01-01T00:00:00+00:00",
+            ),
+            (
+                {
+                    "joined_at": "bad",
+                    "first_seen": "",
+                    "verified_at": "2026-02-01T00:00:00Z",
+                },
+                "2026-02-01T00:00:00+00:00",
+            ),
+        )
+        for user, expected in cases:
+            with self.subTest(user=user), mock.patch.object(
+                main, "find_verified_alcove_user", return_value=user
+            ):
+                self.assertEqual(member_progress.resolve_member_since("4242"), expected)
+
+    def test_invalid_member_since_is_rejected(self):
+        self.assertEqual(member_progress.canonical_member_since("not-a-date"), "")
+        self.assertEqual(member_progress.canonical_member_since("June 30 2026"), "")
+
+    def test_non_numeric_public_profile_id_remains_a_safe_miss(self):
+        response = self.client.get(
+            "/api/members/public-profile", params={"user_id": "not-a-user"}
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(response.json()["found"])
+
+    def test_fox_fallback_schema_migrates_joined_at(self):
+        with sqlite3.connect(":memory:") as con:
+            con.execute(
+                "CREATE TABLE user_profiles "
+                "(user_id INTEGER PRIMARY KEY, first_seen TEXT, verified_at TEXT)"
+            )
+
+            main.ensure_fox_read_tables(con)
+
+            columns = {
+                row[1] for row in con.execute("PRAGMA table_info(user_profiles)")
+            }
+        self.assertIn("joined_at", columns)
+
+    def test_existing_valid_member_since_survives_roster_outage(self):
+        with mock.patch.object(
+            main,
+            "find_verified_alcove_user",
+            return_value={"joined_at": "2025-11-03T20:15:00+00:00"},
+        ):
+            self.put_profile(level=2)
+
+        with mock.patch.object(main, "find_verified_alcove_user", return_value=None):
+            saved = self.put_profile(
+                memberSince="2040-01-01T00:00:00+00:00",
+                level=3,
+            )
+
+        self.assertEqual(saved["memberSince"], "2025-11-03T20:15:00+00:00")
+
+    def test_public_profile_uses_the_same_server_date(self):
+        with mock.patch.object(
+            main,
+            "find_verified_alcove_user",
+            return_value={"user_id": 4242, "joined_at": "2025-11-03T20:15:00+00:00"},
+        ):
+            self.put_profile(level=2)
+            card = self.client.get(
+                "/api/members/public-profile", params={"user_id": "4242"}
+            ).json()
+
+        self.assertEqual(card["profile"]["memberSince"], "2025-11-03T20:15:00+00:00")
+
     def test_public_profile_returns_safe_card(self):
         missing = self.client.get("/api/members/public-profile", params={"user_id": "9999"})
         self.assertEqual(missing.status_code, 200)
@@ -318,33 +489,40 @@ class MemberProgressTests(unittest.TestCase):
         self.assertIsNone(missing.json()["profile"])
         self.assertEqual(missing.json()["equipped_achievements"], [])
 
-        saved = self.client.put(
-            "/api/members/profile",
-            json={
-                "init_data": "member-init",
-                "profile": {
-                    "level": 7,
-                    "memberSince": "2026-01-15T00:00:00+00:00",
-                    "title": "Pulse",
-                    "feed": {"color": "gold", "skin": "foxlove"},
-                    "equippedAchievements": [
-                        {
-                            "key": "first-pulse",
-                            "name": "First Pulse",
-                            "description": "Submit your first pulse question",
-                            "image": "assets/icons/pulse.png",
-                        }
-                    ],
-                    "pendingRewards": [{"id": "secret"}],
-                    "claimReceipts": {"x": 1},
-                    "updated_at": "2026-08-30T12:00:00+00:00",
+        with mock.patch.object(
+            main,
+            "find_verified_alcove_user",
+            return_value={"joined_at": "2026-01-15T00:00:00+00:00"},
+        ):
+            saved = self.client.put(
+                "/api/members/profile",
+                json={
+                    "init_data": "member-init",
+                    "profile": {
+                        "level": 7,
+                        "memberSince": "2040-01-01T00:00:00+00:00",
+                        "title": "Pulse",
+                        "feed": {"color": "gold", "skin": "foxlove"},
+                        "equippedAchievements": [
+                            {
+                                "key": "first-pulse",
+                                "name": "First Pulse",
+                                "description": "Submit your first pulse question",
+                                "image": "assets/icons/pulse.png",
+                            }
+                        ],
+                        "pendingRewards": [{"id": "secret"}],
+                        "claimReceipts": {"x": 1},
+                        "updated_at": "2026-08-30T12:00:00+00:00",
+                    },
                 },
-            },
-        )
+            )
+            card = self.client.get(
+                "/api/members/public-profile", params={"user_id": "4242"}
+            ).json()
+
         self.assertEqual(saved.status_code, 200)
         self.assertEqual(saved.json()["profile"]["equippedAchievements"][0]["name"], "First Pulse")
-
-        card = self.client.get("/api/members/public-profile", params={"user_id": "4242"}).json()
         self.assertTrue(card["found"])
         self.assertEqual(card["profile"]["level"], 7)
         self.assertEqual(card["profile"]["memberSince"], "2026-01-15T00:00:00+00:00")

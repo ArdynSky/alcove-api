@@ -30,6 +30,14 @@ OWNED_LIST_KEYS = (
 SPOTLIGHT_COLOURS = ("purple", "blue", "green", "gold")
 _DAY_KEY = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 _RESET_TOKEN_MS = re.compile(r"(\d{13,})")
+LEGACY_MEMBER_SINCE = {
+    "june 30 2026",
+    "30 june 2026",
+    "2026-06-30",
+    "2026-06-30t00:00:00+00:00",
+    "2026-06-30t00:00:00.000z",
+    "2026-06-30t00:00:00z",
+}
 
 
 def _db_path() -> Path:
@@ -81,6 +89,30 @@ def _parse_ts(value: Any) -> float:
         return datetime.datetime.fromisoformat(raw.replace("Z", "+00:00")).timestamp()
     except ValueError:
         return 0.0
+
+
+def canonical_member_since(value: Any) -> str:
+    raw = str(value or "").strip()
+    if not raw or raw.lower() in LEGACY_MEMBER_SINCE:
+        return ""
+    try:
+        parsed = datetime.datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return ""
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=datetime.timezone.utc)
+    return parsed.isoformat()
+
+
+def resolve_member_since(user_id: str) -> str:
+    from . import main
+
+    user = main.find_verified_alcove_user(user_id=int(user_id))
+    for key in ("joined_at", "first_seen", "verified_at"):
+        value = canonical_member_since((user or {}).get(key))
+        if value:
+            return value
+    return ""
 
 
 def _reset_token_ms(token: Any) -> int:
@@ -235,7 +267,7 @@ def normalize_profile(raw: Any) -> dict:
         "stats": clean_stats,
         "loginDayLast": _day_key(data.get("loginDayLast")),
         "redPulseActivationLast": _day_key(data.get("redPulseActivationLast")),
-        "memberSince": str(data.get("memberSince") or "")[:80],
+        "memberSince": canonical_member_since(data.get("memberSince")),
         "equippedAchievements": _public_equipped(data.get("equippedAchievements") or data.get("equipped_achievements")),
     }
 
@@ -323,35 +355,54 @@ def merge_profiles(base: dict | None, incoming: dict | None) -> dict:
     return normalize_profile(merged)
 
 
-def load_profile(user_id: str) -> dict | None:
-    key = str(user_id or "").strip()
-    if not key:
-        return None
-    with _LOCK:
-        with _conn() as con:
-            row = con.execute(
-                "SELECT payload_json FROM member_progress WHERE user_id = ?",
-                (key,),
-            ).fetchone()
+def _load_stored_profile(key: str) -> dict | None:
+    """Read a profile while the caller holds ``_LOCK``."""
+    with _conn() as con:
+        row = con.execute(
+            "SELECT payload_json FROM member_progress WHERE user_id = ?",
+            (key,),
+        ).fetchone()
     if not row or not row[0]:
         return None
     try:
         payload = json.loads(row[0])
     except (TypeError, json.JSONDecodeError):
         return None
-    return normalize_profile(payload) if isinstance(payload, dict) else None
+    if not isinstance(payload, dict):
+        return None
+    return normalize_profile(payload)
+
+
+def load_profile(user_id: str) -> dict | None:
+    key = str(user_id or "").strip()
+    if not key:
+        return None
+    with _LOCK:
+        profile = _load_stored_profile(key)
+    if profile is None:
+        return None
+    profile["memberSince"] = (
+        resolve_member_since(key) or canonical_member_since(profile.get("memberSince"))
+    )
+    return profile
 
 
 def save_profile(user_id: str, incoming: dict, *, replace: bool = False) -> dict:
     key = str(user_id or "").strip()
     if not key:
         raise HTTPException(status_code=400, detail="Missing Telegram user id")
+    authoritative_member_since = resolve_member_since(key)
     payload = normalize_profile(incoming)
     if not payload.get("updated_at"):
         payload["updated_at"] = _now()
     with _LOCK:
-        current = None if replace else load_profile(key)
+        current = _load_stored_profile(key)
+        preserved_member_since = canonical_member_since(
+            (current or {}).get("memberSince")
+        )
+        payload["memberSince"] = authoritative_member_since or preserved_member_since
         merged = payload if replace or current is None else merge_profiles(current, payload)
+        merged["memberSince"] = authoritative_member_since or preserved_member_since
         if not merged.get("updated_at"):
             merged["updated_at"] = _now()
         serialized = json.dumps(merged, separators=(",", ":"), ensure_ascii=False)
