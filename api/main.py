@@ -401,29 +401,63 @@ def env_int(name: str, default: int, minimum: int, maximum: int) -> int:
     return max(minimum, min(value, maximum))
 
 
-MAX_NOTIFICATION_FEED = env_int("ALCOVE_MAX_NOTIFICATION_FEED", 250, 50, 2000)
-MAX_APPROVED_COMMENTS = env_int("ALCOVE_MAX_APPROVED_COMMENTS", 500, 50, 4000)
-MAX_PENDING_COMMENTS = env_int("ALCOVE_MAX_PENDING_COMMENTS", 200, 20, 2000)
-MAX_VIDEO_REVIEWS = env_int("ALCOVE_MAX_VIDEO_REVIEWS", 2000, 100, 10000)
-MAX_SPOTLIGHT_ENTRIES = env_int("ALCOVE_MAX_SPOTLIGHT_ENTRIES", 1500, 100, 10000)
-MAX_PULSE_ENTRIES = env_int("ALCOVE_MAX_PULSE_ENTRIES", 5000, 500, 20000)
-MAX_PULSE_RECEIPTS = env_int("ALCOVE_MAX_PULSE_RECEIPTS", 5000, 500, 20000)
-MAX_PULSE_RED_ACTIVATIONS = env_int("ALCOVE_MAX_PULSE_RED_ACTIVATIONS", 3000, 200, 20000)
-MAX_PULSE_QUESTION_SUGGESTIONS = env_int("ALCOVE_MAX_PULSE_QUESTION_SUGGESTIONS", 2000, 100, 10000)
-MAX_PULSE_DAILY_SUMMARY_POSTS = env_int("ALCOVE_MAX_PULSE_DAILY_SUMMARY_POSTS", 1000, 100, 5000)
-MAX_PULSE_DISABLED_QUESTIONS = env_int("ALCOVE_MAX_PULSE_DISABLED_QUESTIONS", 1000, 100, 5000)
-MAX_MINIAPP_VERIFICATIONS = env_int("ALCOVE_MAX_MINIAPP_VERIFICATIONS", 2000, 100, 10000)
-MAX_WHEEL_REACTION_HISTORY = env_int("ALCOVE_MAX_WHEEL_REACTION_HISTORY", 2000, 100, 10000)
-MAX_WHEEL_REVIEW_HISTORY = env_int("ALCOVE_MAX_WHEEL_REVIEW_HISTORY", 2000, 100, 10000)
-MAX_ARCHIVED_WHEEL_ENTRIES = env_int("ALCOVE_MAX_ARCHIVED_WHEEL_ENTRIES", 80, 20, 400)
+def lean_default(lean_value: int, full_value: int) -> int:
+    """Prefer tighter defaults on Render when LEAN_MODE=1."""
+    return lean_value if LEAN_MODE else full_value
+
+
+MAX_NOTIFICATION_FEED = env_int("ALCOVE_MAX_NOTIFICATION_FEED", lean_default(120, 250), 50, 2000)
+MAX_APPROVED_COMMENTS = env_int("ALCOVE_MAX_APPROVED_COMMENTS", lean_default(200, 500), 50, 4000)
+MAX_PENDING_COMMENTS = env_int("ALCOVE_MAX_PENDING_COMMENTS", lean_default(100, 200), 20, 2000)
+MAX_VIDEO_REVIEWS = env_int("ALCOVE_MAX_VIDEO_REVIEWS", lean_default(500, 2000), 100, 10000)
+MAX_SPOTLIGHT_ENTRIES = env_int("ALCOVE_MAX_SPOTLIGHT_ENTRIES", lean_default(400, 1500), 100, 10000)
+MAX_PULSE_ENTRIES = env_int("ALCOVE_MAX_PULSE_ENTRIES", lean_default(1200, 5000), 200, 20000)
+MAX_PULSE_RECEIPTS = env_int("ALCOVE_MAX_PULSE_RECEIPTS", lean_default(1200, 5000), 200, 20000)
+MAX_PULSE_RED_ACTIVATIONS = env_int("ALCOVE_MAX_PULSE_RED_ACTIVATIONS", lean_default(600, 3000), 100, 20000)
+MAX_PULSE_QUESTION_SUGGESTIONS = env_int("ALCOVE_MAX_PULSE_QUESTION_SUGGESTIONS", lean_default(400, 2000), 100, 10000)
+MAX_PULSE_DAILY_SUMMARY_POSTS = env_int("ALCOVE_MAX_PULSE_DAILY_SUMMARY_POSTS", lean_default(200, 1000), 50, 5000)
+MAX_PULSE_DISABLED_QUESTIONS = env_int("ALCOVE_MAX_PULSE_DISABLED_QUESTIONS", lean_default(200, 1000), 50, 5000)
+MAX_MINIAPP_VERIFICATIONS = env_int("ALCOVE_MAX_MINIAPP_VERIFICATIONS", lean_default(400, 2000), 100, 10000)
+MAX_WHEEL_REACTION_HISTORY = env_int("ALCOVE_MAX_WHEEL_REACTION_HISTORY", lean_default(300, 2000), 50, 10000)
+MAX_WHEEL_REVIEW_HISTORY = env_int("ALCOVE_MAX_WHEEL_REVIEW_HISTORY", lean_default(300, 2000), 50, 10000)
+MAX_ARCHIVED_WHEEL_ENTRIES = env_int("ALCOVE_MAX_ARCHIVED_WHEEL_ENTRIES", lean_default(40, 80), 20, 400)
+MAX_PULSE_UNLOCK_NOTIFICATIONS = env_int("ALCOVE_MAX_PULSE_UNLOCK_NOTIFICATIONS", lean_default(150, 400), 20, 5000)
+MAX_PULSE_REVIEW_NOTIFICATIONS = env_int("ALCOVE_MAX_PULSE_REVIEW_NOTIFICATIONS", lean_default(150, 400), 20, 5000)
+MAX_ASMR_ENTRIES = env_int("ALCOVE_MAX_ASMR_ENTRIES", lean_default(100, 300), 20, 2000)
+MAX_STORY_ENTRIES = env_int("ALCOVE_MAX_STORY_ENTRIES", lean_default(100, 300), 20, 2000)
+MAX_WHEEL_ENTRIES = env_int("ALCOVE_MAX_WHEEL_ENTRIES", lean_default(250, 800), 50, 5000)
 LIVE_VIEW_COMMENT_LIMIT = env_int("ALCOVE_LIVE_VIEW_COMMENT_LIMIT", 40, 10, 120)
 LIVE_ROOM_PERSIST_DEBOUNCE_S = float(os.getenv("ALCOVE_LIVE_ROOM_PERSIST_DEBOUNCE_S", "0.75") or 0.75)
+RUNTIME_PERSIST_DEBOUNCE_S = float(
+    os.getenv(
+        "ALCOVE_RUNTIME_PERSIST_DEBOUNCE_S",
+        "2.0" if LEAN_MODE else "0.75",
+    )
+    or (2.0 if LEAN_MODE else 0.75)
+)
 
 _persist_live_room_lock = threading.Lock()
 _persist_live_room_timer: threading.Timer | None = None
+_persist_runtime_lock = threading.Lock()
+_persist_runtime_timer: threading.Timer | None = None
 
 _last_saved_runtime_fingerprint: str | None = None
 _last_pulse_prune_day: str | None = None
+SYNCED_USER_KEEP_KEYS = (
+    "user_id",
+    "username",
+    "display_name",
+    "label",
+    "joined_at",
+    "first_seen",
+    "last_seen",
+    "verified_at",
+    "source",
+    "message_count",
+    "link_attempts",
+    "tone_flags",
+    "active_strikes",
+)
 
 state = {
     "current_round": 1,
@@ -510,6 +544,43 @@ def trim_list_in_place(items: list, limit: int) -> None:
         del items[:overflow]
 
 
+def prune_notification_queue(items: list, limit: int) -> int:
+    """Keep unsent notifications, then a small newest completed tail, within limit."""
+    before = len(items)
+    if limit <= 0:
+        items.clear()
+        return before
+    pending = [item for item in items if not item.get("notified_at")]
+    done = [item for item in items if item.get("notified_at")]
+    keep_done = max(20, min(80, limit // 3))
+    kept_done = done[-keep_done:]
+    combined = pending + kept_done
+    if len(combined) > limit:
+        if len(pending) >= limit:
+            combined = pending[-limit:]
+        else:
+            combined = pending + kept_done[-(limit - len(pending)) :]
+    items[:] = combined
+    return before - len(items)
+
+
+def slim_synced_user(user: dict) -> dict:
+    if not isinstance(user, dict):
+        return {}
+    if not lean_mode_enabled():
+        return user
+    slim = {key: user.get(key) for key in SYNCED_USER_KEEP_KEYS}
+    if slim.get("user_id") is None and user.get("id") is not None:
+        slim["user_id"] = user.get("id")
+    return slim
+
+
+def slim_synced_users(users: list) -> list:
+    if not lean_mode_enabled():
+        return users
+    return [slim_synced_user(user) for user in users if isinstance(user, dict)]
+
+
 def trim_runtime_state_collections() -> None:
     trim_list_in_place(spotlight_entries, MAX_SPOTLIGHT_ENTRIES)
     trim_list_in_place(pulse_entries, MAX_PULSE_ENTRIES)
@@ -526,6 +597,11 @@ def trim_runtime_state_collections() -> None:
     trim_list_in_place(pending_comments, MAX_PENDING_COMMENTS)
     trim_list_in_place(video_reviews, MAX_VIDEO_REVIEWS)
     trim_list_in_place(archived_wheel_entries, MAX_ARCHIVED_WHEEL_ENTRIES)
+    trim_list_in_place(asmr_entries, MAX_ASMR_ENTRIES)
+    trim_list_in_place(story_entries, MAX_STORY_ENTRIES)
+    trim_list_in_place(wheel_entries, MAX_WHEEL_ENTRIES)
+    prune_notification_queue(pulse_red_unlock_notifications, MAX_PULSE_UNLOCK_NOTIFICATIONS)
+    prune_notification_queue(pulse_question_review_notifications, MAX_PULSE_REVIEW_NOTIFICATIONS)
 
 
 def ensure_state_store() -> None:
@@ -579,7 +655,9 @@ def apply_runtime_payload(payload: dict) -> None:
         wheel_review_history = payload.get("wheel_review_history") if isinstance(payload.get("wheel_review_history"), list) else []
         wheel_user_engagement = payload.get("wheel_user_engagement") if isinstance(payload.get("wheel_user_engagement"), dict) else {}
         synced_alcove_analytics = payload.get("synced_alcove_analytics") if isinstance(payload.get("synced_alcove_analytics"), dict) else {}
-    synced_alcove_users = payload.get("synced_alcove_users") if isinstance(payload.get("synced_alcove_users"), list) else []
+    synced_alcove_users = slim_synced_users(
+        payload.get("synced_alcove_users") if isinstance(payload.get("synced_alcove_users"), list) else []
+    )
     last_bot_sync_at = payload.get("last_bot_sync_at") if isinstance(payload.get("last_bot_sync_at"), str) else None
     admin_jobs = payload.get("admin_jobs") if isinstance(payload.get("admin_jobs"), dict) else {}
 
@@ -612,9 +690,11 @@ def load_runtime_state_from_db() -> dict | None:
     return payload
 
 
-def save_runtime_state_to_db(payload: dict) -> None:
+def save_runtime_state_to_db(payload: dict, serialized: str | None = None) -> None:
     ensure_state_store()
-    serialized = json.dumps(payload, separators=(",", ":"), sort_keys=True)
+    payload_json = serialized if serialized is not None else json.dumps(
+        payload, separators=(",", ":"), sort_keys=True
+    )
     with sqlite3.connect(STATE_DB_PATH) as conn:
         conn.execute(
             """
@@ -624,7 +704,7 @@ def save_runtime_state_to_db(payload: dict) -> None:
                 payload_json = excluded.payload_json,
                 updated_at = excluded.updated_at
             """,
-            ("alcove_runtime", serialized, datetime.datetime.utcnow().isoformat()),
+            ("alcove_runtime", payload_json, datetime.datetime.utcnow().isoformat()),
         )
         conn.commit()
 
@@ -2038,28 +2118,57 @@ def ensure_cards_api_enabled():
         raise HTTPException(status_code=503, detail="Cards is temporarily disabled.")
 
 
-def save_runtime_state(force: bool = False) -> bool:
+def _flush_runtime_state(force: bool = False) -> bool:
+    """Serialize runtime state once, fingerprint with sha256, write DB + JSON file."""
     global _last_saved_runtime_fingerprint
 
     trim_runtime_state_collections()
     prune_stats = prune_pulse_runtime_data()
     payload = runtime_state_payload()
-    fingerprint = json.dumps(payload, separators=(",", ":"), sort_keys=True)
+    serialized = json.dumps(payload, separators=(",", ":"), sort_keys=True)
+    fingerprint = hashlib.sha256(serialized.encode("utf-8")).hexdigest()
     data_changed = any(prune_stats.values())
     if not force and not data_changed and fingerprint == _last_saved_runtime_fingerprint:
         return False
 
-    save_runtime_state_to_db(payload)
+    save_runtime_state_to_db(payload, serialized=serialized)
 
     directory = os.path.dirname(RUNTIME_STATE_PATH)
     if directory:
         os.makedirs(directory, exist_ok=True)
     temp_path = f"{RUNTIME_STATE_PATH}.tmp"
     with open(temp_path, "w", encoding="utf-8") as handle:
-        json.dump(payload, handle, separators=(",", ":"), sort_keys=True)
+        handle.write(serialized)
     os.replace(temp_path, RUNTIME_STATE_PATH)
 
     _last_saved_runtime_fingerprint = fingerprint
+    return True
+
+
+def save_runtime_state(force: bool = False) -> bool:
+    """Persist runtime state. Non-force calls are debounced to cut Render RAM spikes."""
+    global _persist_runtime_timer
+
+    if force or RUNTIME_PERSIST_DEBOUNCE_S <= 0:
+        with _persist_runtime_lock:
+            if _persist_runtime_timer is not None:
+                _persist_runtime_timer.cancel()
+                _persist_runtime_timer = None
+        return _flush_runtime_state(force=True)
+
+    with _persist_runtime_lock:
+        if _persist_runtime_timer is not None:
+            _persist_runtime_timer.cancel()
+
+        def flush():
+            global _persist_runtime_timer
+            with _persist_runtime_lock:
+                _persist_runtime_timer = None
+            _flush_runtime_state(force=False)
+
+        _persist_runtime_timer = threading.Timer(max(0.05, RUNTIME_PERSIST_DEBOUNCE_S), flush)
+        _persist_runtime_timer.daemon = True
+        _persist_runtime_timer.start()
     return True
 
 
@@ -2198,9 +2307,10 @@ save_runtime_state(force=True)
 if lean_mode_enabled():
     print(
         f"[{now_iso()}] LEAN_MODE enabled: retention={PULSE_RETENTION_DAYS}d, "
+        f"max_pulse_entries={MAX_PULSE_ENTRIES}, runtime_persist_debounce={RUNTIME_PERSIST_DEBOUNCE_S}s, "
         f"unlimited_question_submit={PULSE_UNLIMITED_QUESTION_SUBMIT}, "
         f"pulse_admin_notify={PULSE_ADMIN_NOTIFY_ENABLED}, "
-        "wheel history omitted from runtime state.",
+        "wheel history/analytics omitted from runtime state.",
         flush=True,
     )
 
@@ -4424,12 +4534,14 @@ def append_verification_flow_log(payload: VerificationLogPayload):
 
 
 def read_verification_flow_logs(limit=80, user_id=None, username=None, session_id=None):
+    from collections import deque
+
     limit = max(1, min(int(limit or 80), 500))
     if not os.path.exists(VERIFY_FLOW_LOG_PATH):
         return []
     username = (username or "").strip().lstrip("@").lower()
     session_id = (session_id or "").strip()
-    rows = []
+    rows = deque(maxlen=limit)
     with open(VERIFY_FLOW_LOG_PATH, "r", encoding="utf-8") as handle:
         for line in handle:
             try:
@@ -4443,7 +4555,7 @@ def read_verification_flow_logs(limit=80, user_id=None, username=None, session_i
             if session_id and entry.get("session_id") != session_id:
                 continue
             rows.append(entry)
-    return rows[-limit:]
+    return list(rows)
 
 
 def miniapp_verification_payload(entry: dict) -> dict:
@@ -6983,7 +7095,7 @@ async def cards_startup_tasks():
 def root():
     return {
         "status": "Alcove API running",
-        "api_revision": "spotlight-archive-admin-20260808",
+        "api_revision": "runtime-memory-pressure-20260922",
         "lean_mode": LEAN_MODE,
         "pulse_admin_notify_enabled": PULSE_ADMIN_NOTIFY_ENABLED,
         "pulse_admin_telegram_suppressed": PULSE_ADMIN_TELEGRAM_SUPPRESSED,
@@ -7107,9 +7219,15 @@ def bot_sync_alcove(payload: BotSyncPayload, x_bot_sync_secret: str | None = Hea
 
     verify_bot_sync_secret(x_bot_sync_secret)
 
-    incoming = [user for user in (payload.users or []) if is_alcove_verified_user(user)]
+    incoming = slim_synced_users(
+        [user for user in (payload.users or []) if is_alcove_verified_user(user)]
+    )
     users_changed = bool(incoming) and incoming != synced_alcove_users
-    analytics_changed = payload.analytics is not None and payload.analytics != synced_alcove_analytics
+    analytics_changed = (
+        (not lean_mode_enabled())
+        and payload.analytics is not None
+        and payload.analytics != synced_alcove_analytics
+    )
     if incoming:
         synced_alcove_users = incoming
     elif not synced_alcove_users:
@@ -7120,7 +7238,9 @@ def bot_sync_alcove(payload: BotSyncPayload, x_bot_sync_secret: str | None = Hea
             f"keeping {len(synced_alcove_users)} synced residents",
             flush=True,
         )
-    if payload.analytics is not None:
+    if lean_mode_enabled():
+        synced_alcove_analytics = {}
+    elif payload.analytics is not None:
         synced_alcove_analytics = payload.analytics
     else:
         synced_alcove_analytics = synced_alcove_analytics or {}
@@ -8307,6 +8427,80 @@ def admin_group_activity_export(
     )
 
 
+@app.get("/api/admin/memory")
+def admin_memory_snapshot(admin_secret: str):
+    """Cheap Render RSS / collection-size snapshot for memory sawtooth debugging."""
+    verify_admin_secret(admin_secret)
+    import resource
+
+    usage = resource.getrusage(resource.RUSAGE_SELF)
+    # Linux ru_maxrss is KiB; macOS is bytes. Prefer /proc/self/status on Linux.
+    rss_bytes = None
+    status_path = "/proc/self/status"
+    if os.path.exists(status_path):
+        try:
+            with open(status_path, "r", encoding="utf-8") as handle:
+                for line in handle:
+                    if line.startswith("VmRSS:"):
+                        parts = line.split()
+                        rss_bytes = int(parts[1]) * 1024
+                        break
+        except (OSError, ValueError, IndexError):
+            rss_bytes = None
+    if rss_bytes is None:
+        # Fallback: treat as KiB (Linux) unless clearly huge (macOS bytes).
+        raw = int(getattr(usage, "ru_maxrss", 0) or 0)
+        rss_bytes = raw if raw > 10_000_000 else raw * 1024
+
+    fingerprint = _last_saved_runtime_fingerprint or ""
+    return {
+        "status": "ok",
+        "lean_mode": lean_mode_enabled(),
+        "rss_bytes": rss_bytes,
+        "rss_mb": round((rss_bytes or 0) / (1024 * 1024), 2),
+        "runtime_persist_debounce_s": RUNTIME_PERSIST_DEBOUNCE_S,
+        "runtime_fingerprint_chars": len(fingerprint),
+        "pulse_retention_days": PULSE_RETENTION_DAYS,
+        "caps": {
+            "pulse_entries": MAX_PULSE_ENTRIES,
+            "pulse_receipts": MAX_PULSE_RECEIPTS,
+            "spotlight_entries": MAX_SPOTLIGHT_ENTRIES,
+            "synced_users": "uncapped_list",
+            "unlock_notifications": MAX_PULSE_UNLOCK_NOTIFICATIONS,
+            "review_notifications": MAX_PULSE_REVIEW_NOTIFICATIONS,
+            "wheel_entries": MAX_WHEEL_ENTRIES,
+            "asmr_entries": MAX_ASMR_ENTRIES,
+            "story_entries": MAX_STORY_ENTRIES,
+        },
+        "counts": {
+            "pulse_entries": len(pulse_entries),
+            "pulse_receipts": len(pulse_receipts),
+            "pulse_red_activations": len(pulse_red_activations),
+            "pulse_red_unlock_notifications": len(pulse_red_unlock_notifications),
+            "pulse_question_review_notifications": len(pulse_question_review_notifications),
+            "pulse_question_suggestions": len(pulse_question_suggestions),
+            "spotlight_entries": len(spotlight_entries),
+            "miniapp_verifications": len(miniapp_verifications),
+            "synced_alcove_users": len(synced_alcove_users),
+            "synced_alcove_analytics_keys": len(synced_alcove_analytics or {}),
+            "wheel_entries": len(wheel_entries),
+            "archived_wheel_entries": len(archived_wheel_entries),
+            "wheel_reaction_history": len(wheel_reaction_history),
+            "wheel_review_history": len(wheel_review_history),
+            "wheel_user_engagement": len(wheel_user_engagement),
+            "notification_feed": len(notification_feed),
+            "video_reviews": len(video_reviews),
+            "approved_comments": len(approved_comments),
+            "pending_comments": len(pending_comments),
+            "asmr_entries": len(asmr_entries),
+            "story_entries": len(story_entries),
+            "room_qa_archive": len(room_qa_archive),
+            "poll_history": len(poll_history),
+            "room_media_submissions": len(room_media_submissions),
+        },
+    }
+
+
 @app.get("/api/admin/review-queue")
 def admin_review_queue(admin_secret: str):
     verify_admin_secret(admin_secret)
@@ -8577,6 +8771,7 @@ def submit_wheel(entry: WheelEntry):
     }
 
     wheel_entries.append(new_entry)
+    trim_list_in_place(wheel_entries, MAX_WHEEL_ENTRIES)
     add_notification("submission", f"{entry_data['display_name']} submitted a video", True)
 
     return {
@@ -9387,7 +9582,10 @@ def submit_wheel_reaction(payload: WheelReaction):
         "time": current_wheel_reaction["time"],
     })
     trim_list_in_place(wheel_reaction_history, MAX_WHEEL_REACTION_HISTORY)
-    save_runtime_state()
+    # Lean mode omits wheel history from persisted runtime state; skip the expensive
+    # full-state serialize on every reaction to avoid Render RAM sawteeth.
+    if not lean_mode_enabled():
+        save_runtime_state()
     ws_broadcast_bundle()
     return {"status": "ok", "reaction": current_wheel_reaction}
 
@@ -11864,6 +12062,7 @@ def submit_asmr(payload: dict):
         return {"status": "error", "message": "ASMR Requests is inactive right now."}
 
     asmr_entries.append({"time": now_iso(), "data": payload})
+    trim_list_in_place(asmr_entries, MAX_ASMR_ENTRIES)
     return {"status": "ok"}
 
 
@@ -11878,6 +12077,7 @@ def submit_story(payload: dict):
         return {"status": "error", "message": "Story Game is inactive right now."}
 
     story_entries.append({"time": now_iso(), "data": payload})
+    trim_list_in_place(story_entries, MAX_STORY_ENTRIES)
     return {"status": "ok"}
 
 
