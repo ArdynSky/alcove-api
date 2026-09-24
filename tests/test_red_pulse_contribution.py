@@ -138,8 +138,30 @@ class RedPulseContributionTests(unittest.TestCase):
         recipients = {row["recipient_user_id"] for row in main.pulse_red_unlock_notifications}
         self.assertEqual(recipients, {11})
 
-    def test_late_green_answer_queues_personal_unlock_dm(self):
-        self.add_answer(99, "green", 1, "other")
+    def test_late_green_answer_does_not_count_as_helping_activate(self):
+        main.pulse_heat_threshold = lambda: 3
+        self.add_answer(11, "green", 1, "early_a")
+        self.add_answer(12, "green", 2, "early_b")
+        self.add_answer(13, "green", 3, "early_c")
+        self.add_answer(22, "green", 4, "lurker")
+        slots = main.pulse_slot_state(22, "lurker")
+        self.assertTrue(slots["community_red_unlocked"])
+        self.assertTrue(slots["contributed_today"])
+        self.assertFalse(slots["helped_red_unlock"])
+        self.assertFalse(slots["red_eligible"])
+        self.assertEqual(slots["red_available"], 0)
+
+        early = main.pulse_slot_state(11, "early_a")
+        self.assertTrue(early["helped_red_unlock"])
+        self.assertTrue(early["red_eligible"])
+        self.assertEqual(early["red_available"], 1)
+
+    def test_late_green_answer_does_not_queue_unlock_dm_for_first_cycle(self):
+        main.pulse_heat_threshold = lambda: 3
+        self.add_answer(11, "green", 1, "early_a")
+        self.add_answer(12, "green", 2, "early_b")
+        self.add_answer(13, "green", 3, "early_c")
+        main.pulse_red_unlock_notifications[:] = []
         result = self.client.post("/api/pulse-entry", json={
             "user_id": 22,
             "username": "lurker",
@@ -150,7 +172,23 @@ class RedPulseContributionTests(unittest.TestCase):
         self.assertEqual(result.status_code, 200)
         self.assertEqual(result.json()["status"], "ok")
         recipients = {row["recipient_user_id"] for row in main.pulse_red_unlock_notifications}
-        self.assertIn(22, recipients)
+        self.assertNotIn(22, recipients)
+
+    def test_red_unavailable_after_answering_once(self):
+        self.add_answer(11, "green", 1, "contributor")
+        result = self.client.post("/api/pulse-entry", json={
+            "user_id": 11,
+            "username": "contributor",
+            "pulse_type": "red",
+            "question": RED_QUESTION,
+            "answer": "First and only Red Pulse answer.",
+        })
+        self.assertEqual(result.status_code, 200)
+        body = result.json()
+        self.assertEqual(body["status"], "ok")
+        self.assertEqual(body["slots"]["red_used"], 1)
+        self.assertEqual(body["slots"]["red_available"], 0)
+        self.assertFalse(body["slots"]["red_ready"])
 
 
 if __name__ == "__main__":
