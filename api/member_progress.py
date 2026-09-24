@@ -222,6 +222,26 @@ def _trim_dict(value: Any, limit: int) -> dict:
     return {key: data[key] for key in keys}
 
 
+def _pending_rewards_without_receipts(rows: Any, receipts: dict) -> list:
+    """Keep open pending rewards, dropping any that already have a claim receipt."""
+    out: list = []
+    seen: set[str] = set()
+    for item in _as_list(rows):
+        if not isinstance(item, dict):
+            continue
+        if item.get("opened"):
+            continue
+        key = str(item.get("sourceKey") or item.get("id") or "").strip()
+        if key and key in receipts:
+            continue
+        dedupe = key or str(item.get("id") or id(item))
+        if dedupe in seen:
+            continue
+        seen.add(dedupe)
+        out.append(item)
+    return out[-40:]
+
+
 def normalize_profile(raw: Any) -> dict:
     data = _as_dict(raw)
     owned_in = _as_dict(data.get("owned"))
@@ -238,6 +258,7 @@ def normalize_profile(raw: Any) -> dict:
             continue
     colour_set = _spotlight_colours(data.get("spotlightColourSet"))
     clean_stats["spotlightColours"] = len(colour_set)
+    claim_receipts = _trim_dict(data.get("claimReceipts"), MAX_CLAIM_EVENT_IDS)
     return {
         "version": PROFILE_VERSION,
         "updated_at": str(data.get("updated_at") or data.get("updatedAt") or "").strip(),
@@ -254,9 +275,9 @@ def normalize_profile(raw: Any) -> dict:
         "owned": owned,
         "ownedMeta": _trim_dict(data.get("ownedMeta"), MAX_OWNED_META),
         "newUnlocks": _union_str_list(data.get("newUnlocks"))[:200],
-        "pendingRewards": _as_list(data.get("pendingRewards"))[-40:],
+        "pendingRewards": _pending_rewards_without_receipts(data.get("pendingRewards"), claim_receipts),
         "levelRewardsClaimed": _union_str_list(data.get("levelRewardsClaimed"))[:80],
-        "claimReceipts": _trim_dict(data.get("claimReceipts"), MAX_CLAIM_EVENT_IDS),
+        "claimReceipts": claim_receipts,
         "claimEventIds": _trim_dict(data.get("claimEventIds"), MAX_CLAIM_EVENT_IDS),
         "expHistory": _as_list(data.get("expHistory"))[-MAX_EXP_HISTORY:],
         "achievementsClaimed": _union_str_list(data.get("achievementsClaimed"))[:200],
@@ -337,7 +358,10 @@ def merge_profiles(base: dict | None, incoming: dict | None) -> dict:
         "ownedMeta": {**left["ownedMeta"], **right["ownedMeta"]},
         # Remaining-set: a dismissed New! token must not come back from the older copy.
         "newUnlocks": list(newer.get("newUnlocks") or []),
-        "pendingRewards": (_as_list(older.get("pendingRewards")) + _as_list(newer.get("pendingRewards")))[-40:],
+        "pendingRewards": _pending_rewards_without_receipts(
+            newer.get("pendingRewards"),
+            {**left["claimReceipts"], **right["claimReceipts"]},
+        ),
         "levelRewardsClaimed": _union_str_list(left["levelRewardsClaimed"], right["levelRewardsClaimed"]),
         "claimReceipts": {**left["claimReceipts"], **right["claimReceipts"]},
         "claimEventIds": {**left["claimEventIds"], **right["claimEventIds"]},
