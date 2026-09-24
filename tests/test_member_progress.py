@@ -533,6 +533,44 @@ class MemberProgressTests(unittest.TestCase):
         self.assertNotIn("pendingRewards", card["profile"])
         self.assertNotIn("claimReceipts", card["profile"])
 
+    def test_merge_pending_rewards_prefers_newer_and_drops_receipted(self):
+        older = {
+            "updated_at": "2026-09-24T03:50:00+00:00",
+            "level": 10,
+            "pendingRewards": [
+                {"id": "level_5", "sourceKey": "level_5", "opened": False, "items": []},
+                {"id": "level_7", "sourceKey": "level_7", "opened": False, "items": []},
+            ],
+            "claimReceipts": {},
+            "owned": {"feedColors": ["base"], "feedSkins": [], "feedStickers": [], "feedBackdrops": [], "titles": []},
+        }
+        newer = {
+            "updated_at": "2026-09-24T04:00:00+00:00",
+            "level": 10,
+            "pendingRewards": [],
+            "claimReceipts": {"level_5": {"claimedAt": "2026-09-24T03:59:00+00:00"}},
+            "owned": {"feedColors": ["system_blue"], "feedSkins": [], "feedStickers": [], "feedBackdrops": ["fox_online_backdrop2"], "titles": []},
+        }
+        merged = member_progress.merge_profiles(older, newer)
+        self.assertEqual(merged["pendingRewards"], [])
+        self.assertIn("level_5", merged["claimReceipts"])
+        self.assertIn("system_blue", merged["owned"]["feedColors"])
+        self.assertIn("fox_online_backdrop2", merged["owned"]["feedBackdrops"])
+
+        # Receipted rows on the newer copy must be stripped even when still listed.
+        still_listed = {
+            "updated_at": "2026-09-24T04:05:00+00:00",
+            "level": 10,
+            "pendingRewards": [
+                {"id": "level_8", "sourceKey": "level_8", "opened": False, "items": []},
+                {"id": "level_9", "sourceKey": "level_9", "opened": False, "items": [{"type": "color", "id": "gold"}]},
+            ],
+            "claimReceipts": {"level_8": {"claimedAt": "2026-09-24T04:01:00+00:00"}},
+            "owned": {"feedColors": ["gold"], "feedSkins": [], "feedStickers": [], "feedBackdrops": [], "titles": []},
+        }
+        normalized = member_progress.normalize_profile(still_listed)
+        self.assertEqual([row["id"] for row in normalized["pendingRewards"]], ["level_9"])
+
 
 class LiveAppStateBandwidthTests(unittest.TestCase):
     def test_live_view_omits_heavy_collections(self):
@@ -576,3 +614,4 @@ class LiveAppStateBandwidthTests(unittest.TestCase):
             self.assertEqual(main.archived_wheel_entries[0]["id"], 200 - main.MAX_ARCHIVED_WHEEL_ENTRIES)
         finally:
             main.archived_wheel_entries[:] = original
+
