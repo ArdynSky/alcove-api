@@ -209,11 +209,20 @@ def audience_submit(payload: AudienceThoughtPayload):
 
 @router.get("/audience/submissions")
 def audience_submissions():
-    sid = _session_id()
+    """Read path: idle debate returns an empty payload (not 409) so host polls stay quiet."""
+    state = _load() or {}
+    sid = str(state.get("session_id") or "").strip()
+    if not sid:
+        return {
+            "session_id": None,
+            "submissions_open": False,
+            "overlay": None,
+            "submissions": [],
+        }
     settings = _ensure_settings(sid)
     return {
         "session_id": sid,
-        "submissions_open": _submissions_open(_load()),
+        "submissions_open": _submissions_open(state),
         "overlay": _overlay(sid, settings),
         "submissions": _thoughts(sid),
     }

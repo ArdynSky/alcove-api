@@ -41,3 +41,20 @@ class DebateAudienceAvailabilityTests(unittest.TestCase):
             self.assertTrue(fresh["submissions_open"])
         finally:
             debate_audience._load = original_load
+
+    def test_idle_audience_submissions_read_returns_empty_not_conflict(self):
+        debate_audience.DB_PATH = Path(tempfile.mkdtemp()) / "audience-idle.sqlite3"
+        original_load = debate_audience._load
+        debate_audience._load = lambda: {"session_id": None, "status": "idle"}
+        try:
+            payload = debate_audience.audience_submissions()
+            self.assertEqual(payload["session_id"], None)
+            self.assertFalse(payload["submissions_open"])
+            self.assertIsNone(payload["overlay"])
+            self.assertEqual(payload["submissions"], [])
+        finally:
+            debate_audience._load = original_load
+
+
+if __name__ == "__main__":
+    unittest.main()
