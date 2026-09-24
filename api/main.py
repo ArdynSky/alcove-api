@@ -5216,8 +5216,56 @@ def pulse_user_contributed_today(user_id=None, username=None, day_key: str | Non
     return any((entry.get("pulse_type") or "green") == "green" for entry in sent)
 
 
+def pulse_user_helped_red_unlock(
+    user_id=None,
+    username=None,
+    day_key: str | None = None,
+    cycle_number: int | None = None,
+) -> bool:
+    """True when this member helped fill a Red Pulse heat-target window.
+
+    Default (no cycle_number): only the first unlock of the day counts. A green
+    answer submitted after Red is already active must not count as helping
+    activate it, even if later answers open another heat cycle.
+    """
+    day = day_key or pulse_day_key()
+    threshold = max(1, pulse_heat_threshold())
+    unlocked_cycles = pulse_red_unlocked_cycles(day)
+    if unlocked_cycles <= 0:
+        return False
+    cycle = max(1, int(cycle_number or 1))
+    if cycle > unlocked_cycles:
+        return False
+    start = (cycle - 1) * threshold
+    end = start + threshold
+
+    entries = [
+        entry
+        for entry in pulse_entries_for_day(day)
+        if entry.get("status") == "completed"
+    ]
+    entries.sort(
+        key=lambda entry: (
+            str(entry.get("sent_at") or entry.get("responded_at") or ""),
+            int(entry.get("id") or 0),
+        )
+    )
+    window = entries[start:end]
+    if not window:
+        return False
+    identity = {"user_id": user_id, "username": username}
+    for entry in window:
+        owner = {
+            "user_id": entry.get("sender_user_id") or entry.get("responder_user_id"),
+            "username": entry.get("sender_username") or entry.get("responder_username"),
+        }
+        if pulse_identities_match(identity, owner):
+            return True
+    return False
+
+
 RED_PULSE_CONTRIBUTE_MESSAGE = (
-    "Answer at least one Pulse question today before you can take the Red Pulse."
+    "Answer at least one Pulse question toward today's target before you can take the Red Pulse."
 )
 
 
@@ -5249,7 +5297,7 @@ def queue_red_pulse_unlock_notification_for_user(day_key: str, cycle_number: int
     user_id = user.get("user_id")
     if not user_id:
         return
-    if not pulse_user_contributed_today(user_id, user.get("username"), day_key):
+    if not pulse_user_helped_red_unlock(user_id, user.get("username"), day_key, cycle_number):
         return
     dedupe_key = f"{day_key}:{cycle_number}:{int(user_id)}"
     if any(
@@ -5404,9 +5452,12 @@ def pulse_slot_state(user_id=None, username=None, now: datetime.datetime | None 
     unlocked_cycles = pulse_red_unlocked_cycles(day)
     community_red_unlocked = unlocked_cycles > 0
     contributed_today = green_used > 0
+    helped_red_unlock = pulse_user_helped_red_unlock(user_id, username, day)
     red_unlocked = community_red_unlocked
-    red_eligible = community_red_unlocked and contributed_today
-    red_available = max(0, unlocked_cycles - red_used) if red_eligible else 0
+    # Only members who helped fill the heat target may take Red / earn activation credit.
+    red_eligible = community_red_unlocked and helped_red_unlock
+    # One Red Pulse answer per day (single daily question); hide the orb after.
+    red_available = 1 if (red_eligible and red_used == 0) else 0
     red_ready = red_available > 0
     red_activated = red_ready
     remainder = sent_today % threshold if threshold else 0
@@ -5429,6 +5480,7 @@ def pulse_slot_state(user_id=None, username=None, now: datetime.datetime | None 
         "red_used": red_used,
         "red_available": red_available,
         "contributed_today": contributed_today,
+        "helped_red_unlock": helped_red_unlock,
         "red_eligible": red_eligible,
         "red_unlocked_cycles": unlocked_cycles,
         "red_activated_cycles": red_used,
@@ -11127,7 +11179,7 @@ def activate_pulse_red(payload: PulseReceiptAck):
             "message": "Red Pulse has not been unlocked yet.",
             "slots": slots,
         }
-    if not slots.get("contributed_today"):
+    if not slots.get("helped_red_unlock", slots.get("contributed_today")):
         return {
             "status": "error",
             "message": RED_PULSE_CONTRIBUTE_MESSAGE,
@@ -11191,8 +11243,8 @@ def submit_pulse(entry: PulseEntry):
     if pulse_type == "red" and not slots["red_unlocked"]:
         print(f"[{now_iso()}] pulse submit rejected: red pulse not unlocked", flush=True)
         return {"status": "error", "message": "Red Pulse has not been unlocked by the community yet."}
-    if pulse_type == "red" and not slots.get("contributed_today"):
-        print(f"[{now_iso()}] pulse submit rejected: red pulse requires a Pulse answer today", flush=True)
+    if pulse_type == "red" and not slots.get("helped_red_unlock", slots.get("contributed_today")):
+        print(f"[{now_iso()}] pulse submit rejected: red pulse requires a heat-target contribution today", flush=True)
         return {"status": "error", "message": RED_PULSE_CONTRIBUTE_MESSAGE}
     if pulse_type == "red" and slots["red_available"] <= 0:
         print(f"[{now_iso()}] pulse submit rejected: red pulse already used", flush=True)
