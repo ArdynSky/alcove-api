@@ -49,6 +49,12 @@ from .member_progress import router as member_progress_router
 from .homepage_settings import router as homepage_settings_router
 from .homepage_settings import ensure_homepage_media_optimized
 from .help_cms import router as help_cms_router
+from .safety_enforcement import (
+    ACTION_QUEUE_ROW_GAPS,
+    build_action_queue_rows,
+    pending_bot_action_jobs,
+    router as safety_enforcement_router,
+)
 
 try:
     from dotenv import load_dotenv
@@ -74,6 +80,7 @@ app.include_router(live_room_test_router)
 app.include_router(member_progress_router)
 app.include_router(homepage_settings_router)
 app.include_router(help_cms_router)
+app.include_router(safety_enforcement_router)
 
 CORS_ALLOWED_ORIGINS = [
     "null",
@@ -6508,6 +6515,8 @@ def build_safety_action_queue(period: str = "today"):
         "recent_flood": recent_flood,
         "recent_member_events": recent_joins,
         "settings": load_safety_settings(),
+        "rows": build_action_queue_rows(since),
+        "row_gaps": ACTION_QUEUE_ROW_GAPS,
     }
 
 
@@ -8692,6 +8701,7 @@ def bot_pending_admin_jobs(x_bot_sync_secret: str | None = Header(default=None))
     bulk_job = get_admin_job("bulk_verify_group")
     if bulk_job.get("status") == "pending":
         jobs.append({"job": "bulk_verify_group", **bulk_job})
+    jobs.extend(pending_bot_action_jobs())
     return {"status": "ok", "jobs": jobs}
 
 
