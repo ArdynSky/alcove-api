@@ -7,7 +7,9 @@ so they share that poll and persistence path.
 
 Care reports and EXP grants are rows in the API state database. They are
 durable records (reporter timestamps, a +30 EXP receipt), not bot jobs.
-Member EXP in this repo is a profile blob; nothing here writes that blob.
+Member EXP in this repo is a profile blob. Care-report grants stay pending until the
+miniapp applies them and calls ``POST /api/exp-grants/{id}/claim``. Nothing
+here writes the profile blob.
 """
 
 from __future__ import annotations
@@ -448,6 +450,10 @@ class ExpGrantCompletePayload(BaseModel):
     status: Literal["applied", "failed"]
     result: dict | None = None
     error: str | None = None
+
+
+class ExpGrantClaimPayload(BaseModel):
+    user_id: int
 
 
 def _require_admin(secret: str | None) -> None:
@@ -1268,6 +1274,74 @@ def resolve_care_report(report_id: str, payload: CareReportResolvePayload):
         "report": _public_care_report(current),
         "exp_grant": _public_grant(grant) if grant else None,
     }
+
+
+@router.get("/api/exp-grants")
+def member_pending_exp_grants(user_id: int, limit: int = 100):
+    """Pending grants for one member. Open like other member GETs that take user_id."""
+    owner = _bounded_int(user_id, field="user_id", required=True)
+    limit = max(1, min(int(limit or 100), 200))
+    conn = _db()
+    try:
+        rows = conn.execute(
+            """
+            SELECT * FROM exp_grants
+            WHERE status = 'pending' AND user_id = ?
+            ORDER BY created_at ASC
+            LIMIT ?
+            """,
+            (owner, limit),
+        ).fetchall()
+    finally:
+        conn.close()
+    return {"status": "ok", "grants": [_public_grant(dict(row)) for row in rows]}
+
+
+@router.post("/api/exp-grants/{grant_id}/claim")
+def claim_exp_grant(grant_id: str, payload: ExpGrantClaimPayload):
+    """Mark a grant applied after the member's own profile write succeeds."""
+    grant_id = _record_id(grant_id, field="grant_id") or ""
+    claimer = _bounded_int(payload.user_id, field="user_id", required=True)
+    conn = _db()
+    try:
+        row = conn.execute("SELECT * FROM exp_grants WHERE id = ?", (grant_id,)).fetchone()
+        if not row:
+            conn.rollback()
+            raise _http(404, "EXP grant not found")
+        current = dict(row)
+        if int(current.get("user_id") or 0) != int(claimer):
+            conn.rollback()
+            raise _http(403, "EXP grant belongs to another member")
+        if current.get("status") == "applied":
+            conn.rollback()
+            return {"status": "ok", "already_done": True, "grant": _public_grant(current)}
+        if current.get("status") != "pending":
+            conn.rollback()
+            raise _http(409, "EXP grant is already finished")
+        applied_at = _now()
+        updated = conn.execute(
+            """
+            UPDATE exp_grants
+            SET status = 'applied', applied_at = ?, error = NULL
+            WHERE id = ? AND status = 'pending' AND user_id = ?
+            """,
+            (applied_at, grant_id, claimer),
+        )
+        if updated.rowcount != 1:
+            conn.rollback()
+            raise _http(409, "EXP grant is already finished")
+        conn.commit()
+        current["status"] = "applied"
+        current["applied_at"] = applied_at
+        current["error"] = None
+    except HTTPException:
+        raise
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+    return {"status": "ok", "already_done": False, "grant": _public_grant(current)}
 
 
 @router.get("/api/bot-sync/exp-grants")

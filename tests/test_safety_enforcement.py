@@ -519,6 +519,89 @@ class SafetyEnforcementTests(unittest.TestCase):
         self.assertIn("strike_count", care_rows[0]["missing"])
         self.assertEqual(care_rows[0]["display_name"], "")
 
+    def test_member_lists_and_claims_own_exp_grant(self):
+        def remove_report(reporter_id: int, target_user_id: int):
+            created = self.client.post(
+                "/api/bot-sync/care-reports",
+                headers=BOT_HEADERS,
+                json={
+                    "reporter_id": reporter_id,
+                    "target_user_id": target_user_id,
+                    "reason": "harassment",
+                    "source": "fox_care",
+                },
+            )
+            self.assertEqual(created.status_code, 200, created.text)
+            report_id = created.json()["report"]["id"]
+            removed = self.client.post(
+                f"/api/admin/safety/care-reports/{report_id}/resolve",
+                json={"admin_secret": SECRET, "decision": "remove", "admin_user_id": 7},
+            )
+            self.assertEqual(removed.status_code, 200, removed.text)
+            return report_id, removed.json()["exp_grant"]
+
+        report_id, grant = remove_report(900, 504)
+        _, other_grant = remove_report(902, 501)
+
+        listed = self.client.get("/api/exp-grants", params={"user_id": 900})
+        self.assertEqual(listed.status_code, 200, listed.text)
+        self.assertEqual([row["id"] for row in listed.json()["grants"]], [grant["id"]])
+        self.assertEqual(listed.json()["grants"][0]["amount"], 30)
+        self.assertEqual(listed.json()["grants"][0]["status"], "pending")
+        self.assertEqual(listed.json()["grants"][0]["dedupe_key"], f"care_report:{report_id}")
+        self.assertEqual(listed.json()["grants"][0]["user_id"], 900)
+
+        someone_else = self.client.get("/api/exp-grants", params={"user_id": 901})
+        self.assertEqual(someone_else.status_code, 200, someone_else.text)
+        self.assertEqual(someone_else.json()["grants"], [])
+        self.assertEqual(self.client.get("/api/exp-grants").status_code, 422)
+
+        wrong = self.client.post(
+            f"/api/exp-grants/{grant['id']}/claim",
+            json={"user_id": 901},
+        )
+        self.assertEqual(wrong.status_code, 403)
+        self.assertEqual(
+            [row["id"] for row in self.client.get("/api/exp-grants", params={"user_id": 900}).json()["grants"]],
+            [grant["id"]],
+        )
+
+        missing = self.client.post("/api/exp-grants/missing-grant/claim", json={"user_id": 900})
+        self.assertEqual(missing.status_code, 404)
+
+        claimed = self.client.post(
+            f"/api/exp-grants/{grant['id']}/claim",
+            json={"user_id": 900},
+        )
+        self.assertEqual(claimed.status_code, 200, claimed.text)
+        self.assertFalse(claimed.json()["already_done"])
+        self.assertEqual(claimed.json()["grant"]["status"], "applied")
+        self.assertEqual(claimed.json()["grant"]["dedupe_key"], f"care_report:{report_id}")
+        self.assertTrue(claimed.json()["grant"]["applied_at"])
+
+        again = self.client.post(
+            f"/api/exp-grants/{grant['id']}/claim",
+            json={"user_id": 900},
+        )
+        self.assertEqual(again.status_code, 200, again.text)
+        self.assertTrue(again.json()["already_done"])
+        self.assertEqual(again.json()["grant"]["status"], "applied")
+        self.assertEqual(again.json()["grant"]["applied_at"], claimed.json()["grant"]["applied_at"])
+        self.assertEqual(self.client.get("/api/exp-grants", params={"user_id": 900}).json()["grants"], [])
+
+        failed = self.client.post(
+            f"/api/bot-sync/exp-grants/{other_grant['id']}/complete",
+            headers=BOT_HEADERS,
+            json={"status": "failed", "error": "ledger skipped"},
+        )
+        self.assertEqual(failed.status_code, 200, failed.text)
+        blocked = self.client.post(
+            f"/api/exp-grants/{other_grant['id']}/claim",
+            json={"user_id": 902},
+        )
+        self.assertEqual(blocked.status_code, 409)
+        self.assertEqual(self.client.get("/api/exp-grants", params={"user_id": 902}).json()["grants"], [])
+
 
 if __name__ == "__main__":
     unittest.main()
