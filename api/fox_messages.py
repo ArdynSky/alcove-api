@@ -171,6 +171,10 @@ def default_template_settings() -> dict:
                 "launch": {"label": "▶ ┃ LAUNCH APP", "style": "primary"},
             },
         },
+        "care_report": {
+            "enabled": True,
+            "banner": "assets/fox_reminder.png",
+        },
     }
 
 
@@ -217,6 +221,18 @@ FOX_TEMPLATE_EDITORS = [
             {"key": "enabled", "type": "bool", "label": "Enabled"},
             {"key": "banner", "type": "banner", "label": "Banner image"},
             {"key": "templates", "type": "numbered", "label": "Warning templates", "count": 6},
+        ],
+    },
+    {
+        "id": "care_report",
+        "title": "Care report DM (/report)",
+        "description": (
+            "Private banner F.O.X sends when a member starts a care report. "
+            "Keep this image light/small — it captions the thank-you + category picker."
+        ),
+        "fields": [
+            {"key": "enabled", "type": "bool", "label": "Use banner image"},
+            {"key": "banner", "type": "banner", "label": "Banner image"},
         ],
     },
     {
@@ -277,6 +293,7 @@ MEDIA_KIND_HINTS = {
     "pulse_test.png": "group_app_launcher",
     "fox_banner.png": "group_app_launcher",
     "help_terminal_banner.png": "help_terminal",
+    "fox_care.png": "care_report",
 }
 
 HELP_TERMINAL_BUTTON_IDS = ("rules", "ardyn", "guide", "faq", "back", "launch")
@@ -420,6 +437,17 @@ FOX_MESSAGE_CATALOG = [
         "schedule_label": "When a link is removed",
         "default_banner": "assets/fox_caution.png",
         "content_source": "Editable below (Event templates)",
+    },
+    {
+        "id": "care_report",
+        "title": "Care report DM banner",
+        "category": "event",
+        "controllable": True,
+        "target": "private_dm",
+        "topic_label": "Reporter DM",
+        "schedule_label": "When a member uses /report",
+        "default_banner": "assets/fox_reminder.png",
+        "content_source": "Editable in Event templates or Safety Rules",
     },
     {
         "id": "admin_public_warn",
