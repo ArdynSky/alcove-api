@@ -3469,10 +3469,14 @@ def find_pulse_question_suggestion(suggestion_id: int):
     pool = live or matches
     pool.sort(
         key=lambda entry: (
-            _PULSE_SUGGESTION_LIVE_STATUS_RANK.get((entry.get("status") or "").strip().lower(), 99),
-            # Invert chronological sort via secondary reverse below.
+            _PULSE_SUGGESTION_LIVE_STATUS_RANK.get(
+                (entry.get("status") or "").strip().lower(),
+                99,
+            ),
+            # Newest first within the best live-status rank.
             entry.get("submitted_at") or "",
         ),
+        reverse=False,
     )
     best_rank = _PULSE_SUGGESTION_LIVE_STATUS_RANK.get(
         (pool[0].get("status") or "").strip().lower(),
@@ -3480,7 +3484,10 @@ def find_pulse_question_suggestion(suggestion_id: int):
     )
     best = [
         entry for entry in pool
-        if _PULSE_SUGGESTION_LIVE_STATUS_RANK.get((entry.get("status") or "").strip().lower(), 99) == best_rank
+        if _PULSE_SUGGESTION_LIVE_STATUS_RANK.get(
+            (entry.get("status") or "").strip().lower(),
+            99,
+        ) == best_rank
     ]
     best.sort(key=lambda entry: entry.get("submitted_at") or "", reverse=True)
     return best[0]
