@@ -4118,6 +4118,57 @@ def normalize_level_packs(raw) -> dict:
     return packs
 
 
+def level_pack_item_conflicts(packs: dict | None) -> list[dict]:
+    """Detect (type, id) reused across level packs with conflicting name/image.
+
+    Reusing the same cosmetic id for two different stickers (e.g. Connect vs
+    Wellbeing) overwrites ownedMeta on claim, so the earlier reward vanishes
+    from the profile inventory even though the id remains owned.
+    """
+    if not isinstance(packs, dict):
+        return []
+    by_key: dict[tuple[str, str], list[dict]] = {}
+    for pack_key, pack in packs.items():
+        if not isinstance(pack, dict):
+            continue
+        for item in pack.get("items") or []:
+            if not isinstance(item, dict):
+                continue
+            item_type = str(item.get("type") or "").strip().lower()
+            item_id = str(item.get("id") or "").strip()
+            if not item_type or not item_id:
+                continue
+            by_key.setdefault((item_type, item_id), []).append(
+                {
+                    "pack": str(pack_key),
+                    "type": item_type,
+                    "id": item_id,
+                    "name": str(item.get("name") or item.get("label") or "").strip(),
+                    "image": str(
+                        item.get("image") or item.get("icon") or item.get("src") or ""
+                    ).strip(),
+                }
+            )
+    conflicts: list[dict] = []
+    for (item_type, item_id), rows in sorted(by_key.items()):
+        if len(rows) < 2:
+            continue
+        names = {row["name"] for row in rows if row["name"]}
+        images = {row["image"] for row in rows if row["image"]}
+        if len(names) <= 1 and len(images) <= 1:
+            continue
+        conflicts.append(
+            {
+                "type": item_type,
+                "id": item_id,
+                "packs": [row["pack"] for row in rows],
+                "names": sorted(names),
+                "images": sorted(images),
+            }
+        )
+    return conflicts
+
+
 def normalize_verification_pack_key(raw) -> str | None:
     key = str(raw or "").strip().lower()
     if key in VERIFICATION_PACK_KEYS:
@@ -8367,7 +8418,19 @@ def admin_update_reward_catalog(payload: RewardCatalogUpdate):
     verify_admin_secret(payload.admin_secret)
     current = load_reward_catalog()
     if payload.level_packs is not None:
-        current["level_packs"] = normalize_level_packs(payload.level_packs)
+        level_packs = normalize_level_packs(payload.level_packs)
+        conflicts = level_pack_item_conflicts(level_packs)
+        if conflicts:
+            first = conflicts[0]
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Level packs reuse {first['type']}:{first['id']} with conflicting "
+                    f"name/image across {', '.join(first['packs'])}. Give each cosmetic "
+                    f"a unique item id (example: alcove_wellbeing_sticker)."
+                ),
+            )
+        current["level_packs"] = level_packs
     if payload.achievements is not None:
         current["achievements"] = normalize_reward_achievements(payload.achievements)
     if payload.verification_packs is not None:
