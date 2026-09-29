@@ -3428,11 +3428,87 @@ def resubmit_rejected_pulse_question(user_id: int | None, username: str | None, 
     }
 
 
+_PULSE_SUGGESTION_LIVE_STATUS_RANK = {
+    "pending_review": 0,
+    "reserved": 1,
+    "approved": 2,
+}
+
+
+def next_pulse_question_suggestion_id() -> int:
+    """Allocate a never-reused suggestion id (max existing + 1).
+
+    Older code used ``len(list) + 1``, which collided after pruning/deletes and
+    left Feature Admin Delete marking the wrong duplicate row as deleted.
+    """
+    return max((int(entry.get("id") or 0) for entry in pulse_question_suggestions), default=0) + 1
+
+
+def find_pulse_question_suggestions(suggestion_id: int) -> list[dict]:
+    sid = int(suggestion_id or 0)
+    return [
+        entry for entry in pulse_question_suggestions
+        if int(entry.get("id") or 0) == sid
+    ]
+
+
 def find_pulse_question_suggestion(suggestion_id: int):
-    for entry in pulse_question_suggestions:
-        if int(entry.get("id") or 0) == int(suggestion_id):
-            return entry
-    return None
+    """Return the best row for this suggestion id.
+
+    Prefer live statuses (pending / reserved / approved) over deleted/rejected
+    ghosts that share a reused id. Within a status, prefer the newest submission
+    so Feature Admin actions hit the row still shown in the review queue.
+    """
+    matches = find_pulse_question_suggestions(suggestion_id)
+    if not matches:
+        return None
+    live = [
+        entry for entry in matches
+        if (entry.get("status") or "").strip().lower() in _PULSE_SUGGESTION_LIVE_STATUS_RANK
+    ]
+    pool = live or matches
+    pool.sort(
+        key=lambda entry: (
+            _PULSE_SUGGESTION_LIVE_STATUS_RANK.get((entry.get("status") or "").strip().lower(), 99),
+            # Invert chronological sort via secondary reverse below.
+            entry.get("submitted_at") or "",
+        ),
+    )
+    best_rank = _PULSE_SUGGESTION_LIVE_STATUS_RANK.get(
+        (pool[0].get("status") or "").strip().lower(),
+        99,
+    )
+    best = [
+        entry for entry in pool
+        if _PULSE_SUGGESTION_LIVE_STATUS_RANK.get((entry.get("status") or "").strip().lower(), 99) == best_rank
+    ]
+    best.sort(key=lambda entry: entry.get("submitted_at") or "", reverse=True)
+    return best[0]
+
+
+def soft_delete_pulse_question_suggestion(entry: dict) -> None:
+    """Mark one suggestion deleted without a rejection DM."""
+    cancel_pending_pulse_question_review_notifications(
+        int(entry.get("id") or 0),
+        reason="deleted",
+    )
+    entry["status"] = "deleted"
+    entry["rejection_reason"] = None
+    entry["resubmit_allowed"] = False
+    entry["needs_admin_notify"] = False
+    entry["reviewed_at"] = now_iso()
+
+
+def soft_delete_pulse_question_queue_rows(suggestion_id: int) -> list[dict]:
+    """Delete every pending/reserved row sharing this id (duplicate-id cleanup)."""
+    sid = int(suggestion_id or 0)
+    targets = [
+        entry for entry in find_pulse_question_suggestions(sid)
+        if (entry.get("status") or "").strip().lower() in {"pending_review", "reserved"}
+    ]
+    for entry in targets:
+        soft_delete_pulse_question_suggestion(entry)
+    return targets
 
 
 def next_pulse_entry_id() -> int:
@@ -4365,15 +4441,11 @@ def apply_admin_pulse_question_action(
         return
     if action == "delete":
         # Silent remove — no rejection form, no F.O.X DM, hidden from member app.
-        cancel_pending_pulse_question_review_notifications(
-            int(entry.get("id") or 0),
-            reason="deleted",
-        )
-        entry["status"] = "deleted"
-        entry["rejection_reason"] = None
-        entry["resubmit_allowed"] = False
-        entry["needs_admin_notify"] = False
-        entry["reviewed_at"] = now_iso()
+        # Clear every pending/reserved twin that reused this id so Feature Admin
+        # does not keep showing a "deleted" card that never left the queue.
+        deleted_rows = soft_delete_pulse_question_queue_rows(int(entry.get("id") or 0))
+        if not deleted_rows:
+            soft_delete_pulse_question_suggestion(entry)
         return
     if action in {"today", "tomorrow", "reserve"}:
         pool = (entry.get("pool") or "green").strip().lower()
@@ -4426,7 +4498,7 @@ def create_admin_pulse_question(
             detail="Red Pulse questions can only be scheduled for Today or Tomorrow.",
         )
     entry = {
-        "id": len(pulse_question_suggestions) + 1,
+        "id": next_pulse_question_suggestion_id(),
         "pool": pool,
         "category": "General",
         "question": question,
@@ -10992,7 +11064,7 @@ def submit_pulse_question_suggestion(payload: PulseQuestionSuggestion):
         }
 
     entry = {
-        "id": len(pulse_question_suggestions) + 1,
+        "id": next_pulse_question_suggestion_id(),
         "pool": pool,
         "category": category,
         "question": question,
@@ -11681,7 +11753,7 @@ def bot_create_pulse_question(payload: dict | None = None, x_bot_sync_secret: st
 
     active_from = (payload.get("active_from_day_key") or pulse_next_day_key()).strip()
     entry = {
-        "id": len(pulse_question_suggestions) + 1,
+        "id": next_pulse_question_suggestion_id(),
         "pool": pool,
         "category": category,
         "question": question,
