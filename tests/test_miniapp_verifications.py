@@ -86,6 +86,63 @@ class MiniappVerificationUpsertTests(unittest.TestCase):
         self.assertEqual(entry["detail"], "access_processed")
         self.assertEqual(entry["username"], "member_new")
 
+    def test_pending_resubmit_clears_soft_retry_detail_and_refreshes_request(self):
+        existing = {
+            "id": 11,
+            "user_id": 222,
+            "username": "pending_user",
+            "first_name": "Pending",
+            "last_name": "User",
+            "display_name": "Pending User",
+            "status": "pending",
+            "requested_at": "2026-07-03T00:00:00",
+            "last_seen_at": "2026-07-03T00:00:00",
+            "completed_at": None,
+            "detail": "retrying_access:join request missing",
+            "attempt_count": 3,
+        }
+        main.miniapp_verifications.append(existing)
+
+        entry = main.upsert_miniapp_verification({
+            "id": 222,
+            "username": "pending_user",
+            "first_name": "Pending",
+            "last_name": "User",
+        })
+
+        self.assertEqual(entry["status"], "pending")
+        self.assertNotEqual(entry["requested_at"], "2026-07-03T00:00:00")
+        self.assertNotIn("detail", entry)
+        self.assertEqual(entry["attempt_count"], 0)
+
+    def test_bot_update_tracks_attempt_count_on_pending_retry(self):
+        entry = {
+            "id": 15,
+            "user_id": 333,
+            "username": "retry",
+            "status": "pending",
+            "requested_at": "2026-07-04T00:00:00",
+            "last_seen_at": "2026-07-04T00:00:00",
+            "completed_at": None,
+            "attempt_count": 1,
+        }
+        main.miniapp_verifications.append(entry)
+        original_secret = main.verify_bot_sync_secret
+        main.verify_bot_sync_secret = lambda *_args, **_kwargs: None
+        try:
+            result = main.bot_update_miniapp_verification(
+                15,
+                {"status": "pending", "detail": "retrying_access:x", "attempt_count": 2},
+                x_bot_sync_secret="test",
+            )
+        finally:
+            main.verify_bot_sync_secret = original_secret
+
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["verification"]["attempt_count"], 2)
+        self.assertEqual(result["verification"]["status"], "pending")
+        self.assertEqual(entry["attempt_count"], 2)
+
 
 if __name__ == "__main__":
     unittest.main()
