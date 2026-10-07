@@ -4658,6 +4658,7 @@ def miniapp_verification_payload(entry: dict) -> dict:
         "requested_at": entry.get("requested_at"),
         "completed_at": entry.get("completed_at"),
         "detail": entry.get("detail"),
+        "attempt_count": int(entry.get("attempt_count") or 0),
     }
 
 
@@ -4680,7 +4681,16 @@ def upsert_miniapp_verification(user: dict) -> dict:
             existing["status"] = "pending"
             existing["requested_at"] = now
             existing["completed_at"] = None
+            existing["attempt_count"] = 0
             existing.pop("detail", None)
+        elif existing.get("status") == "pending":
+            # Fresh Mini App taps should reset soft-retry bookkeeping so F.O.X
+            # keeps working the join request instead of stalling on old detail.
+            existing["requested_at"] = now
+            existing["completed_at"] = None
+            existing["attempt_count"] = 0
+            if str(existing.get("detail") or "").startswith("retrying_access:"):
+                existing.pop("detail", None)
         existing.update({
             "username": user.get("username"),
             "first_name": user.get("first_name"),
@@ -4701,6 +4711,7 @@ def upsert_miniapp_verification(user: dict) -> dict:
         "requested_at": now,
         "last_seen_at": now,
         "completed_at": None,
+        "attempt_count": 0,
     }
     miniapp_verifications.append(entry)
     return entry
@@ -7445,8 +7456,17 @@ def bot_update_miniapp_verification(
         return {"status": "error", "message": "Invalid Mini App verification status."}
     entry["status"] = status
     entry["completed_at"] = now_iso() if status in {"completed", "failed"} else None
-    if payload.get("detail"):
-        entry["detail"] = str(payload.get("detail"))[:500]
+    if "detail" in payload:
+        detail = payload.get("detail")
+        if detail:
+            entry["detail"] = str(detail)[:500]
+        else:
+            entry.pop("detail", None)
+    if "attempt_count" in payload:
+        try:
+            entry["attempt_count"] = max(0, int(payload.get("attempt_count") or 0))
+        except (TypeError, ValueError):
+            entry["attempt_count"] = int(entry.get("attempt_count") or 0)
     save_runtime_state()
     return {"status": "ok", "verification": miniapp_verification_payload(entry)}
 
