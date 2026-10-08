@@ -130,7 +130,7 @@ APP_HELP_CONTENT = (
             ("help-spotlight-overview", "WHAT IS SPOTLIGHT?", "What is Spotlight?", "Spotlight is The Alcove's member-recognition feature. It gives you a thoughtful way to acknowledge people who have made a positive difference to the community."),
             ("help-spotlight-nominate", "NOMINATE A MEMBER", "Nominate a Member", "Open Spotlight, choose an eligible member and select the award that best reflects what you want to recognise. Add any supporting message requested and confirm your nomination."),
             ("help-spotlight-awards", "THE FOUR SPOTLIGHT AWARDS", "The Four Spotlight Awards", "Spotlight includes four forms of recognition: **Recognition**, **Appreciation**, **Respect** and **Support**. Choose the one that most closely matches the contribution you want to celebrate."),
-            ("help-spotlight-send", "SEND A SPOTLIGHT AWARD", "Send a Spotlight Award", "Review the member, award and message you selected, then submit it. F.O.X and the app will use the same Spotlight activity when displaying the result."),
+            ("help-spotlight-send", "SEND A SPOTLIGHT AWARD", "Send a Spotlight Award", "Review the member, award and message you selected, then submit it. The Spotlight result will match what was shown during the activity."),
             ("help-spotlight-activity", "VIEW SPOTLIGHT ACTIVITY", "View Spotlight Activity", "Use Spotlight and the Archive to see relevant recognition activity, including awards that have been published or received."),
         ),
     },
