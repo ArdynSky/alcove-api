@@ -121,7 +121,27 @@ CREATE TABLE IF NOT EXISTS safety_queue_resolutions (
     action TEXT,
     updated_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS moderation_terminology (
+    id TEXT PRIMARY KEY,
+    phrase TEXT NOT NULL,
+    decision TEXT NOT NULL,
+    source TEXT,
+    source_id TEXT,
+    queue_item_id TEXT,
+    admin_user_id INTEGER,
+    learned_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(phrase, decision)
+);
+CREATE INDEX IF NOT EXISTS idx_moderation_terminology_decision
+    ON moderation_terminology(decision, updated_at DESC);
 """
+
+TERMINOLOGY_DECISIONS = frozenset({"keep", "teach", "remove"})
+MIN_TERMINOLOGY_PHRASE_LEN = 8
+MAX_TERMINOLOGY_PHRASE_LEN = 300
+MAX_TERMINOLOGY_ROWS = 500
 
 
 def _now() -> str:
@@ -150,6 +170,12 @@ def _connect() -> sqlite3.Connection:
 
 def _ensure(conn: sqlite3.Connection) -> None:
     conn.executescript(_SCHEMA)
+    care_cols = {
+        str(row[1])
+        for row in conn.execute("PRAGMA table_info(care_reports)").fetchall()
+    }
+    if "message_excerpt" not in care_cols:
+        conn.execute("ALTER TABLE care_reports ADD COLUMN message_excerpt TEXT")
 
 
 def _db() -> sqlite3.Connection:
@@ -437,6 +463,7 @@ class CareReportCreatePayload(BaseModel):
         "other",
     ]
     note: str | None = None
+    message_excerpt: str | None = None
     source: Literal["feature_admin", "fox_care", "telegram"] = "fox_care"
 
 
@@ -444,6 +471,34 @@ class CareReportResolvePayload(BaseModel):
     admin_secret: str
     decision: Literal["keep", "remove", "teach"]
     admin_user_id: int
+    phrase: str | None = None
+
+
+class TerminologyUpsertPayload(BaseModel):
+    admin_secret: str | None = None
+    decision: Literal["keep", "teach", "remove"]
+    phrase: str
+    admin_user_id: int | None = None
+    source: str | None = None
+    source_id: str | None = None
+    queue_item_id: str | None = None
+
+
+class TerminologyTeachPayload(BaseModel):
+    admin_secret: str
+    decision: Literal["keep", "teach", "remove"]
+    phrase: str
+    admin_user_id: int
+    queue_item_id: str | None = None
+    source: str | None = None
+    source_id: str | None = None
+
+
+class TerminologyDeletePayload(BaseModel):
+    admin_secret: str
+    phrase_id: str | None = None
+    phrase: str | None = None
+    decision: Literal["keep", "teach", "remove"] | None = None
 
 
 class ExpGrantCompletePayload(BaseModel):
@@ -474,6 +529,7 @@ def _load_care_report(conn: sqlite3.Connection, report_id: str) -> dict | None:
 
 
 def _public_care_report(row: dict) -> dict:
+    excerpt = row.get("message_excerpt") or row.get("note") or row.get("reason")
     return {
         "id": row.get("id"),
         "reporter_id": row.get("reporter_id"),
@@ -482,6 +538,8 @@ def _public_care_report(row: dict) -> dict:
         "message_id": row.get("message_id"),
         "reason": row.get("reason"),
         "note": row.get("note"),
+        "message_excerpt": row.get("message_excerpt"),
+        "excerpt": excerpt,
         "created_at": row.get("created_at"),
         "status": row.get("status"),
         "resolved_at": row.get("resolved_at"),
@@ -489,6 +547,121 @@ def _public_care_report(row: dict) -> dict:
         "decision": row.get("decision"),
         "source": row.get("source"),
     }
+
+
+def _normalize_terminology_phrase(text: str | None) -> str:
+    phrase = " ".join(str(text or "").split()).strip().lower()
+    if len(phrase) < MIN_TERMINOLOGY_PHRASE_LEN:
+        raise _http(
+            400,
+            f"phrase must be at least {MIN_TERMINOLOGY_PHRASE_LEN} characters",
+        )
+    return phrase[:MAX_TERMINOLOGY_PHRASE_LEN]
+
+
+def _public_terminology(row: dict) -> dict:
+    return {
+        "id": row.get("id"),
+        "phrase": row.get("phrase"),
+        "decision": row.get("decision"),
+        "source": row.get("source"),
+        "source_id": row.get("source_id"),
+        "queue_item_id": row.get("queue_item_id"),
+        "admin_user_id": row.get("admin_user_id"),
+        "learned_at": row.get("learned_at"),
+        "updated_at": row.get("updated_at"),
+        "effect": "flag" if row.get("decision") == "remove" else "safe",
+    }
+
+
+def _upsert_terminology(
+    conn: sqlite3.Connection,
+    *,
+    phrase: str,
+    decision: str,
+    source: str | None = None,
+    source_id: str | None = None,
+    queue_item_id: str | None = None,
+    admin_user_id: int | None = None,
+) -> dict:
+    if decision not in TERMINOLOGY_DECISIONS:
+        raise _http(400, "decision must be keep, teach, or remove")
+    normalized = _normalize_terminology_phrase(phrase)
+    now = _now()
+    existing = conn.execute(
+        """
+        SELECT * FROM moderation_terminology
+        WHERE phrase = ? AND decision = ?
+        """,
+        (normalized, decision),
+    ).fetchone()
+    if existing:
+        conn.execute(
+            """
+            UPDATE moderation_terminology
+            SET source = COALESCE(?, source),
+                source_id = COALESCE(?, source_id),
+                queue_item_id = COALESCE(?, queue_item_id),
+                admin_user_id = COALESCE(?, admin_user_id),
+                updated_at = ?
+            WHERE id = ?
+            """,
+            (
+                source,
+                source_id,
+                queue_item_id,
+                admin_user_id,
+                now,
+                existing["id"],
+            ),
+        )
+        row = conn.execute(
+            "SELECT * FROM moderation_terminology WHERE id = ?",
+            (existing["id"],),
+        ).fetchone()
+        return dict(row)
+    row_id = uuid.uuid4().hex
+    conn.execute(
+        """
+        INSERT INTO moderation_terminology (
+            id, phrase, decision, source, source_id, queue_item_id,
+            admin_user_id, learned_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            row_id,
+            normalized,
+            decision,
+            source,
+            source_id,
+            queue_item_id,
+            admin_user_id,
+            now,
+            now,
+        ),
+    )
+    # Opposite effect for the same phrase should not stay active together.
+    if decision == "remove":
+        conn.execute(
+            """
+            DELETE FROM moderation_terminology
+            WHERE phrase = ? AND decision IN ('keep', 'teach')
+            """,
+            (normalized,),
+        )
+    else:
+        conn.execute(
+            """
+            DELETE FROM moderation_terminology
+            WHERE phrase = ? AND decision = 'remove'
+            """,
+            (normalized,),
+        )
+    row = conn.execute(
+        "SELECT * FROM moderation_terminology WHERE id = ?",
+        (row_id,),
+    ).fetchone()
+    return dict(row)
 
 
 def _public_grant(row: dict) -> dict:
@@ -851,7 +1024,7 @@ def build_action_queue_rows(since: str | None) -> list[dict]:
                 "user_id": row.get("target_user_id"),
                 "username": "",
                 "display_name": "",
-                "excerpt": row.get("note") or row.get("reason"),
+                "excerpt": row.get("message_excerpt") or row.get("note") or row.get("reason"),
                 "message_id": row.get("message_id"),
                 "chat_id": row.get("chat_id"),
                 "created_at": row.get("created_at"),
@@ -1077,6 +1250,9 @@ def create_care_report(
         raise _http(400, "source is not supported")
     reporter_id = _bounded_int(payload.reporter_id, field="reporter_id", required=True)
     target_user_id = _bounded_int(payload.target_user_id, field="target_user_id", required=True)
+    message_excerpt = _clean_text(
+        payload.message_excerpt, limit=MAX_TERMINOLOGY_PHRASE_LEN, field="message_excerpt"
+    )
     report = {
         "id": uuid.uuid4().hex,
         "reporter_id": reporter_id,
@@ -1085,6 +1261,7 @@ def create_care_report(
         "message_id": _bounded_int(payload.message_id, field="message_id"),
         "reason": payload.reason,
         "note": _clean_text(payload.note, limit=MAX_NOTE_LEN, field="note"),
+        "message_excerpt": message_excerpt,
         "created_at": _now(),
         "status": "pending",
         "resolved_at": None,
@@ -1098,8 +1275,8 @@ def create_care_report(
             """
             INSERT INTO care_reports (
                 id, reporter_id, target_user_id, chat_id, message_id, reason, note,
-                created_at, status, resolved_at, admin_user_id, decision, source
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                message_excerpt, created_at, status, resolved_at, admin_user_id, decision, source
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 report["id"],
@@ -1109,6 +1286,7 @@ def create_care_report(
                 report["message_id"],
                 report["reason"],
                 report["note"],
+                report["message_excerpt"],
                 report["created_at"],
                 report["status"],
                 report["resolved_at"],
@@ -1261,6 +1439,21 @@ def resolve_care_report(report_id: str, payload: CareReportResolvePayload):
         current["admin_user_id"] = admin_user_id
         grant = _insert_remove_grant(conn, current) if decision == "remove" else None
         _set_resolution(conn, f"care_report:{report_id}", "acted", None, f"care_{decision}")
+        phrase = payload.phrase or current.get("message_excerpt") or current.get("note") or ""
+        terminology = None
+        try:
+            terminology = _upsert_terminology(
+                conn,
+                phrase=phrase,
+                decision=decision,
+                source="care_report",
+                source_id=report_id,
+                queue_item_id=f"care_report:{report_id}",
+                admin_user_id=admin_user_id,
+            )
+        except HTTPException:
+            # Care resolve still succeeds even if the phrase is too short to learn.
+            terminology = None
         conn.commit()
     except HTTPException:
         raise
@@ -1273,6 +1466,7 @@ def resolve_care_report(report_id: str, payload: CareReportResolvePayload):
         "status": "ok",
         "report": _public_care_report(current),
         "exp_grant": _public_grant(grant) if grant else None,
+        "terminology": _public_terminology(terminology) if terminology else None,
     }
 
 
@@ -1444,3 +1638,190 @@ def complete_exp_grant(
     finally:
         conn.close()
     return {"status": "ok", "already_done": False, "grant": _public_grant(current)}
+
+
+def _list_terminology(decision: str | None = None, limit: int = 200) -> list[dict]:
+    limit = max(1, min(int(limit or 200), MAX_TERMINOLOGY_ROWS))
+    clauses = []
+    params: list[Any] = []
+    wanted = (decision or "").strip().lower()
+    if wanted:
+        if wanted not in TERMINOLOGY_DECISIONS and wanted not in {"safe", "flag"}:
+            raise _http(400, "decision must be keep, teach, remove, safe, or flag")
+        if wanted == "safe":
+            clauses.append("decision IN ('keep', 'teach')")
+        elif wanted == "flag":
+            clauses.append("decision = 'remove'")
+        else:
+            clauses.append("decision = ?")
+            params.append(wanted)
+    where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+    conn = _db()
+    try:
+        rows = conn.execute(
+            f"""
+            SELECT * FROM moderation_terminology
+            {where}
+            ORDER BY updated_at DESC
+            LIMIT ?
+            """,
+            tuple(params) + (limit,),
+        ).fetchall()
+    finally:
+        conn.close()
+    return [_public_terminology(dict(row)) for row in rows]
+
+
+@router.get("/api/admin/safety/terminology")
+def admin_list_terminology(
+    admin_secret: str,
+    decision: str | None = None,
+    limit: int = 200,
+):
+    _require_admin(admin_secret)
+    items = _list_terminology(decision=decision, limit=limit)
+    return {
+        "status": "ok",
+        "items": items,
+        "safe": [item for item in items if item.get("effect") == "safe"],
+        "flagged": [item for item in items if item.get("effect") == "flag"],
+    }
+
+
+@router.get("/api/bot-sync/safety-terminology")
+def bot_list_terminology(
+    x_bot_sync_secret: str | None = Header(default=None),
+    decision: str | None = None,
+    limit: int = 500,
+):
+    _require_bot(x_bot_sync_secret)
+    items = _list_terminology(decision=decision, limit=limit)
+    return {
+        "status": "ok",
+        "items": items,
+        "safe": [item["phrase"] for item in items if item.get("effect") == "safe"],
+        "flagged": [item["phrase"] for item in items if item.get("effect") == "flag"],
+    }
+
+
+@router.post("/api/admin/safety/terminology")
+def admin_upsert_terminology(payload: TerminologyUpsertPayload):
+    _require_admin(payload.admin_secret)
+    admin_user_id = _bounded_int(payload.admin_user_id, field="admin_user_id")
+    conn = _db()
+    try:
+        row = _upsert_terminology(
+            conn,
+            phrase=payload.phrase,
+            decision=payload.decision,
+            source=payload.source or "feature_admin",
+            source_id=payload.source_id,
+            queue_item_id=_queue_item_id(payload.queue_item_id),
+            admin_user_id=admin_user_id,
+        )
+        queue_item_id = _queue_item_id(payload.queue_item_id)
+        if queue_item_id:
+            _set_resolution(conn, queue_item_id, "acted", None, f"terminology_{payload.decision}")
+        conn.commit()
+    except HTTPException:
+        conn.rollback()
+        raise
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+    return {"status": "ok", "terminology": _public_terminology(row)}
+
+
+@router.post("/api/admin/safety/teach")
+def admin_teach_from_flag(payload: TerminologyTeachPayload):
+    """Teach / keep / remove wording from any moderation inbox row."""
+    _require_admin(payload.admin_secret)
+    admin_user_id = _bounded_int(payload.admin_user_id, field="admin_user_id", required=True)
+    queue_item_id = _queue_item_id(payload.queue_item_id)
+    conn = _db()
+    try:
+        row = _upsert_terminology(
+            conn,
+            phrase=payload.phrase,
+            decision=payload.decision,
+            source=payload.source or "feature_admin",
+            source_id=payload.source_id,
+            queue_item_id=queue_item_id,
+            admin_user_id=admin_user_id,
+        )
+        if queue_item_id:
+            _set_resolution(conn, queue_item_id, "acted", None, f"terminology_{payload.decision}")
+        conn.commit()
+    except HTTPException:
+        conn.rollback()
+        raise
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+    return {"status": "ok", "terminology": _public_terminology(row)}
+
+
+@router.post("/api/bot-sync/safety-terminology")
+def bot_upsert_terminology(
+    payload: TerminologyUpsertPayload,
+    x_bot_sync_secret: str | None = Header(default=None),
+):
+    _require_bot(x_bot_sync_secret)
+    conn = _db()
+    try:
+        row = _upsert_terminology(
+            conn,
+            phrase=payload.phrase,
+            decision=payload.decision,
+            source=payload.source or "fox_bot",
+            source_id=payload.source_id,
+            queue_item_id=_queue_item_id(payload.queue_item_id),
+            admin_user_id=_bounded_int(payload.admin_user_id, field="admin_user_id"),
+        )
+        conn.commit()
+    except HTTPException:
+        conn.rollback()
+        raise
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+    return {"status": "ok", "terminology": _public_terminology(row)}
+
+
+@router.post("/api/admin/safety/terminology/delete")
+def admin_delete_terminology(payload: TerminologyDeletePayload):
+    _require_admin(payload.admin_secret)
+    phrase_id = _record_id(payload.phrase_id, field="phrase_id")
+    conn = _db()
+    try:
+        if phrase_id:
+            deleted = conn.execute(
+                "DELETE FROM moderation_terminology WHERE id = ?",
+                (phrase_id,),
+            )
+        else:
+            if not payload.phrase or not payload.decision:
+                raise _http(400, "phrase_id or phrase+decision is required")
+            phrase = _normalize_terminology_phrase(payload.phrase)
+            deleted = conn.execute(
+                "DELETE FROM moderation_terminology WHERE phrase = ? AND decision = ?",
+                (phrase, payload.decision),
+            )
+        if deleted.rowcount < 1:
+            conn.rollback()
+            raise _http(404, "Terminology phrase not found")
+        conn.commit()
+    except HTTPException:
+        raise
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+    return {"status": "ok"}
