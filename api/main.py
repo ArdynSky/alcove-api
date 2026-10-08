@@ -2912,7 +2912,7 @@ def pulse_question_availability_copy(entry: dict) -> str:
             f"({pulse_day_name_with_ordinal(pulse_day_key())})."
         )
     if schedule == "reserve":
-        return "It has been saved to the reserve pot. F.O.X will schedule it for a future Pulse day."
+        return "It’s been approved by @Ardyn_Sky and will appear on a future Pulse day."
     return (
         f"It will be added to the next day's Pulse questions and will be available from "
         f"00:00 on {day_label} (UK time) for 24 hours."
@@ -3421,7 +3421,7 @@ def resubmit_rejected_pulse_question(user_id: int | None, username: str | None, 
     return {
         "status": "ok",
         "message": (
-            "Thanks — your new Pulse question has been sent to F.O.X for review. "
+            "Thanks — your new Pulse question has been sent to @Ardyn_Sky for review. "
             "That uses today's one replacement attempt."
         ),
         "entry": entry,
@@ -5362,7 +5362,7 @@ def pulse_user_helped_red_unlock(
 
 
 RED_PULSE_CONTRIBUTE_MESSAGE = (
-    "Answer at least one Pulse question toward today's target before you can take the Red Pulse."
+    "Answer at least one member’s Pulse question today before you can take the Red Pulse."
 )
 
 
@@ -11078,7 +11078,7 @@ def submit_pulse_question_suggestion(payload: PulseQuestionSuggestion):
         return {
             "status": "ok",
             "message": (
-                "Thanks — your replacement Pulse question is with F.O.X for review. "
+                "Thanks — your replacement Pulse question is with @Ardyn_Sky for review. "
                 "That uses today's one amendment."
             ),
             "entry": entry,
@@ -11135,9 +11135,12 @@ def submit_pulse_question_suggestion(payload: PulseQuestionSuggestion):
     submissions_today = pulse_question_submissions_today_count(user_id, username)
     can_submit_another = pulse_can_submit_another_question(user_id, username)
     if can_submit_another:
-        success_message = "Pulse sent for admin review. Submit another Pulse question below if you like."
+        success_message = (
+            "Your Pulse has been sent for approval to @Ardyn_Sky. "
+            "Once approved, it will be available for members to answer within the next 24 hours."
+        )
     else:
-        success_message = "Both of today's Pulse questions are with F.O.X for review."
+        success_message = "Both of today’s Pulse questions are with @Ardyn_Sky for review."
     return {
         "status": "ok",
         "message": success_message,
@@ -11189,12 +11192,12 @@ def pulse_question_suggestion_status(user_id: int | None = None, username: str |
         if pulse_rejection_replacement_used_today(user_id, username):
             message = "You've used today's one replacement attempt. New questions unlock at midnight UK time."
         elif submissions_total_today >= PULSE_DAILY_QUESTION_LIMIT:
-            message = "Both of today's Pulse questions are already with F.O.X for review."
+            message = "Both of today’s Pulse questions are already with @Ardyn_Sky for review."
         else:
-            message = "Both of today's Pulse questions are already with F.O.X for review."
+            message = "Both of today’s Pulse questions are already with @Ardyn_Sky for review."
     elif replacement_open and has_approved_today:
         # Lead with the approval — do not pair "approved" with "not approved"
-        # in one line (that reads like a contradictory F.O.X decision).
+        # in one line (that reads like a contradictory review decision).
         message = (
             "Your Pulse was approved. You still have one replacement attempt today "
             "if you want to rewrite the other question."
@@ -11205,7 +11208,7 @@ def pulse_question_suggestion_status(user_id: int | None = None, username: str |
             "choose your words carefully."
         )
     elif latest_entry and latest_entry.get("status") == "pending_review":
-        message = "Your Pulse is with F.O.X for review. You can submit one more today."
+        message = "Your Pulse is with @Ardyn_Sky for review. You can submit one more today."
     elif latest_entry and latest_entry.get("status") == "approved":
         message = "Your Pulse has been approved. You can submit one more today."
     else:
