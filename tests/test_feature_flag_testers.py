@@ -51,6 +51,62 @@ class FeatureFlagTesterUsernamesTests(unittest.TestCase):
         self.assertEqual(stamp["layout"], "stamp")
         self.assertEqual(banner["layout"], "banner")
 
+    def test_level_pack_item_conflicts_detect_reused_ids(self):
+        conflicts = main.level_pack_item_conflicts(
+            {
+                "level_11": {
+                    "items": [
+                        {
+                            "type": "sticker",
+                            "id": "alcove_connect_sticker",
+                            "name": "Alcove Connect",
+                            "image": "https://example/connect.png",
+                        }
+                    ]
+                },
+                "level_15": {
+                    "items": [
+                        {
+                            "type": "sticker",
+                            "id": "alcove_connect_sticker",
+                            "name": "Alcove Wellbeing",
+                            "image": "https://example/wellbeing.png",
+                        }
+                    ]
+                },
+            }
+        )
+        self.assertEqual(len(conflicts), 1)
+        self.assertEqual(conflicts[0]["id"], "alcove_connect_sticker")
+        self.assertEqual(set(conflicts[0]["packs"]), {"level_11", "level_15"})
+
+    def test_level_pack_item_conflicts_allow_identical_reuse(self):
+        conflicts = main.level_pack_item_conflicts(
+            {
+                "level_2": {
+                    "items": [
+                        {
+                            "type": "sticker",
+                            "id": "star",
+                            "name": "Star",
+                            "image": "https://example/star.png",
+                        }
+                    ]
+                },
+                "level_4": {
+                    "items": [
+                        {
+                            "type": "sticker",
+                            "id": "star",
+                            "name": "Star",
+                            "image": "https://example/star.png",
+                        }
+                    ]
+                },
+            }
+        )
+        self.assertEqual(conflicts, [])
+
     def test_achievement_uploads_filter_retired_effect_items(self):
         achievements = main.normalize_reward_achievements(
             [
