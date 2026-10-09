@@ -137,12 +137,30 @@ CREATE TABLE IF NOT EXISTS moderation_terminology (
 );
 CREATE INDEX IF NOT EXISTS idx_moderation_terminology_decision
     ON moderation_terminology(decision, updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS synced_safety_events (
+    id TEXT PRIMARY KEY,
+    kind TEXT NOT NULL,
+    external_key TEXT NOT NULL,
+    user_id INTEGER,
+    username TEXT,
+    display_name TEXT,
+    message_id INTEGER,
+    chat_id INTEGER,
+    excerpt TEXT,
+    detail_json TEXT,
+    logged_at TEXT NOT NULL,
+    UNIQUE(kind, external_key)
+);
+CREATE INDEX IF NOT EXISTS idx_synced_safety_events_kind_logged
+    ON synced_safety_events(kind, logged_at DESC);
 """
 
 TERMINOLOGY_DECISIONS = frozenset({"keep", "teach", "remove"})
 MIN_TERMINOLOGY_PHRASE_LEN = 8
 MAX_TERMINOLOGY_PHRASE_LEN = 300
 MAX_TERMINOLOGY_ROWS = 500
+SYNCED_SAFETY_KINDS = frozenset({"flood", "tone", "link", "member"})
 
 
 def _now() -> str:
@@ -511,6 +529,10 @@ class ExpGrantCompletePayload(BaseModel):
 
 class ExpGrantClaimPayload(BaseModel):
     user_id: int
+
+
+class SyncedSafetyEventsPayload(BaseModel):
+    events: list[dict] = []
 
 
 def _require_admin(secret: str | None) -> None:
@@ -883,6 +905,171 @@ def _queue_row(
     }
 
 
+def _synced_event_rows(kind: str, since: str | None, limit: int = ROW_LIMIT_PER_KIND) -> list[dict]:
+    clauses = ["kind = ?"]
+    params: list[Any] = [kind]
+    if since:
+        clauses.append("logged_at >= ?")
+        params.append(since)
+    where = " WHERE " + " AND ".join(clauses)
+    conn = _db()
+    try:
+        rows = conn.execute(
+            f"""
+            SELECT * FROM synced_safety_events
+            {where}
+            ORDER BY logged_at DESC
+            LIMIT ?
+            """,
+            tuple(params) + (max(1, min(int(limit), ROW_LIMIT_PER_KIND)),),
+        ).fetchall()
+    finally:
+        conn.close()
+    out = []
+    for row in rows:
+        item = dict(row)
+        detail = {}
+        raw = item.get("detail_json")
+        if raw:
+            try:
+                parsed = json.loads(raw)
+            except (TypeError, json.JSONDecodeError):
+                parsed = None
+            if isinstance(parsed, dict):
+                detail = parsed
+        item["detail"] = detail
+        out.append(item)
+    return out
+
+
+def _count_synced_events(kind: str, since: str | None) -> int:
+    clauses = ["kind = ?"]
+    params: list[Any] = [kind]
+    if since:
+        clauses.append("logged_at >= ?")
+        params.append(since)
+    where = " WHERE " + " AND ".join(clauses)
+    conn = _db()
+    try:
+        row = conn.execute(
+            f"SELECT COUNT(*) AS count FROM synced_safety_events{where}",
+            tuple(params),
+        ).fetchone()
+    finally:
+        conn.close()
+    return int((row["count"] if row else 0) or 0)
+
+
+def _coerce_optional_int(value: Any, *, allow_negative: bool = False) -> int | None:
+    if value is None or value == "":
+        return None
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return None
+    if number == 0 or abs(number) >= 2**63:
+        return None
+    if not allow_negative and number < 0:
+        return None
+    return number
+
+
+def upsert_synced_safety_events(events: list[dict]) -> int:
+    """Store F.O.X safety rows on the API disk so Feature Admin can read them."""
+    if not events:
+        return 0
+    conn = _db()
+    saved = 0
+    try:
+        for raw in events:
+            if not isinstance(raw, dict):
+                continue
+            kind = str(raw.get("kind") or "").strip().lower()
+            external_key = str(raw.get("external_key") or "").strip()
+            if kind not in SYNCED_SAFETY_KINDS or not external_key:
+                continue
+            logged_at = str(raw.get("logged_at") or _now()).strip() or _now()
+            detail = raw.get("detail") if isinstance(raw.get("detail"), dict) else {}
+            detail_json = json.dumps(detail, separators=(",", ":"), sort_keys=True)
+            excerpt = str(raw.get("excerpt") or "").strip()
+            if len(excerpt) > 400:
+                excerpt = excerpt[:397] + "..."
+            row_id = uuid.uuid4().hex
+            conn.execute(
+                """
+                INSERT INTO synced_safety_events (
+                    id, kind, external_key, user_id, username, display_name,
+                    message_id, chat_id, excerpt, detail_json, logged_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(kind, external_key) DO UPDATE SET
+                    user_id = excluded.user_id,
+                    username = excluded.username,
+                    display_name = excluded.display_name,
+                    message_id = excluded.message_id,
+                    chat_id = excluded.chat_id,
+                    excerpt = excluded.excerpt,
+                    detail_json = excluded.detail_json,
+                    logged_at = excluded.logged_at
+                """,
+                (
+                    row_id,
+                    kind,
+                    external_key[:120],
+                    _coerce_optional_int(raw.get("user_id")),
+                    str(raw.get("username") or "")[:80],
+                    str(raw.get("display_name") or "")[:120],
+                    _coerce_optional_int(raw.get("message_id")),
+                    _coerce_optional_int(raw.get("chat_id"), allow_negative=True),
+                    excerpt or None,
+                    detail_json,
+                    logged_at,
+                ),
+            )
+            saved += 1
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+    return saved
+
+
+def safety_events_source_meta(since: str | None = None) -> dict:
+    """Describe whether Command Center is reading fox_logs or bot-synced rows."""
+    import os
+
+    from . import main
+
+    fox_available = bool(os.path.exists(main.FOX_LOGS_DB_PATH))
+    fox_flood = 0
+    if fox_available:
+        where, params = main.since_clause("logged_at", since)
+        fox_flood = int(
+            main.fox_db_value(f"SELECT COUNT(*) FROM flood_flags{where}", params) or 0
+        )
+    synced_flood = _count_synced_events("flood", since)
+    synced_total = (
+        synced_flood
+        + _count_synced_events("tone", since)
+        + _count_synced_events("link", since)
+        + _count_synced_events("member", since)
+    )
+    if fox_flood > 0:
+        source = "fox_logs"
+    elif synced_total > 0:
+        source = "bot_sync"
+    elif fox_available:
+        source = "fox_logs"
+    else:
+        source = "bot_sync"
+    return {
+        "events_source": source,
+        "fox_logs_available": fox_available,
+        "synced_event_count": synced_total,
+    }
+
+
 def build_action_queue_rows(since: str | None) -> list[dict]:
     from . import main
 
@@ -920,6 +1107,60 @@ def build_action_queue_rows(since: str | None) -> list[dict]:
         """,
         params + (ROW_LIMIT_PER_KIND,),
     )
+    # Render keeps separate disks for API and Fox. When fox_logs.db is not on the
+    # API service, use events pushed by the bot so Command Center still fills.
+    if not flood_rows:
+        for row in _synced_event_rows("flood", since):
+            detail = row.get("detail") or {}
+            flood_rows.append(
+                {
+                    "id": row.get("external_key"),
+                    "user_id": row.get("user_id"),
+                    "username": row.get("username"),
+                    "display_name": row.get("display_name"),
+                    "message_count": detail.get("message_count"),
+                    "window_seconds": detail.get("window_seconds"),
+                    "message_excerpt": row.get("excerpt"),
+                    "logged_at": row.get("logged_at"),
+                    "message_id": row.get("message_id"),
+                    "chat_id": row.get("chat_id"),
+                }
+            )
+    if not link_rows:
+        for row in _synced_event_rows("link", since):
+            detail = row.get("detail") or {}
+            link_rows.append(
+                {
+                    "id": row.get("external_key"),
+                    "message_id": row.get("message_id"),
+                    "user_id": row.get("user_id"),
+                    "username": row.get("username"),
+                    "display_name": row.get("display_name"),
+                    "message_excerpt": row.get("excerpt"),
+                    "link_samples": detail.get("link_samples"),
+                    "logged_at": row.get("logged_at"),
+                    "chat_id": row.get("chat_id"),
+                }
+            )
+    if not tone_rows:
+        for row in _synced_event_rows("tone", since):
+            detail = row.get("detail") or {}
+            tone_rows.append(
+                {
+                    "id": row.get("external_key"),
+                    "message_id": row.get("message_id"),
+                    "user_id": row.get("user_id"),
+                    "username": row.get("username"),
+                    "display_name": row.get("display_name"),
+                    "categories": detail.get("categories"),
+                    "severity": detail.get("severity"),
+                    "score": detail.get("score"),
+                    "matched_terms": detail.get("matched_terms"),
+                    "message_excerpt": row.get("excerpt"),
+                    "logged_at": row.get("logged_at"),
+                    "chat_id": row.get("chat_id"),
+                }
+            )
 
     care_where = ""
     care_params: tuple = ()
@@ -965,8 +1206,8 @@ def build_action_queue_rows(since: str | None) -> list[dict]:
                 "username": row.get("username") or "",
                 "display_name": row.get("display_name") or "",
                 "excerpt": row.get("message_excerpt"),
-                "message_id": None,
-                "chat_id": None,
+                "message_id": row.get("message_id"),
+                "chat_id": row.get("chat_id"),
                 "created_at": row.get("logged_at"),
                 "detail": {
                     "message_count": row.get("message_count"),
@@ -987,7 +1228,7 @@ def build_action_queue_rows(since: str | None) -> list[dict]:
                 "display_name": row.get("display_name") or "",
                 "excerpt": row.get("message_excerpt"),
                 "message_id": row.get("message_id"),
-                "chat_id": None,
+                "chat_id": row.get("chat_id"),
                 "created_at": row.get("logged_at"),
                 "detail": {"link_samples": row.get("link_samples")},
             },
@@ -1005,7 +1246,7 @@ def build_action_queue_rows(since: str | None) -> list[dict]:
                 "display_name": row.get("display_name") or "",
                 "excerpt": row.get("message_excerpt"),
                 "message_id": row.get("message_id"),
-                "chat_id": None,
+                "chat_id": row.get("chat_id"),
                 "created_at": row.get("logged_at"),
                 "detail": {
                     "categories": row.get("categories"),
@@ -1797,6 +2038,25 @@ def bot_upsert_terminology(
     finally:
         conn.close()
     return {"status": "ok", "terminology": _public_terminology(row)}
+
+
+@router.post("/api/bot-sync/safety-events")
+def bot_sync_safety_events(
+    payload: SyncedSafetyEventsPayload,
+    x_bot_sync_secret: str | None = Header(default=None),
+):
+    """Receive flood/tone/link/member rows from F.O.X (separate Render disk)."""
+    _require_bot(x_bot_sync_secret)
+    events = payload.events if isinstance(payload.events, list) else []
+    if len(events) > 500:
+        raise _http(400, "events must contain at most 500 items")
+    saved = upsert_synced_safety_events(events)
+    return {
+        "status": "ok",
+        "saved": saved,
+        "received": len(events),
+        **safety_events_source_meta(None),
+    }
 
 
 @router.post("/api/admin/safety/terminology/delete")

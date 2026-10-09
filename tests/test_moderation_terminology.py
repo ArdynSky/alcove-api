@@ -34,8 +34,10 @@ class ModerationTerminologySourceTests(unittest.TestCase):
         self.assertIn("/api/admin/safety/terminology", routes)
         self.assertIn("/api/admin/safety/teach", routes)
         self.assertIn("/api/bot-sync/safety-terminology", routes)
+        self.assertIn("/api/bot-sync/safety-events", routes)
         self.assertIn("/api/admin/safety/terminology/delete", routes)
         self.assertIn("moderation_terminology", source)
+        self.assertIn("synced_safety_events", source)
         self.assertIn("message_excerpt", source)
         self.assertIn("CREATE TABLE IF NOT EXISTS moderation_terminology", source)
 
