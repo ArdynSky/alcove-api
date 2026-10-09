@@ -167,6 +167,66 @@ class SafetyEnforcementTests(unittest.TestCase):
         self.assertEqual(tone["detail"]["severity"], "high")
         self.assertEqual(tone["strike_count"], 0)
 
+    def test_bot_sync_safety_events_fill_queue_without_fox_db(self):
+        """Command Center can use synced events when fox_logs.db is not mounted."""
+        main.FOX_LOGS_DB_PATH = os.path.join(self.tmp.name, "missing-fox.db")
+        pushed = self.client.post(
+            "/api/bot-sync/safety-events",
+            headers=BOT_HEADERS,
+            json={
+                "events": [
+                    {
+                        "kind": "flood",
+                        "external_key": "flood:900",
+                        "user_id": 701,
+                        "username": "floody",
+                        "display_name": "Floody",
+                        "chat_id": -100999,
+                        "message_id": 55,
+                        "excerpt": "spam spam spam",
+                        "logged_at": main.now_iso(),
+                        "detail": {"message_count": 9, "window_seconds": 60},
+                    },
+                    {
+                        "kind": "tone",
+                        "external_key": "tone:901",
+                        "user_id": 702,
+                        "username": "tonee",
+                        "display_name": "Tonee",
+                        "chat_id": -100999,
+                        "message_id": 56,
+                        "excerpt": "flagged wording for the room",
+                        "logged_at": main.now_iso(),
+                        "detail": {
+                            "categories": "report_flagged",
+                            "severity": "high",
+                            "score": 4,
+                            "matched_terms": "report_flagged: phrase",
+                        },
+                    },
+                ]
+            },
+        )
+        self.assertEqual(pushed.status_code, 200, pushed.text)
+        self.assertEqual(pushed.json()["saved"], 2)
+        self.assertEqual(pushed.json()["events_source"], "bot_sync")
+
+        queue = self._queue()
+        self.assertEqual(queue["events_source"], "bot_sync")
+        self.assertFalse(queue["db_available"])
+        self.assertGreaterEqual(queue["synced_event_count"], 2)
+        flood_rows = [row for row in queue["rows"] if row["kind"] == "flood"]
+        tone_rows = [row for row in queue["rows"] if row["kind"] == "tone"]
+        self.assertTrue(flood_rows)
+        self.assertEqual(flood_rows[0]["user_id"], 701)
+        self.assertEqual(flood_rows[0]["chat_id"], -100999)
+        self.assertEqual(flood_rows[0]["message_id"], 55)
+        self.assertEqual(flood_rows[0]["detail"]["message_count"], 9)
+        self.assertTrue(tone_rows)
+        self.assertEqual(tone_rows[0]["message_id"], 56)
+        self.assertTrue(any(item["kind"] == "flood" for item in queue["items"]))
+        self.assertTrue(any(item["kind"] == "tone" for item in queue["items"]))
+
     def test_enqueue_claim_complete_and_keep_bulk_job(self):
         muted = self.client.post(
             "/api/admin/safety/actions",

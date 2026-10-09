@@ -51,9 +51,12 @@ from .homepage_settings import ensure_homepage_media_optimized
 from .help_cms import router as help_cms_router
 from .safety_enforcement import (
     ACTION_QUEUE_ROW_GAPS,
+    _count_synced_events,
+    _synced_event_rows,
     build_action_queue_rows,
     pending_bot_action_jobs,
     router as safety_enforcement_router,
+    safety_events_source_meta,
 )
 
 try:
@@ -6592,6 +6595,7 @@ def build_safety_action_queue(period: str = "today"):
     since = group_activity_since(period)
     summary = build_group_activity_summary(period)
     overview = summary.get("overview") or {}
+    events_meta = safety_events_source_meta(since)
     items = []
 
     def add_item(kind, title, count, severity, hint=""):
@@ -6607,9 +6611,20 @@ def build_safety_action_queue(period: str = "today"):
             }
         )
 
-    add_item("flood", "Flood alerts", overview.get("floodAlerts", 0), "high", "Users posting too fast")
-    add_item("links", "Link violations", overview.get("linkAttempts", 0), "high", "Review link alerts tab")
-    add_item("tone", "Tone alerts", overview.get("toneAlerts", 0), "medium", "Review tone flags tab")
+    flood_count = overview.get("floodAlerts", 0) or 0
+    link_count = overview.get("linkAttempts", 0) or 0
+    tone_count = overview.get("toneAlerts", 0) or 0
+    # Separate Render disks: when fox_logs.db is empty on the API, use synced counts.
+    if not flood_count:
+        flood_count = _count_synced_events("flood", since)
+    if not link_count:
+        link_count = _count_synced_events("link", since)
+    if not tone_count:
+        tone_count = _count_synced_events("tone", since)
+
+    add_item("flood", "Flood alerts", flood_count, "high", "Users posting too fast")
+    add_item("links", "Link violations", link_count, "high", "Review link alerts tab")
+    add_item("tone", "Tone alerts", tone_count, "medium", "Review tone flags tab")
     add_item("strikes", "Users at 2+ strikes", len(summary.get("usersNeedingAttention") or []), "high", "Review user profiles")
     add_item("captcha", "Failed verifications", overview.get("failedCaptcha", 0), "medium", "Check join verification flow")
 
@@ -6624,6 +6639,21 @@ def build_safety_action_queue(period: str = "today"):
         """,
         link_params,
     )
+    if not recent_flood:
+        recent_flood = []
+        for row in _synced_event_rows("flood", since, limit=5):
+            detail = row.get("detail") or {}
+            recent_flood.append(
+                {
+                    "user_id": row.get("user_id"),
+                    "username": row.get("username"),
+                    "display_name": row.get("display_name"),
+                    "message_count": detail.get("message_count"),
+                    "window_seconds": detail.get("window_seconds"),
+                    "message_excerpt": row.get("excerpt"),
+                    "logged_at": row.get("logged_at"),
+                }
+            )
     member_where, member_params = since_clause("logged_at", since)
     recent_joins = fox_db_rows(
         f"""
@@ -6635,6 +6665,20 @@ def build_safety_action_queue(period: str = "today"):
         """,
         member_params,
     )
+    if not recent_joins:
+        recent_joins = []
+        for row in _synced_event_rows("member", since, limit=8):
+            detail = row.get("detail") or {}
+            recent_joins.append(
+                {
+                    "user_id": row.get("user_id"),
+                    "username": row.get("username"),
+                    "display_name": row.get("display_name"),
+                    "event_type": detail.get("event_type") or "member",
+                    "detail": detail.get("detail") or row.get("excerpt") or "",
+                    "logged_at": row.get("logged_at"),
+                }
+            )
 
     pending_pulse = len([
         entry for entry in pulse_question_suggestions
@@ -6658,6 +6702,11 @@ def build_safety_action_queue(period: str = "today"):
         "settings": load_safety_settings(),
         "rows": build_action_queue_rows(since),
         "row_gaps": ACTION_QUEUE_ROW_GAPS,
+        "db_available": events_meta.get("fox_logs_available"),
+        "events_source": events_meta.get("events_source"),
+        "synced_event_count": events_meta.get("synced_event_count"),
+        "last_bot_sync_at": last_bot_sync_at,
+        "source": events_meta.get("events_source"),
     }
 
 
