@@ -47,8 +47,9 @@ SAFETY_ACTIONS = {
     "warn_public",
     "ban_request",
     "dismiss",
+    "delete_message",
 }
-USER_REQUIRED_ACTIONS = SAFETY_ACTIONS - {"dismiss"}
+USER_REQUIRED_ACTIONS = SAFETY_ACTIONS - {"dismiss", "delete_message"}
 MUTE_HOURS = {1, 6, 12, 24}
 ACTION_SOURCES = {"feature_admin", "fox_care", "telegram"}
 CARE_REASONS = {
@@ -432,6 +433,7 @@ class SafetyActionPayload(BaseModel):
         "warn_public",
         "ban_request",
         "dismiss",
+        "delete_message",
     ]
     telegram_user_id: int | None = None
     chat_id: int | None = None
@@ -1090,6 +1092,9 @@ def _validate_action(payload: SafetyActionPayload) -> dict:
             raise _http(400, "hours must be 1, 6, 12, or 24 for mute")
     elif hours is not None:
         raise _http(400, "hours is only valid for mute")
+    message_id = _bounded_int(payload.message_id, field="message_id")
+    if action == "delete_message" and message_id is None:
+        raise _http(400, "delete_message requires message_id")
     if care_report_id:
         conn = _db()
         try:
@@ -1101,7 +1106,7 @@ def _validate_action(payload: SafetyActionPayload) -> dict:
         "action": action,
         "telegram_user_id": telegram_user_id,
         "chat_id": _bounded_int(payload.chat_id, field="chat_id", allow_negative=True),
-        "message_id": _bounded_int(payload.message_id, field="message_id"),
+        "message_id": message_id,
         "hours": hours if action == "mute" else None,
         "reason": _clean_text(payload.reason, limit=MAX_REASON_LEN, field="reason"),
         "source": payload.source,
