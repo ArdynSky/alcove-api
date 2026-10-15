@@ -164,6 +164,8 @@ def default_homepage_settings() -> dict:
         "fallback_image_url": "",
         "logo_url": "",
         "bottom_banner_url": "",
+        # Default lobby loop on live-holding when no VC / no per-agenda holding video.
+        "idle_holding_video_url": "",
         "tiles": {key: _default_tile(key) for key in TILE_KEYS},
     }
 
@@ -218,6 +220,13 @@ def normalize_homepage_settings(raw: Any) -> dict:
             raw.get("bottom_banner_url")
             or raw.get("bottomBannerUrl")
             or raw.get("bottom_banner")
+            or ""
+        ),
+        "idle_holding_video_url": _clean_url(
+            raw.get("idle_holding_video_url")
+            or raw.get("idleHoldingVideoUrl")
+            or raw.get("idle_lobby_video_url")
+            or raw.get("idleLobbyVideoUrl")
             or ""
         ),
         "tiles": {key: _normalize_tile(key, tiles_raw.get(key)) for key in TILE_KEYS},
@@ -424,6 +433,7 @@ class HomepageSettingsUpdate(BaseModel):
     fallback_image_url: Optional[str] = ""
     logo_url: Optional[str] = ""
     bottom_banner_url: Optional[str] = ""
+    idle_holding_video_url: Optional[str] = ""
     tiles: dict[str, HomepageTileUpdate] = Field(default_factory=dict)
 
 
@@ -459,6 +469,7 @@ def update_homepage_settings(payload: HomepageSettingsUpdate):
             "fallback_image_url": payload.fallback_image_url or "",
             "logo_url": payload.logo_url or "",
             "bottom_banner_url": payload.bottom_banner_url or "",
+            "idle_holding_video_url": payload.idle_holding_video_url or "",
             "tiles": tiles,
         }
     )
