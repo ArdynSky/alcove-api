@@ -43,6 +43,7 @@ class HomepageSettingsTests(unittest.TestCase):
         self.assertEqual(settings["fallback_image_url"], "")
         self.assertEqual(settings["logo_url"], "")
         self.assertEqual(settings["bottom_banner_url"], "")
+        self.assertEqual(settings["idle_holding_video_url"], "")
         self.assertEqual(settings["tiles"]["live_room"]["cta"], "LET'S GO!")
         self.assertEqual(settings["tiles"]["live_room"]["preview_opacity"], 50)
         self.assertEqual(settings["tiles"]["archive"]["info_title"], "ARCHIVE")
@@ -54,6 +55,7 @@ class HomepageSettingsTests(unittest.TestCase):
             "fallback_image_url": "https://example.com/bg.jpg",
             "logo_url": "https://example.com/logo.png",
             "bottom_banner_url": "https://example.com/bottom-banner.png",
+            "idle_holding_video_url": "https://example.com/idle-lobby.mp4",
             "tiles": {
                 "live_room": {
                     "preview_video_url": "https://example.com/live.mp4",
@@ -89,6 +91,7 @@ class HomepageSettingsTests(unittest.TestCase):
         loaded = self.client.get("/api/homepage-settings").json()["settings"]
         self.assertEqual(loaded["background_video_url"], "https://example.com/bg.mp4")
         self.assertEqual(loaded["bottom_banner_url"], "https://example.com/bottom-banner.png")
+        self.assertEqual(loaded["idle_holding_video_url"], "https://example.com/idle-lobby.mp4")
         self.assertEqual(loaded["tiles"]["connect"]["cta"], "ENTER")
         self.assertEqual(loaded["tiles"]["live_room"]["info_description"], "Custom live room copy.")
         self.assertEqual(loaded["tiles"]["live_room"]["preview_opacity"], 75)
