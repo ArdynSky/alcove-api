@@ -49,6 +49,7 @@ from .member_progress import router as member_progress_router
 from .homepage_settings import router as homepage_settings_router
 from .homepage_settings import ensure_homepage_media_optimized
 from .help_cms import router as help_cms_router
+from .daily_checkin import router as daily_checkin_router
 from .safety_enforcement import (
     ACTION_QUEUE_ROW_GAPS,
     _count_synced_events,
@@ -84,6 +85,7 @@ app.include_router(member_progress_router)
 app.include_router(homepage_settings_router)
 app.include_router(help_cms_router)
 app.include_router(safety_enforcement_router)
+app.include_router(daily_checkin_router)
 
 CORS_ALLOWED_ORIGINS = [
     "null",
