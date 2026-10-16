@@ -65,6 +65,9 @@ STYLE_KEYS = {
     "skin_opacity",
     "stamp_opacity",
 }
+_ASSET_RE = re.compile(r"^(?:https://|assets/|/assets/)[^\s\"'<>]{1,480}\Z", re.IGNORECASE)
+_ID_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,80}\Z")
+_USERNAME_RE = re.compile(r"^[A-Za-z0-9_]{1,32}\Z")
 CARE_REASONS = {
     "harassment",
     "unsafe_solicitation",
@@ -86,6 +89,8 @@ CREATE TABLE IF NOT EXISTS daily_checkins (
     feeling TEXT NOT NULL,
     message TEXT NOT NULL DEFAULT '',
     display_name TEXT NOT NULL,
+    username TEXT NOT NULL DEFAULT '',
+    feed_style_json TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL,
     deleted_at TEXT,
     UNIQUE(user_id, community_date)
@@ -150,6 +155,11 @@ def _connect() -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.executescript(_SCHEMA)
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(daily_checkins)")}
+    if "username" not in columns:
+        conn.execute("ALTER TABLE daily_checkins ADD COLUMN username TEXT NOT NULL DEFAULT ''")
+    if "feed_style_json" not in columns:
+        conn.execute("ALTER TABLE daily_checkins ADD COLUMN feed_style_json TEXT NOT NULL DEFAULT ''")
     return conn
 
 
@@ -195,6 +205,19 @@ def _user_from_init(init_data: str | None) -> dict:
 
 def _init_data(body_value: str | None, header_value: str | None) -> str:
     return (header_value or body_value or "").strip()
+
+
+def _username(user: dict) -> str:
+    raw = str(user.get("username") or "").strip().lstrip("@")
+    if not _USERNAME_RE.fullmatch(raw):
+        return ""
+    return raw
+
+
+def _row_text(row: sqlite3.Row, key: str) -> str:
+    if key not in row.keys():
+        return ""
+    return str(row[key] or "")
 
 
 def _display_name(user: dict) -> str:
@@ -302,7 +325,112 @@ def _insert_grant(
     return _pending_grant(conn, source, source_id)
 
 
-def _feed_style(conn: sqlite3.Connection, user_id: str) -> dict:
+def _safe_asset(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text or text.lower().startswith("javascript:"):
+        return ""
+    if _ASSET_RE.fullmatch(text):
+        return text
+    return ""
+
+
+def _clean_style_value(key: str, value: Any) -> Any:
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)) and key.endswith("opacity"):
+        return max(0.1, min(0.3, float(value)))
+    if isinstance(value, (dict, list)):
+        return None
+    text = str(value).strip()
+    if not text or len(text) > 500 or text.lower().startswith("javascript:"):
+        return None
+    if key.endswith("_src") or key.endswith("Src"):
+        return _safe_asset(text) or None
+    if key in {"color_swatch", "colorSwatch"}:
+        raw = text[1:] if text.startswith("#") else text
+        if re.fullmatch(r"[0-9A-Fa-f]{6}", raw):
+            return f"#{raw.upper()}"
+        return None
+    if key in {"skin_layout", "skinLayout"}:
+        lowered = text.lower()
+        if lowered in {"banner", "wide", "full", "fill"}:
+            return "banner"
+        if lowered in {"stamp", "square", "corner", "seal"}:
+            return "stamp"
+        return None
+    if key in {"color", "skin", "stamp", "cornerSticker", "backdrop"}:
+        return text if _ID_RE.fullmatch(text) else None
+    if key in {"sticker_emoji", "stickerEmoji"}:
+        return text[:16]
+    return text
+
+
+def _sanitize_style(feed: Any) -> dict[str, Any]:
+    if not isinstance(feed, dict):
+        return {}
+    clean: dict[str, Any] = {}
+    for key, value in feed.items():
+        if key not in STYLE_KEYS:
+            continue
+        kept = _clean_style_value(key, value)
+        if kept is None or kept == "":
+            continue
+        clean[key] = kept
+    return clean
+
+
+def _meta_entry(owned_meta: dict, kind: str, item_id: str) -> dict:
+    if not item_id or item_id == "none" or not isinstance(owned_meta, dict):
+        return {}
+    entry = owned_meta.get(f"{kind}:{item_id}")
+    return entry if isinstance(entry, dict) else {}
+
+
+def _enrich_style(style: dict[str, Any], owned_meta: Any) -> dict[str, Any]:
+    """Attach asset URLs from the author's owned cosmetics.
+
+    The saved feed object stores catalogue ids. Custom skins, stamps, and
+    stickers only paint on someone else's screen when the URL travels with
+    the id, the same way Live Feed serializes a message.
+    """
+    clean = dict(style)
+    meta = owned_meta if isinstance(owned_meta, dict) else {}
+
+    skin = _meta_entry(meta, "skin", str(clean.get("skin") or ""))
+    skin_src = _safe_asset(skin.get("image") or skin.get("src"))
+    if skin_src and "skin_src" not in clean:
+        clean["skin_src"] = skin_src
+    skin_layout = _clean_style_value("skin_layout", skin.get("layout"))
+    if skin_layout and "skin_layout" not in clean:
+        clean["skin_layout"] = skin_layout
+    skin_opacity = _clean_style_value("skin_opacity", skin.get("opacity"))
+    if skin_opacity is not None and "skin_opacity" not in clean and str(clean.get("skin") or "") not in {"", "none"}:
+        clean["skin_opacity"] = skin_opacity
+
+    stamp = _meta_entry(meta, "skin", str(clean.get("stamp") or ""))
+    stamp_src = _safe_asset(stamp.get("image") or stamp.get("src"))
+    if stamp_src and "stamp_src" not in clean:
+        clean["stamp_src"] = stamp_src
+    stamp_opacity = _clean_style_value("stamp_opacity", stamp.get("opacity"))
+    if stamp_opacity is not None and "stamp_opacity" not in clean and str(clean.get("stamp") or "") not in {"", "none"}:
+        clean["stamp_opacity"] = stamp_opacity
+
+    sticker = _meta_entry(meta, "sticker", str(clean.get("cornerSticker") or ""))
+    sticker_src = _safe_asset(sticker.get("image") or sticker.get("src"))
+    if sticker_src and "sticker_src" not in clean:
+        clean["sticker_src"] = sticker_src
+    emoji = _clean_style_value("sticker_emoji", sticker.get("emoji"))
+    if emoji and "sticker_emoji" not in clean:
+        clean["sticker_emoji"] = emoji
+
+    color = _meta_entry(meta, "color", str(clean.get("color") or ""))
+    swatch = _clean_style_value("color_swatch", color.get("swatch") or color.get("color"))
+    if swatch and "color_swatch" not in clean:
+        clean["color_swatch"] = swatch
+    return clean
+
+
+def _profile_style(conn: sqlite3.Connection, user_id: str) -> dict[str, Any]:
     try:
         row = conn.execute(
             "SELECT payload_json FROM member_progress WHERE user_id = ?",
@@ -316,25 +444,29 @@ def _feed_style(conn: sqlite3.Connection, user_id: str) -> dict:
         payload = json.loads(row["payload_json"] or "{}")
     except json.JSONDecodeError:
         return {}
-    feed = payload.get("feed") if isinstance(payload, dict) else None
-    if not isinstance(feed, dict):
+    if not isinstance(payload, dict):
         return {}
-    clean: dict[str, Any] = {}
-    for key, value in feed.items():
-        if key not in STYLE_KEYS or value is None:
-            continue
-        if isinstance(value, bool):
-            continue
-        if isinstance(value, (int, float)) and key.endswith("opacity"):
-            clean[key] = max(0.1, min(0.3, float(value)))
-            continue
-        text = str(value).strip()
-        if not text or len(text) > 500:
-            continue
-        if text.lower().startswith("javascript:"):
-            continue
-        clean[key] = text
-    return clean
+    return _enrich_style(_sanitize_style(payload.get("feed")), payload.get("ownedMeta"))
+
+
+def _stored_style(row: sqlite3.Row) -> dict[str, Any]:
+    raw = _row_text(row, "feed_style_json")
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return {}
+    return _sanitize_style(parsed)
+
+
+def _public_style(conn: sqlite3.Connection, row: sqlite3.Row) -> dict[str, Any]:
+    # The post snapshot is what the author previewed, including asset URLs.
+    # Older rows fall back to the profile, with ownedMeta URLs attached.
+    stored = _stored_style(row)
+    if stored:
+        return stored
+    return _profile_style(conn, row["user_id"])
 
 
 def _checkin_row(conn: sqlite3.Connection, user_id: str, day: str):
@@ -377,10 +509,11 @@ def _public_checkin(conn: sqlite3.Connection, row: sqlite3.Row, viewer_id: str) 
         "deleted": deleted,
         "reply_count": int(reply_count or 0) if not deleted else 0,
         "is_self": is_self,
+        "username": "" if deleted else _row_text(row, "username"),
         "already_replied": bool(slot) and not is_self,
         "can_reply": (not is_self) and (not slot) and (not deleted) and row["community_date"] == community_clock()["community_date"],
         "can_delete": is_self and not deleted,
-        "feed_style": {} if deleted else _feed_style(conn, row["user_id"]),
+        "feed_style": {} if deleted else _public_style(conn, row),
     }
 
 
@@ -404,6 +537,7 @@ class SubmitPayload(BaseModel):
     message: str | None = None
     community_date: str | None = None
     init_data: str | None = None
+    feed_style: dict[str, Any] | None = None
 
 
 class ReplyPayload(BaseModel):
@@ -433,7 +567,13 @@ def _assert_same_day(confirmed: str | None, day: str) -> None:
         )
 
 
-def submit_checkin(user: dict, feeling: str, message: str | None, confirmed_day: str | None) -> dict:
+def submit_checkin(
+    user: dict,
+    feeling: str,
+    message: str | None,
+    confirmed_day: str | None,
+    feed_style: dict | None = None,
+) -> dict:
     user_id = _user_id(user)
     _limit(user_id, "write", 20)
     mood = str(feeling or "").strip().lower()
@@ -462,13 +602,25 @@ def submit_checkin(user: dict, feeling: str, message: str | None, confirmed_day:
                 **clock,
             }
         checkin_id = uuid.uuid4().hex
+        style_json = json.dumps(_sanitize_style(feed_style), separators=(",", ":"), ensure_ascii=False)
         conn.execute(
             """
             INSERT INTO daily_checkins (
-                id, user_id, community_date, feeling, message, display_name, created_at, deleted_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL)
+                id, user_id, community_date, feeling, message, display_name, username,
+                feed_style_json, created_at, deleted_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
             """,
-            (checkin_id, user_id, day, mood, text, _display_name(user), _now_iso()),
+            (
+                checkin_id,
+                user_id,
+                day,
+                mood,
+                text,
+                _display_name(user),
+                _username(user),
+                style_json,
+                _now_iso(),
+            ),
         )
         award = _insert_grant(
             conn,
@@ -882,7 +1034,13 @@ def route_submit(
     x_telegram_init_data: str | None = Header(default=None, alias="X-Telegram-Init-Data"),
 ):
     user = _user_from_init(_init_data(payload.init_data, x_telegram_init_data))
-    return submit_checkin(user, payload.feeling, payload.message, payload.community_date)
+    return submit_checkin(
+        user,
+        payload.feeling,
+        payload.message,
+        payload.community_date,
+        payload.feed_style,
+    )
 
 
 @router.delete("")
