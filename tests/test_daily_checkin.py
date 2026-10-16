@@ -111,11 +111,11 @@ class DailyCheckInTests(unittest.TestCase):
         self.assertEqual(again.json()["award"]["id"], award["id"])
 
     def test_character_limit_counts_code_points(self):
-        emoji = "😀" * 150
+        emoji = "😀" * 120
         ok = self._post(user_id="2", feeling="hard", message=emoji)
         self.assertEqual(ok.status_code, 200)
-        self.assertEqual(len(ok.json()["checkin"]["message"]), 150)
-        over = self._post(user_id="3", feeling="good", message="😀" * 151)
+        self.assertEqual(len(ok.json()["checkin"]["message"]), 120)
+        over = self._post(user_id="3", feeling="good", message="😀" * 121)
         self.assertEqual(over.status_code, 400)
         self.assertEqual(self._grant_count(3), 0)
 
@@ -137,6 +137,7 @@ class DailyCheckInTests(unittest.TestCase):
         self.assertEqual(feed.status_code, 200)
         messages = [post["message"] for post in feed.json()["posts"]]
         self.assertEqual(messages, ["between two", "between one"])
+        self.assertEqual(feed.json()["counts"], {"good": 1, "between": 2, "hard": 0})
         self.assertNotIn("good one", messages)
         self.assertNotIn("@", feed.json()["posts"][0]["display_name"])
 
@@ -335,6 +336,74 @@ class DailyCheckInTests(unittest.TestCase):
         if care is not None:
             self.assertEqual(care[0], "telegram")
             self.assertEqual(care[1], "spam")
+
+    def test_posted_style_and_profile_art_travel_with_username(self):
+        from api import member_progress
+
+        member_progress.save_profile(
+            "2",
+            {
+                "updated_at": "2026-06-15T12:00:00+00:00",
+                "feed": {
+                    "color": "rose",
+                    "skin": "custom_banner",
+                    "stamp": "custom_stamp",
+                    "cornerSticker": "custom_sticker",
+                },
+                "ownedMeta": {
+                    "skin:custom_banner": {
+                        "image": "assets/custom/banner.png",
+                        "layout": "banner",
+                        "opacity": 0.2,
+                    },
+                    "skin:custom_stamp": {"src": "assets/custom/stamp.png", "layout": "stamp"},
+                    "sticker:custom_sticker": {"image": "assets/custom/sticker.png", "emoji": "✨"},
+                    "color:rose": {"swatch": "#E27AA0"},
+                },
+            },
+            replace=True,
+        )
+        posted = self.client.post(
+            "/api/daily-checkin",
+            headers=self._headers("1"),
+            json={
+                "feeling": "between",
+                "message": "carrying my box",
+                "community_date": "2026-06-15",
+                "feed_style": {
+                    "color": "blue",
+                    "skin": "pack_skin",
+                    "skin_src": "assets/packs/skin.png",
+                    "skin_layout": "banner",
+                    "stamp": "pack_stamp",
+                    "stamp_src": "https://cdn.example/stamp.png",
+                    "cornerSticker": "pack_sticker",
+                    "sticker_src": "javascript:alert(1)",
+                    "sticker_emoji": "💚",
+                    "sneaky": "<script>",
+                },
+            },
+        )
+        self.assertEqual(posted.status_code, 200)
+        own = posted.json()["checkin"]
+        self.assertEqual(own["display_name"], "Ardyn Sky")
+        self.assertEqual(own["username"], "ardyn")
+        self.assertEqual(own["feed_style"]["skin_src"], "assets/packs/skin.png")
+        self.assertEqual(own["feed_style"]["stamp_src"], "https://cdn.example/stamp.png")
+        self.assertEqual(own["feed_style"]["sticker_emoji"], "💚")
+        self.assertNotIn("sticker_src", own["feed_style"])
+        self.assertNotIn("sneaky", own["feed_style"])
+
+        self._post(user_id="2", feeling="between", message="profile art")
+        feed = self.client.get("/api/daily-checkin/feed?feeling=between", headers=self._headers("1"))
+        jamie = next(post for post in feed.json()["posts"] if post["username"] == "jamie")
+        self.assertEqual(jamie["display_name"], "Jamie")
+        self.assertNotIn("@", jamie["display_name"])
+        self.assertEqual(jamie["feed_style"]["skin"], "custom_banner")
+        self.assertEqual(jamie["feed_style"]["skin_src"], "assets/custom/banner.png")
+        self.assertEqual(jamie["feed_style"]["stamp_src"], "assets/custom/stamp.png")
+        self.assertEqual(jamie["feed_style"]["sticker_src"], "assets/custom/sticker.png")
+        self.assertEqual(jamie["feed_style"]["color_swatch"], "#E27AA0")
 
 
 if __name__ == "__main__":
