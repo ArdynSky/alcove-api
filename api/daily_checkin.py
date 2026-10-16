@@ -31,7 +31,8 @@ FEELING_LABELS = {
     "between": "In between",
     "hard": "Having a hard day",
 }
-MESSAGE_LIMIT = 150
+CHECKIN_MESSAGE_LIMIT = 120
+REPLY_MESSAGE_LIMIT = 150
 REPLY_EXP = 10
 REPLY_EXP_LIMIT = 10
 CHECKIN_FEELING_EXP = 30
@@ -219,13 +220,13 @@ def _is_moderator(user_id: str) -> bool:
     return str(user_id) in ids
 
 
-def normalize_message(value: str | None, *, allow_blank: bool) -> str:
+def normalize_message(value: str | None, *, allow_blank: bool, limit: int) -> str:
     text = str(value or "")
     text = text.replace("\r\n", " ").replace("\r", " ").replace("\n", " ")
     text = text.replace("\u2028", " ").replace("\u2029", " ")
     text = re.sub(r"[ \t\f\v]+", " ", text).strip()
-    if len(text) > MESSAGE_LIMIT:
-        raise _http(400, f"Messages can be at most {MESSAGE_LIMIT} characters.")
+    if len(text) > limit:
+        raise _http(400, f"Messages can be at most {limit} characters.")
     if not allow_blank and not text:
         raise _http(400, "Reply text is required.")
     return text
@@ -438,7 +439,7 @@ def submit_checkin(user: dict, feeling: str, message: str | None, confirmed_day:
     mood = str(feeling or "").strip().lower()
     if mood not in FEELINGS:
         raise _http(400, "Choose how you are feeling today.")
-    text = normalize_message(message, allow_blank=True)
+    text = normalize_message(message, allow_blank=True, limit=CHECKIN_MESSAGE_LIMIT)
     clock = community_clock()
     day = clock["community_date"]
     _assert_same_day(confirmed_day, day)
@@ -596,10 +597,24 @@ def list_feed(user: dict, feeling: str, cursor: str | None, limit: int) -> dict:
         if len(rows) > page and visible:
             last = visible[-1]
             next_cursor = f"{last['created_at']}|{last['id']}"
+        count_rows = conn.execute(
+            """
+            SELECT feeling, COUNT(*) AS total
+            FROM daily_checkins
+            WHERE community_date = ? AND deleted_at IS NULL
+            GROUP BY feeling
+            """,
+            (day,),
+        ).fetchall()
+        counts = {feeling: 0 for feeling in FEELINGS}
+        for count_row in count_rows:
+            if count_row["feeling"] in counts:
+                counts[count_row["feeling"]] = int(count_row["total"])
         return {
             "status": "ok",
             "feeling": mood,
             "feeling_label": FEELING_LABELS[mood],
+            "counts": counts,
             "posts": [_public_checkin(conn, row, user_id) for row in visible],
             "next_cursor": next_cursor,
             **clock,
@@ -675,7 +690,7 @@ def _rewarded_reply_count(conn: sqlite3.Connection, user_id: str, day: str) -> i
 def submit_reply(user: dict, checkin_id: str, message: str) -> dict:
     user_id = _user_id(user)
     _limit(user_id, "write", 20)
-    text = normalize_message(message, allow_blank=False)
+    text = normalize_message(message, allow_blank=False, limit=REPLY_MESSAGE_LIMIT)
     clock = community_clock()
     day = clock["community_date"]
     conn = _connect()

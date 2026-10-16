@@ -111,11 +111,11 @@ class DailyCheckInTests(unittest.TestCase):
         self.assertEqual(again.json()["award"]["id"], award["id"])
 
     def test_character_limit_counts_code_points(self):
-        emoji = "😀" * 150
+        emoji = "😀" * 120
         ok = self._post(user_id="2", feeling="hard", message=emoji)
         self.assertEqual(ok.status_code, 200)
-        self.assertEqual(len(ok.json()["checkin"]["message"]), 150)
-        over = self._post(user_id="3", feeling="good", message="😀" * 151)
+        self.assertEqual(len(ok.json()["checkin"]["message"]), 120)
+        over = self._post(user_id="3", feeling="good", message="😀" * 121)
         self.assertEqual(over.status_code, 400)
         self.assertEqual(self._grant_count(3), 0)
 
@@ -137,6 +137,7 @@ class DailyCheckInTests(unittest.TestCase):
         self.assertEqual(feed.status_code, 200)
         messages = [post["message"] for post in feed.json()["posts"]]
         self.assertEqual(messages, ["between two", "between one"])
+        self.assertEqual(feed.json()["counts"], {"good": 1, "between": 2, "hard": 0})
         self.assertNotIn("good one", messages)
         self.assertNotIn("@", feed.json()["posts"][0]["display_name"])
 
