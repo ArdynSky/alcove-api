@@ -276,6 +276,32 @@ class MemberProgressTests(unittest.TestCase):
         self.assertEqual(merged["stats"]["spotlightColours"], 4)
         self.assertNotIn("pink", merged["spotlightColourSet"])
 
+    def test_checkin_days_keep_counting_across_a_gap(self):
+        self.client.put(
+            "/api/members/profile",
+            json={
+                "init_data": "member-init",
+                "profile": {
+                    "stats": {"checkinDays": 4},
+                    "checkinDayLast": "2026-09-04",
+                    "updated_at": "2026-09-04T21:00:00+00:00",
+                },
+            },
+        )
+        resumed = self.client.put(
+            "/api/members/profile",
+            json={
+                "init_data": "member-init",
+                "profile": {
+                    "stats": {"checkinDays": 1},
+                    "checkinDayLast": "2026-09-10",
+                    "updated_at": "2026-09-10T09:00:00+00:00",
+                },
+            },
+        ).json()["profile"]
+        self.assertEqual(resumed["checkinDayLast"], "2026-09-10")
+        self.assertEqual(resumed["stats"]["checkinDays"], 5)
+
     def test_login_streak_resets_after_a_gap_and_keeps_unique_days(self):
         self.client.put(
             "/api/members/profile",

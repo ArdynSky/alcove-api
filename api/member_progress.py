@@ -181,6 +181,28 @@ def _merge_login_progress(left: dict, right: dict, stats: dict) -> str:
     return later_day
 
 
+def _merge_checkin_days(left: dict, right: dict, stats: dict) -> str:
+    """Unique Daily Check-In days. A gap keeps the running total."""
+    left_day = _day_key(left.get("checkinDayLast"))
+    right_day = _day_key(right.get("checkinDayLast"))
+    left_days = int(_as_dict(left.get("stats")).get("checkinDays") or 0)
+    right_days = int(_as_dict(right.get("stats")).get("checkinDays") or 0)
+    if not left_day and not right_day:
+        stats["checkinDays"] = max(left_days, right_days)
+        return ""
+    if not right_day or (left_day and left_day >= right_day):
+        later_day, later_days = left_day, left_days
+        earlier_day, earlier_days = right_day, right_days
+    else:
+        later_day, later_days = right_day, right_days
+        earlier_day, earlier_days = left_day, left_days
+    count = max(later_days, earlier_days)
+    if earlier_day and later_day != earlier_day:
+        count = max(count, earlier_days + 1)
+    stats["checkinDays"] = count
+    return later_day
+
+
 def _spotlight_colours(value: Any) -> list[str]:
     seen: set[str] = set()
     out: list[str] = []
@@ -315,6 +337,7 @@ def normalize_profile(raw: Any) -> dict:
         "spotlightColourSet": colour_set,
         "stats": clean_stats,
         "loginDayLast": _day_key(data.get("loginDayLast")),
+        "checkinDayLast": _day_key(data.get("checkinDayLast")),
         "redPulseActivationLast": _day_key(data.get("redPulseActivationLast")),
         "memberSince": canonical_member_since(data.get("memberSince")),
         "equippedAchievements": _public_equipped(data.get("equippedAchievements") or data.get("equipped_achievements")),
@@ -358,6 +381,7 @@ def merge_profiles(base: dict | None, incoming: dict | None) -> dict:
     )
     stats["spotlightColours"] = len(colour_set)
     login_day_last = _merge_login_progress(left, right, stats)
+    checkin_day_last = _merge_checkin_days(left, right, stats)
     left_red = _day_key(left.get("redPulseActivationLast"))
     right_red = _day_key(right.get("redPulseActivationLast"))
     red_pulse_activation_last = left_red if left_red >= right_red else right_red
@@ -400,6 +424,7 @@ def merge_profiles(base: dict | None, incoming: dict | None) -> dict:
         "spotlightColourSet": colour_set,
         "stats": stats,
         "loginDayLast": login_day_last,
+        "checkinDayLast": checkin_day_last,
         "redPulseActivationLast": red_pulse_activation_last,
         "equippedAchievements": newer.get("equippedAchievements") or older.get("equippedAchievements") or [],
         "updated_at": newer.get("updated_at") or _now(),
