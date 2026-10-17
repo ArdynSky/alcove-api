@@ -322,6 +322,7 @@ pulse_question_suggestions = []
 pulse_daily_summary_posts = []
 pulse_disabled_questions = []
 miniapp_verifications = []
+verification_pack_choices = {}
 synced_alcove_users = []
 synced_alcove_analytics = {}
 last_bot_sync_at = None
@@ -469,6 +470,7 @@ SYNCED_USER_KEEP_KEYS = (
     "link_attempts",
     "tone_flags",
     "active_strikes",
+    "fox_form",
 )
 
 state = {
@@ -533,6 +535,7 @@ def runtime_state_payload() -> dict:
         "pulse_daily_summary_posts": pulse_daily_summary_posts,
         "pulse_disabled_questions": pulse_disabled_questions,
         "miniapp_verifications": miniapp_verifications,
+        "verification_pack_choices": verification_pack_choices,
         "synced_alcove_users": synced_alcove_users,
         "last_bot_sync_at": last_bot_sync_at,
         "admin_jobs": admin_jobs,
@@ -636,7 +639,7 @@ def ensure_state_store() -> None:
 def apply_runtime_payload(payload: dict) -> None:
     global spotlight_entries, pulse_entries, pulse_receipts, pulse_red_activations, pulse_red_unlock_notifications
     global pulse_question_review_notifications, pulse_question_suggestions, pulse_daily_summary_posts, pulse_disabled_questions
-    global miniapp_verifications, wheel_reaction_history, wheel_review_history, wheel_user_engagement
+    global miniapp_verifications, verification_pack_choices, wheel_reaction_history, wheel_review_history, wheel_user_engagement
     global synced_alcove_users, synced_alcove_analytics, last_bot_sync_at, admin_jobs
 
     spotlight_entries = payload.get("spotlight_entries") if isinstance(payload.get("spotlight_entries"), list) else []
@@ -657,6 +660,8 @@ def apply_runtime_payload(payload: dict) -> None:
     pulse_daily_summary_posts = payload.get("pulse_daily_summary_posts") if isinstance(payload.get("pulse_daily_summary_posts"), list) else []
     pulse_disabled_questions = payload.get("pulse_disabled_questions") if isinstance(payload.get("pulse_disabled_questions"), list) else []
     miniapp_verifications = payload.get("miniapp_verifications") if isinstance(payload.get("miniapp_verifications"), list) else []
+    stored_pack_choices = payload.get("verification_pack_choices")
+    verification_pack_choices = stored_pack_choices if isinstance(stored_pack_choices, dict) else {}
     if lean_mode_enabled():
         wheel_reaction_history.clear()
         wheel_review_history.clear()
@@ -2054,6 +2059,29 @@ def runtime_entry_day(entry: dict) -> str:
     )[:10]
 
 
+def verification_record_day(entry: dict) -> str:
+    for key in (
+        "day_key",
+        "submitted_at",
+        "time",
+        "created_at",
+        "requested_at",
+        "completed_at",
+        "last_seen_at",
+    ):
+        raw = str(entry.get(key) or "").strip()
+        if len(raw) >= 10:
+            return raw[:10]
+    return ""
+
+
+def verification_pack_key_kept(raw) -> bool:
+    normalize = globals().get("normalize_verification_pack_key")
+    if normalize:
+        return bool(normalize(raw))
+    return str(raw or "").strip().lower() in {"biker", "dancer", "daddy", "pup"}
+
+
 def prune_pulse_runtime_data(force: bool = False) -> dict:
     global pulse_entries, pulse_receipts, pulse_red_activations, miniapp_verifications
     global pulse_question_suggestions, spotlight_entries, _last_pulse_prune_day
@@ -2093,7 +2121,8 @@ def prune_pulse_runtime_data(force: bool = False) -> dict:
     miniapp_verifications[:] = [
         entry for entry in miniapp_verifications
         if entry.get("status") == "pending"
-        or runtime_entry_day(entry) >= cutoff
+        or verification_pack_key_kept(entry.get("selected_pack"))
+        or verification_record_day(entry) >= cutoff
     ]
 
     before_suggestions = len(pulse_question_suggestions)
@@ -2134,6 +2163,9 @@ def _flush_runtime_state(force: bool = False) -> bool:
     """Serialize runtime state once, fingerprint with sha256, write DB + JSON file."""
     global _last_saved_runtime_fingerprint
 
+    sweeper = globals().get("retain_verification_pack_choices")
+    if sweeper:
+        sweeper()
     trim_runtime_state_collections()
     prune_stats = prune_pulse_runtime_data()
     payload = runtime_state_payload()
@@ -4220,13 +4252,145 @@ def normalize_verification_packs_active(raw) -> bool:
     return str(raw or "").strip().lower() in {"1", "true", "yes", "on", "active"}
 
 
+_verification_flow_pack_index = {"stamp": None, "by_user": {}, "by_name": {}}
+
+
+def remember_verification_pack_choice(user_id, username, raw_pack) -> str | None:
+    pack_key = normalize_verification_pack_key(raw_pack)
+    if not pack_key:
+        return None
+    username_key = str(username or "").strip().lstrip("@").lower()
+    try:
+        uid = int(user_id or 0)
+    except (TypeError, ValueError):
+        uid = 0
+    record = {"pack_key": pack_key, "username": username_key}
+    if uid:
+        verification_pack_choices[str(uid)] = record
+    if username_key:
+        verification_pack_choices[f"name:{username_key}"] = record
+    return pack_key
+
+
+def _pack_key_from_choice_record(record) -> str | None:
+    if isinstance(record, dict):
+        return normalize_verification_pack_key(record.get("pack_key"))
+    if isinstance(record, str):
+        return normalize_verification_pack_key(record)
+    return None
+
+
+def pack_key_from_choice_store(user_id: int | None, username_key: str) -> str | None:
+    if user_id:
+        pack_key = _pack_key_from_choice_record(verification_pack_choices.get(str(int(user_id))))
+        if pack_key:
+            return pack_key
+    if username_key:
+        return _pack_key_from_choice_record(verification_pack_choices.get(f"name:{username_key}"))
+    return None
+
+
+def retain_verification_pack_choices() -> None:
+    for entry in miniapp_verifications:
+        if not isinstance(entry, dict):
+            continue
+        remember_verification_pack_choice(
+            entry.get("user_id"),
+            entry.get("username"),
+            entry.get("selected_pack"),
+        )
+
+
+def verification_flow_pack_index() -> dict:
+    path = VERIFY_FLOW_LOG_PATH
+    try:
+        stat = os.stat(path)
+        stamp = (getattr(stat, "st_mtime_ns", stat.st_mtime), stat.st_size)
+    except OSError:
+        _verification_flow_pack_index["stamp"] = None
+        _verification_flow_pack_index["by_user"] = {}
+        _verification_flow_pack_index["by_name"] = {}
+        return _verification_flow_pack_index
+    if stamp == _verification_flow_pack_index.get("stamp"):
+        return _verification_flow_pack_index
+    by_user: dict[int, str] = {}
+    by_name: dict[str, str] = {}
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(entry, dict):
+                    continue
+                detail = entry.get("detail") if isinstance(entry.get("detail"), dict) else {}
+                pack_key = normalize_verification_pack_key(
+                    entry.get("selected_pack") or detail.get("selected_pack")
+                )
+                if not pack_key:
+                    continue
+                try:
+                    uid = int(entry.get("user_id") or 0)
+                except (TypeError, ValueError):
+                    uid = 0
+                username_key = str(entry.get("username") or "").strip().lstrip("@").lower()
+                if uid:
+                    by_user[uid] = pack_key
+                if username_key:
+                    by_name[username_key] = pack_key
+    except OSError:
+        return _verification_flow_pack_index
+    _verification_flow_pack_index["stamp"] = stamp
+    _verification_flow_pack_index["by_user"] = by_user
+    _verification_flow_pack_index["by_name"] = by_name
+    return _verification_flow_pack_index
+
+
+def pack_key_from_synced_resident(user_id: int | None, username_key: str) -> str | None:
+    username_match = None
+    for user in synced_alcove_users:
+        if not isinstance(user, dict):
+            continue
+        try:
+            same_user = bool(user_id) and int(user.get("user_id") or user.get("id") or 0) == int(user_id)
+        except (TypeError, ValueError):
+            same_user = False
+        same_username = (
+            bool(username_key)
+            and str(user.get("username") or "").strip().lstrip("@").lower() == username_key
+        )
+        if not (same_user or same_username):
+            continue
+        pack_key = normalize_verification_pack_key(
+            user.get("fox_form")
+            or user.get("reward_label")
+            or user.get("choice_label")
+            or user.get("selected_pack")
+        )
+        if not pack_key:
+            continue
+        if same_user:
+            return pack_key
+        if username_match is None:
+            username_match = pack_key
+    return username_match
+
+
 def find_user_verification_pack_key(user_id: int | None = None, username: str | None = None) -> str | None:
     username_key = (username or "").strip().lstrip("@").lower()
+    try:
+        numeric_user_id = int(user_id) if user_id else None
+    except (TypeError, ValueError):
+        numeric_user_id = None
     matches = []
     for entry in miniapp_verifications:
         if not isinstance(entry, dict):
             continue
-        same_user = user_id and int(entry.get("user_id") or 0) == int(user_id)
+        same_user = numeric_user_id and int(entry.get("user_id") or 0) == numeric_user_id
         same_username = username_key and (entry.get("username") or "").strip().lstrip("@").lower() == username_key
         if not (same_user or same_username):
             continue
@@ -4242,10 +4406,29 @@ def find_user_verification_pack_key(user_id: int | None = None, username: str | 
         matches.sort(reverse=True)
         return matches[0][2]
 
-    if user_id:
+    stored = pack_key_from_choice_store(numeric_user_id, username_key)
+    if stored:
+        return stored
+
+    synced = pack_key_from_synced_resident(numeric_user_id, username_key)
+    if synced:
+        return synced
+
+    if numeric_user_id or username_key:
+        index = verification_flow_pack_index()
+        flow_key = None
+        if numeric_user_id:
+            flow_key = index["by_user"].get(numeric_user_id)
+        if not flow_key and username_key:
+            flow_key = index["by_name"].get(username_key)
+        if flow_key:
+            remember_verification_pack_choice(numeric_user_id, username_key, flow_key)
+            return flow_key
+
+    if numeric_user_id:
         rows = fox_db_rows(
             "SELECT choice_label FROM fox_votes WHERE user_id = ? LIMIT 1",
-            (int(user_id),),
+            (int(numeric_user_id),),
         )
         if rows:
             pack_key = normalize_verification_pack_key(rows[0].get("choice_label"))
@@ -4253,7 +4436,7 @@ def find_user_verification_pack_key(user_id: int | None = None, username: str | 
                 return pack_key
         reward_rows = fox_db_rows(
             "SELECT reward_label FROM user_rewards WHERE user_id = ? LIMIT 1",
-            (int(user_id),),
+            (int(numeric_user_id),),
         )
         if reward_rows:
             pack_key = normalize_verification_pack_key(reward_rows[0].get("reward_label"))
@@ -4776,6 +4959,11 @@ def upsert_miniapp_verification(user: dict) -> dict:
 def update_miniapp_verification_details(entry: dict, payload: MiniappVerificationPayload) -> dict:
     if payload.selected_pack:
         entry["selected_pack"] = clipped_text(payload.selected_pack, 60)
+        remember_verification_pack_choice(
+            entry.get("user_id"),
+            entry.get("username"),
+            entry.get("selected_pack"),
+        )
     if payload.feedback:
         entry["feedback"] = clipped_text(payload.feedback, 1200)
     return entry
