@@ -201,6 +201,34 @@ def _as_list(value: Any) -> list:
     return list(value) if isinstance(value, list) else []
 
 
+def _dedupe_exp_history(*groups: Any) -> list:
+    """Keep one row per grant. Profile sync used to append both copies."""
+    seen: set[str] = set()
+    merged: list = []
+    for group in groups:
+        for item in _as_list(group):
+            if not isinstance(item, dict):
+                continue
+            entry_id = str(item.get("id") or "").strip()
+            if entry_id:
+                key = f"id:{entry_id}"
+            else:
+                key = "raw:" + "|".join(
+                    [
+                        str(item.get("at") or ""),
+                        str(item.get("actionKey") or item.get("action_key") or ""),
+                        str(item.get("amount") or ""),
+                        str(item.get("label") or ""),
+                    ]
+                )
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(item)
+    merged.sort(key=lambda item: str(item.get("at") or ""))
+    return merged[-MAX_EXP_HISTORY:]
+
+
 def _union_str_list(*groups: Any) -> list[str]:
     seen: set[str] = set()
     out: list[str] = []
@@ -279,7 +307,7 @@ def normalize_profile(raw: Any) -> dict:
         "levelRewardsClaimed": _union_str_list(data.get("levelRewardsClaimed"))[:80],
         "claimReceipts": claim_receipts,
         "claimEventIds": _trim_dict(data.get("claimEventIds"), MAX_CLAIM_EVENT_IDS),
-        "expHistory": _as_list(data.get("expHistory"))[-MAX_EXP_HISTORY:],
+        "expHistory": _dedupe_exp_history(data.get("expHistory")),
         "achievementsClaimed": _union_str_list(data.get("achievementsClaimed"))[:200],
         "achievementsNotified": _union_str_list(data.get("achievementsNotified"))[:200],
         "progressionResetToken": str(data.get("progressionResetToken") or "")[:120],
@@ -365,7 +393,7 @@ def merge_profiles(base: dict | None, incoming: dict | None) -> dict:
         "levelRewardsClaimed": _union_str_list(left["levelRewardsClaimed"], right["levelRewardsClaimed"]),
         "claimReceipts": {**left["claimReceipts"], **right["claimReceipts"]},
         "claimEventIds": {**left["claimEventIds"], **right["claimEventIds"]},
-        "expHistory": (_as_list(older.get("expHistory")) + _as_list(newer.get("expHistory")))[-MAX_EXP_HISTORY:],
+        "expHistory": _dedupe_exp_history(older.get("expHistory"), newer.get("expHistory")),
         "achievementsClaimed": _union_str_list(left["achievementsClaimed"], right["achievementsClaimed"]),
         "achievementsNotified": _union_str_list(left["achievementsNotified"], right["achievementsNotified"]),
         "progressionResetAt": reset_at,
