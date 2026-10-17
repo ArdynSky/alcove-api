@@ -125,6 +125,23 @@ class FeatureFlagTesterUsernamesTests(unittest.TestCase):
             [{"type": "skin", "id": "crest", "layout": "stamp"}],
         )
 
+    def test_message_colors_keep_twenty_slots_in_order(self):
+        slots = main.normalize_message_colors(
+            [
+                {"slot": 4, "name": "Sky", "swatch": "28a4e7"},
+                {"slot": 1, "id": "rose", "name": "Rose", "swatch": "#e94b78"},
+                {"slot": 2, "name": "Nope", "swatch": "red"},
+                {"slot": 1, "id": "rose", "name": "Duplicate", "swatch": "#111111"},
+                {"id": "base", "name": "Cream", "swatch": "#ffffff"},
+            ]
+        )
+        self.assertEqual(len(slots), 20)
+        self.assertEqual(slots[0], {"slot": 1, "id": "rose", "name": "Rose", "swatch": "#E94B78"})
+        self.assertEqual(slots[1]["id"], "")
+        self.assertEqual(slots[3], {"slot": 4, "id": "sky", "name": "Sky", "swatch": "#28A4E7"})
+        self.assertTrue(all(slot["id"] != "base" for slot in slots))
+        self.assertEqual(len(main.empty_reward_catalog()["message_colors"]), 20)
+
 
 if __name__ == "__main__":
     unittest.main()

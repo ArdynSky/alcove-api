@@ -2740,6 +2740,7 @@ class RewardCatalogUpdate(BaseModel):
     achievements: list[dict] | None = None
     verification_packs: dict[str, dict] | None = None
     verification_packs_active: bool | None = None
+    message_colors: list[dict] | None = None
 
 
 class VerificationPackEligibilityPayload(BaseModel):
@@ -4524,6 +4525,66 @@ def normalize_reward_achievements(raw) -> list[dict]:
     return achievements
 
 
+MESSAGE_COLOR_SLOT_COUNT = 20
+
+
+def _blank_message_colors() -> list[dict]:
+    return [
+        {"slot": index, "id": "", "name": "", "swatch": ""}
+        for index in range(1, MESSAGE_COLOR_SLOT_COUNT + 1)
+    ]
+
+
+def _normalize_hex_color(value) -> str:
+    raw = str(value or "").strip()
+    if re.fullmatch(r"[0-9a-fA-F]{6}", raw):
+        raw = f"#{raw}"
+    if not re.fullmatch(r"#[0-9a-fA-F]{6}", raw):
+        return ""
+    return raw.upper()
+
+
+def _slug_message_color_id(name: str, slot: int) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "_", str(name or "").strip().lower()).strip("_")
+    if not slug or slug in {"base", "none"}:
+        slug = f"colour_{slot}"
+    return slug[:40]
+
+
+def normalize_message_colors(raw) -> list[dict]:
+    slots = _blank_message_colors()
+    if not isinstance(raw, list):
+        return slots
+    used: set[str] = set()
+    for index, entry in enumerate(raw):
+        if not isinstance(entry, dict):
+            continue
+        try:
+            slot = int(entry.get("slot") or entry.get("order") or (index + 1))
+        except (TypeError, ValueError):
+            slot = index + 1
+        if slot < 1 or slot > MESSAGE_COLOR_SLOT_COUNT:
+            continue
+        swatch = _normalize_hex_color(entry.get("swatch") or entry.get("hex") or entry.get("color"))
+        name = str(entry.get("name") or "").strip()[:40]
+        if not swatch:
+            continue
+        color_id = re.sub(r"[^a-z0-9_]+", "_", str(entry.get("id") or "").strip().lower()).strip("_")
+        if not color_id:
+            color_id = _slug_message_color_id(name, slot)
+        color_id = color_id[:40]
+        if color_id in {"base", "none"} or color_id in used:
+            continue
+        used.add(color_id)
+        slots[slot - 1] = {
+            "slot": slot,
+            "id": color_id,
+            "name": name or color_id,
+            "swatch": swatch,
+        }
+    return slots
+
+
 def empty_reward_catalog() -> dict:
     return {
         "level_packs": {},
@@ -4531,6 +4592,7 @@ def empty_reward_catalog() -> dict:
         "verification_packs": normalize_verification_packs({}),
         "verification_packs_active": False,
         "verification_packs_activated_at": None,
+        "message_colors": normalize_message_colors([]),
         "updated_at": None,
     }
 
@@ -4556,6 +4618,7 @@ def load_reward_catalog() -> dict:
                     catalog["verification_packs_activated_at"] = (
                         str(activated).strip() if activated else None
                     )
+                    catalog["message_colors"] = normalize_message_colors(data.get("message_colors"))
                     updated = data.get("updated_at")
                     catalog["updated_at"] = str(updated).strip() if updated else None
     except Exception:
@@ -4576,6 +4639,7 @@ def save_reward_catalog(catalog: dict) -> dict:
         "verification_packs": normalize_verification_packs(catalog.get("verification_packs")),
         "verification_packs_active": active,
         "verification_packs_activated_at": str(activated_at).strip() if activated_at else None,
+        "message_colors": normalize_message_colors(catalog.get("message_colors")),
         "updated_at": now_iso(),
     }
     directory = os.path.dirname(REWARD_CATALOG_PATH)
@@ -8701,6 +8765,8 @@ def admin_update_reward_catalog(payload: RewardCatalogUpdate):
             current["verification_packs_activated_at"] = now_iso()
         if not current["verification_packs_active"]:
             current["verification_packs_activated_at"] = None
+    if payload.message_colors is not None:
+        current["message_colors"] = normalize_message_colors(payload.message_colors)
     saved = save_reward_catalog(current)
     return {"status": "ok", **saved}
 
