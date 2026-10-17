@@ -571,6 +571,62 @@ class MemberProgressTests(unittest.TestCase):
         normalized = member_progress.normalize_profile(still_listed)
         self.assertEqual([row["id"] for row in normalized["pendingRewards"]], ["level_9"])
 
+    def test_exp_history_collapses_copied_checkin_rows(self):
+        older = {
+            "updated_at": "2026-10-16T10:00:00+00:00",
+            "level": 3,
+            "expHistory": [
+                {
+                    "id": "daily_checkin:1",
+                    "at": "2026-10-17T08:00:00+00:00",
+                    "amount": 75,
+                    "actionKey": "daily_checkin",
+                    "label": "Daily check-in",
+                },
+                {
+                    "id": "pulse-1",
+                    "at": "2026-10-17T07:00:00+00:00",
+                    "amount": 50,
+                    "actionKey": "pulse_answer",
+                    "label": "Answered a members Pulse",
+                },
+            ],
+        }
+        newer = {
+            "updated_at": "2026-10-17T09:00:00+00:00",
+            "level": 3,
+            "expHistory": [
+                {
+                    "id": "daily_checkin:1",
+                    "at": "2026-10-17T08:00:00+00:00",
+                    "amount": 75,
+                    "actionKey": "daily_checkin",
+                    "label": "Daily check-in",
+                },
+                {
+                    "id": "daily_checkin:1",
+                    "at": "2026-10-17T08:00:00+00:00",
+                    "amount": 75,
+                    "actionKey": "daily_checkin",
+                    "label": "Daily check-in",
+                },
+                {
+                    "id": "reply-1",
+                    "at": "2026-10-17T09:00:00+00:00",
+                    "amount": 10,
+                    "actionKey": "daily_checkin_reply",
+                    "label": "Check-in reply",
+                },
+            ],
+        }
+        merged = member_progress.merge_profiles(older, newer)
+        ids = [row["id"] for row in merged["expHistory"]]
+        self.assertEqual(ids, ["pulse-1", "daily_checkin:1", "reply-1"])
+        self.assertEqual(sum(row["amount"] for row in merged["expHistory"] if row["id"] == "daily_checkin:1"), 75)
+
+        doubled = member_progress.normalize_profile({"expHistory": newer["expHistory"] + newer["expHistory"]})
+        self.assertEqual([row["id"] for row in doubled["expHistory"]], ["daily_checkin:1", "reply-1"])
+
 
 class LiveAppStateBandwidthTests(unittest.TestCase):
     def test_live_view_omits_heavy_collections(self):
