@@ -13,7 +13,18 @@ from pathlib import Path
 
 from fastapi import HTTPException
 
-DATA_DIR = Path(os.getenv("ALCOVE_QUESTION_GAME_DIR", os.getenv("ALCOVE_TEAM_GAME_DIR", str(Path.cwd() / "team_game_data"))))
+def data_dir():
+    direct = os.getenv("ALCOVE_QUESTION_GAME_DIR") or os.getenv("ALCOVE_TEAM_GAME_DIR")
+    if direct:
+        return Path(direct)
+    for key in ("ALCOVE_STATE_DB_PATH", "ALCOVE_RUNTIME_STATE_PATH", "FOX_LOGS_DB_PATH"):
+        value = os.getenv(key)
+        if value:
+            return Path(value).expanduser().resolve().parent / "question_game_data"
+    return Path.cwd() / "team_game_data"
+
+
+DATA_DIR = data_dir()
 DB_PATH = DATA_DIR / "question_games.sqlite3"
 
 

@@ -6,6 +6,7 @@ import os
 import time
 import uuid
 from typing import Any
+import hashlib
 
 from fastapi import APIRouter, Body, Depends, Header
 from pydantic import BaseModel, Field
@@ -81,12 +82,15 @@ class Chat(BaseModel):
 
 
 @router.get("/state")
-def state(after_revision: int | None = None, authorization: str | None = Header(default=None), x_telegram_init_data: str | None = Header(default=None)):
+def state(after_revision: str | None = None, authorization: str | None = Header(default=None), x_telegram_init_data: str | None = Header(default=None)):
     user = optional_identity(authorization, x_telegram_init_data)
     current = current_state()
-    if after_revision is not None and current["revision"] == after_revision:
-        return {"unchanged": True, "revision": after_revision}
-    return q.public_state(current, user["user_id"] if user else None)
+    public = q.public_state(current, user["user_id"] if user else None)
+    public.pop("revision", None)
+    version = hashlib.sha256(json.dumps(public, sort_keys=True).encode()).hexdigest()[:20]
+    if after_revision == version:
+        return {"unchanged": True, "revision": version}
+    return {**public, "revision": version}
 
 
 @router.get("/host-state")
@@ -153,8 +157,10 @@ def submit(payload: Submission, user=Depends(identity)):
 def finish(state):
     if state["stage"] != "all_answers" or state["round"] != len(state["questions"]):
         q.fail("Complete all questions before final results.")
-    top = max((e["score"] for e in state["entries"]), default=0)
-    state["winners"] = [e["id"] for e in state["entries"] if e["score"] == top]
+    qualified = set(state.get("qualified", []))
+    eligible = [e for e in state["entries"] if any(m["user_id"] in qualified for m in e["members"])]
+    top = max((e["score"] for e in eligible), default=0)
+    state["winners"] = [e["id"] for e in eligible if e["score"] == top]
     state["reward_status"] = grant_rewards(state)
     state["stage"] = "finished"
     return state
@@ -194,15 +200,27 @@ def grant_rewards(state):
                         continue
                     existing = con.execute("SELECT grant_id FROM question_game_reward_awards WHERE game_id=? AND user_id=? AND kind=?", (state["game_id"], uid, kind)).fetchone()
                     if existing:
+                        if existing["grant_id"]:
+                            results[kind] += 1
+                        else:
+                            results["collection_complete"] += 1
                         continue
-                    if kind == "participation" and not state.get("repeat_participation"):
+                    if kind == "participation":
                         award = pr._grant_one(con, cfg, row, {
                             "user_key": "id:" + uid, "user_id": uid, "username": person["username"],
                             "event_id": "question-game:" + state["game_id"], "activity": "question_game",
                         })
                         grant_id = award.get("grant_id")
                         if award["status"] == "collection_complete":
-                            results["collection_complete"] += 1
+                            if state.get("repeat_participation"):
+                                pack = cr._pack(row)
+                                pack["items"] = [random_item(pack["items"])]
+                                grant_id = str(uuid.uuid4())
+                                pack.update(event_id=state["game_id"], activity="question_game")
+                                con.execute("INSERT INTO custom_pack_grants(id,template_id,target_user_id,target_username,pack_json,sent_at,claimed_at) VALUES(?,?,?,?,?,?,NULL)",
+                                            (grant_id, row["id"], uid, person["username"] or None, json.dumps(pack), cr._now()))
+                            else:
+                                results["collection_complete"] += 1
                     else:
                         pack = cr._pack(row)
                         if kind == "participation":
@@ -339,3 +357,21 @@ def delete_template(template_id: str, _=Depends(host)):
     finally:
         con.close()
     return {"ok": True}
+
+
+@router.get("/clock")
+def clock():
+    s = current_state()
+    return {"game_id": s.get("game_id"), "stage": s["stage"], "ends_at": s.get("ends_at")}
+
+
+@router.get("/packs")
+def packs(_=Depends(host)):
+    from . import custom_rewards as cr
+    with cr._LOCK:
+        con = cr._conn()
+        try:
+            rows = con.execute("SELECT * FROM custom_pack_templates ORDER BY name").fetchall()
+            return {"packs": [{"id": row["id"], "name": row["name"], "item_count": len(cr._pack(row)["items"])} for row in rows]}
+        finally:
+            con.close()
