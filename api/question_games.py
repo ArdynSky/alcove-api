@@ -320,6 +320,16 @@ def public_state(state, user_id=None):
         "id": e["id"], "name": e["name"], "members": [m["display_name"] for m in e["members"]],
         "answer": state["submissions"][e["id"]]["text"], "style": e["style"],
     } for e in state["entries"] if e["id"] in ids and e["id"] in state["revealed"]]
+    # OBS keeps a stable board in submission order; unrevealed text never leaves the server.
+    entries = {e["id"]: e for e in state["entries"]}
+    winning_ids = {eid for group in state["reveal_groups"] if group["kind"] == "winner" for eid in group["ids"]}
+    overlay_cards = [{
+        "id": eid, "name": entries[eid]["name"], "style": entries[eid]["style"],
+        "members": [m["display_name"] for m in entries[eid]["members"]],
+        "answer": item["text"] if eid in state["revealed"] else "",
+        "revealed": eid in state["revealed"],
+        "winning": eid in winning_ids and eid in state["revealed"],
+    } for eid, item in state["submissions"].items() if eid in entries]
     return {
         "stage": state["stage"], "revision": state["revision"], "game_id": state["game_id"],
         "title": state["title"], "mode": state["mode"], "team_size": state["team_size"],
@@ -332,7 +342,7 @@ def public_state(state, user_id=None):
         "teammates": [{"user_id": m["user_id"], "name": m["display_name"]} for m in mine["members"]] if mine else [],
         "submitted": bool(mine and mine["id"] in state["submissions"]),
         "eligible_this_round": bool(mine and mine["id"] in state["round_members"]),
-        "cards": cards, "active_ids": state["active_ids"], "active_kind": state["active_kind"],
+        "overlay_cards": overlay_cards, "cards": cards, "active_ids": state["active_ids"], "active_kind": state["active_kind"],
         "leaderboard": [{"id": e["id"], "name": e["name"], "score": e["score"]} for e in sorted(state["entries"], key=lambda e: -e["score"])],
         "winners": state["winners"], "reward_status": state["reward_status"],
     }
