@@ -34,7 +34,9 @@ def fail(message, code=409):
 
 def normalize(value):
     text = unicodedata.normalize("NFKC", str(value)).casefold()
-    return " ".join("".join(c for c in text if not unicodedata.category(c).startswith("P")).split())
+    # Ignore surrounding sentence punctuation without changing numeric meaning:
+    # "-5" is not "5", and "0.5" is not "05".
+    return " ".join(text.strip(" \\t\\r\\n.,!?;:\\\"'“”‘’").split())
 
 
 def connect():

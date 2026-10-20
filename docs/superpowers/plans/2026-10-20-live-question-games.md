@@ -28,16 +28,22 @@ Spec: accepted conversation, consolidated below.
 ## Tasks
 - [x] Isolate branches and establish baseline; use GitHub Actions because local execution is unavailable.
 - [x] Commit failing behavioral checks before implementation.
-- [ ] Engine: create_game(config), begin_round(state), submit_answer(state,uid,text), review_answers(state,corrections,merges), reveal_next(state), public_state(state,uid). Verify pytest scoring/privacy/deadlines/persistence.
-- [ ] HTTP adapter: host auth, participant auth, state revisions, templates, team chat, atomic final grants. Verify route authentication, chat isolation and retry tests.
-- [ ] Shared frontend renderer and single state poller. Verify browser inputs, cards, role-specific controls and text escaping.
-- [ ] Host question editor and reveal panel. Preserve other host handlers and background media.
-- [ ] Member activity, polished chat dialog, OBS answer/leaderboard and existing timer extension.
-- [ ] Run complete backend/frontend suites; record pre-existing failures separately; inspect in browser at mobile and OBS dimensions.
-- [ ] Review both pull requests and provide validation evidence before release.
+- [x] Engine: create_game(config), begin_round(state), submit_answer(state,uid,text), review_answers(state,corrections,merges), reveal_next(state), public_state(state,uid). Verify pytest scoring/privacy/deadlines/persistence.
+- [x] HTTP adapter: host auth, participant auth, state revisions, templates, team chat, atomic final grants. Verify route authentication, chat isolation and retry tests.
+- [x] Shared frontend renderer and single state poller. Verify browser inputs, cards, role-specific controls and text escaping.
+- [x] Host question editor and reveal panel. Preserve other host handlers and background media.
+- [x] Member activity, polished chat dialog, OBS answer/leaderboard and existing timer extension.
+- [x] Run complete backend/frontend suites; record pre-existing failures separately; inspect in browser at mobile and OBS dimensions.
+- [x] Review both pull requests and provide validation evidence before release.
 
 ## Ledger
 - 2026-10-20: backend baseline 147 passed, 1 skipped; frontend baseline five test files fail before changes.
 - Ruling: use remote isolated branches and CI instead of unavailable local runtime.
 - Ruling: unresolved collection fallback remains existing behavior; optional host repeat toggle makes additional awards explicit.
 - Ruling: odd pair count allows one team of three rather than leaving a member alone; preview teams before starting.
+
+- Verification: backend behavior and route/auth/privacy/retry checks pass; full existing backend suite passes (one existing skip). Numeric punctuation regression verifies signs and decimals remain meaningful.
+- Verification: frontend 4 new behavior checks pass; full suite177 passed with the same5 recorded pre-existing failures. CI compares exact baseline failures.
+- Verification: Chromium390px/1200px join/submit/chat/draft/card/cleanup checks pass; actual Host Control builder/save/activation/reset/end and OBS timer/round-heading checks pass.
+- Review: corrected transport-ready cosmetics, late-join draft resets, restored activity visibility, stop-on-reset/off, stale OBS round heading and delayed fade cleanup.
+- Deployment: draft PRs only; backend must be released before the frontend. No main branch or Render deployment changed.
