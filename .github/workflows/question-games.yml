@@ -16,7 +16,7 @@ jobs:
           python-version: '3.11'
       - run: pip install -r api/requirements.txt pytest httpx
       - name: Question game behavior
-        run: pytest tests/test_question_games.py -q
+        run: python -m pytest tests/test_question_games.py -q
       - name: Existing tests
         if: always()
-        run: pytest -q --ignore=tests/test_question_games.py
+        run: python -m pytest -q --ignore=tests/test_question_games.py
