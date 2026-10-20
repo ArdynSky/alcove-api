@@ -50,13 +50,16 @@ def test_host_endpoints_reject_unverified_and_nonhost(api):
     assert client.get("/api/question-game/templates").status_code==401
     assert client.get("/api/question-game/host-state").status_code==401
 
-def test_hidden_answers_and_unchanged_public_state_between_other_submissions(api):
+def test_hidden_answers_and_public_submission_names(api):
     client,q,*_=api;s=setup(client)
     before=client.get("/api/question-game/state",headers=member(2)).json()
     response=client.post("/api/question-game/submit",headers=member(1),json={"game_id":s["game_id"],"round":1,"text":"Paris"})
     assert response.status_code==200
     public=client.get("/api/question-game/state",headers=member(2),params={"after_revision":before["revision"]}).json()
-    assert public["unchanged"]
+    assert public["revision"] != before["revision"]
+    assert public["overlay_cards"][0]["name"] == "Member 1"
+    assert public["overlay_cards"][0]["answer"] == ""
+    assert "Paris" not in str(public)
     own=client.get("/api/question-game/state",headers=member(1)).json()
     assert own["submitted"] and own["revision"]!=before["revision"]
     assert "Paris" not in str(own)
