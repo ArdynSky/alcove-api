@@ -137,3 +137,33 @@ def test_quiz_numeric_punctuation_preserves_sign_and_decimal(game):
     assert game.normalize("0.5") != game.normalize("05")
     assert game.normalize("Ten") == "ten"
     assert game.normalize("  Paris!  ") == "paris"
+
+def test_overlay_names_follow_submissions_but_answers_stay_private(game):
+    s=start(game,players=4)
+    s=game.submit_answer(s,"2","Secret two",now=s["opened_at"]+1)
+    s=game.submit_answer(s,"1","Secret one",now=s["opened_at"]+2)
+    public=game.public_state(s)
+    assert [c["id"] for c in public["overlay_cards"]] == ["2","1"]
+    assert all(c["answer"] == "" and not c["revealed"] for c in public["overlay_cards"])
+    assert "Secret" not in str(public)
+    s=game.close_round(s)
+    s=game.reveal_next(s)
+    public=game.public_state(s)
+    assert [c["answer"] for c in public["overlay_cards"]] == ["Secret two","Secret one"]
+    assert all(c["revealed"] for c in public["overlay_cards"])
+    s=game.begin_round(s)
+    assert game.public_state(s)["overlay_cards"] == []
+
+def test_overlay_accumulates_reveals_and_marks_winning_cards(game):
+    s=answer(game,start(game),["A","A","A","B","B","C"])
+    s=game.close_round(s)
+    s=game.reveal_next(s)
+    public=game.public_state(s)
+    assert [c["id"] for c in public["overlay_cards"] if c["revealed"]] == ["4","5"]
+    assert not any(c["winning"] for c in public["overlay_cards"])
+    s=game.reveal_next(s)
+    public=game.public_state(s)
+    assert [c["id"] for c in public["overlay_cards"] if c["winning"]] == ["1","2","3"]
+    assert public["overlay_cards"][-1]["answer"] == ""
+    s=game.reveal_next(s)
+    assert all(c["revealed"] for c in game.public_state(s)["overlay_cards"])
