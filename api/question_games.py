@@ -36,7 +36,7 @@ def normalize(value):
     text = unicodedata.normalize("NFKC", str(value)).casefold()
     # Ignore surrounding sentence punctuation without changing numeric meaning:
     # "-5" is not "5", and "0.5" is not "05".
-    return " ".join(text.strip(" \\t\\r\\n.,!?;:\\\"'“”‘’").split())
+    return " ".join(text.strip().strip(chr(34) + chr(39) + "“”‘’.,!?;:").split())
 
 
 def connect():

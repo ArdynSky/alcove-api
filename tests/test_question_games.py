@@ -135,3 +135,5 @@ def test_quiz_numeric_punctuation_preserves_sign_and_decimal(game):
     s=game.close_round(s)
     assert s["round_points"] == {"1":0,"2":1,"3":1,"4":0}
     assert game.normalize("0.5") != game.normalize("05")
+    assert game.normalize("Ten") == "ten"
+    assert game.normalize("  Paris!  ") == "paris"
