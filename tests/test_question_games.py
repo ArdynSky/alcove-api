@@ -123,3 +123,15 @@ def test_validation(game):
     bad["questions"][0]["answers"]=[]
     with pytest.raises(Exception):
         game.create_game(bad)
+
+def test_quiz_numeric_punctuation_preserves_sign_and_decimal(game):
+    c=configuration("quiz", count=1)
+    c["questions"][0]["answers"]=["5"]
+    s=game.create_game(c)
+    for n in range(1,5):
+        s=game.join_game(s,player(n))
+    s=game.begin_round(s)
+    s=answer(game,s,["-5","5","5.","0.5"])
+    s=game.close_round(s)
+    assert s["round_points"] == {"1":0,"2":1,"3":1,"4":0}
+    assert game.normalize("0.5") != game.normalize("05")
