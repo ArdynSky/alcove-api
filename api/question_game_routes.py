@@ -161,7 +161,8 @@ def finish(state):
     eligible = [e for e in state["entries"] if any(m["user_id"] in qualified for m in e["members"])]
     top = max((e["score"] for e in eligible), default=0)
     state["winners"] = [e["id"] for e in eligible if e["score"] == top]
-    state["reward_status"] = grant_rewards(state)
+    state["reward_status"] = {}
+    state["rewards_sent"] = False
     state["stage"] = "finished"
     return state
 
@@ -189,7 +190,7 @@ def grant_rewards(state):
             if state.get("winner_template_id"):
                 winner_row = con.execute("SELECT * FROM custom_pack_templates WHERE id=?", (state["winner_template_id"],)).fetchone()
                 if not winner_row or len(cr._pack(winner_row)["items"]) != 2:
-                    q.fail("Restore the selected two-item winner pack before final results.", 422)
+                    q.fail("Restore the selected two-item winner pack before sending packs.", 422)
             con.execute("BEGIN IMMEDIATE")
             for person in state["participants"]:
                 uid = person["user_id"]
@@ -263,6 +264,13 @@ def action(payload: Action, _=Depends(host)):
             return q.reveal_next(s)
         if kind == "finish":
             return finish(s)
+        if kind == "send_packs":
+            if s["stage"] != "finished":
+                q.fail("Reveal final results before sending packs.")
+            if not s.get("rewards_sent"):
+                s["reward_status"] = grant_rewards(s)
+                s["rewards_sent"] = True
+            return s
         if kind == "end":
             s.update(stage="ended", active_ids=[])
             return s
