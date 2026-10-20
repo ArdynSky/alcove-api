@@ -92,10 +92,19 @@ def test_final_rewards_retry_safe_and_winner_has_two_items(api):
         client.post("/api/question-game/submit",headers=member(uid),json={"game_id":s["game_id"],"round":1,"text":text})
     s=client.get("/api/question-game/host-state",headers=ADMIN).json()
     s=action(client,s,"close");s=action(client,s,"reveal");s=action(client,s,"reveal")
-    # Simulate a successful reward commit followed by a failed game-state commit.
-    pending=copy.deepcopy(s);pending["winners"]=["1"]
-    r.grant_rewards(pending)
+    early=client.post("/api/question-game/action",headers=ADMIN,json={"game_id":s["game_id"],"revision":s["revision"],"action":"send_packs"})
+    assert early.status_code==409
     s=action(client,s,"finish")
+    con=cr._conn()
+    assert con.execute("SELECT COUNT(*) FROM custom_pack_grants").fetchone()[0]==0
+    con.close()
+    assert not s.get("rewards_sent")
+    # Simulate a successful reward commit followed by a failed game-state commit.
+    r.grant_rewards(copy.deepcopy(s))
+    s=action(client,s,"send_packs")
+    assert s["rewards_sent"]
+    assert s["reward_status"]["winner"]==1
+    s=action(client,s,"send_packs")
     con=cr._conn()
     assert con.execute("SELECT COUNT(*) FROM custom_pack_grants").fetchone()[0]==3
     winner=con.execute("SELECT pack_json FROM custom_pack_grants WHERE template_id='winner'").fetchone()[0]
