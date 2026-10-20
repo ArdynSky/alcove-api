@@ -40,6 +40,7 @@ from .cards_ws_manager import cards_ws_manager
 from . import fox_messages as fox_messages_store
 from .home_alerts import router as home_alerts_router
 from .team_games import router as team_games_router
+from .question_game_routes import router as question_game_router
 from .custom_rewards import router as custom_rewards_router
 from .debate_games import router as debate_games_router
 from . import debate_audience  # noqa: F401 — registers audience/archive routes on the debate router
@@ -77,6 +78,7 @@ except ImportError:
 app = FastAPI()
 app.include_router(home_alerts_router)
 app.include_router(team_games_router)
+app.include_router(question_game_router)
 app.include_router(custom_rewards_router)
 app.include_router(debate_games_router)
 app.include_router(agendas_router)
