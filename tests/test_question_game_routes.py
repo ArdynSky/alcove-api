@@ -161,6 +161,8 @@ def test_quiz_http_flow_collects_then_reveals_each_question_and_final_winner_car
         if number==1:s=action(client,s,"next_result")
     s=action(client,s,"finish")
     public=client.get("/api/question-game/state").json()
+    import time
+    assert time.time() < public["celebration_at"] <= time.time()+2.2
     assert len(public["winner_cards"])==2
     assert all(c["answer"]=="1 point" for c in public["winner_cards"])
     assert not s["rewards_sent"]
