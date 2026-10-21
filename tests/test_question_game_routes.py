@@ -94,7 +94,7 @@ def test_final_rewards_retry_safe_and_winner_has_two_items(api):
     for uid,text in [(1,"Paris"),(2,"London")]:
         client.post("/api/question-game/submit",headers=member(uid),json={"game_id":s["game_id"],"round":1,"text":text})
     s=client.get("/api/question-game/host-state",headers=ADMIN).json()
-    s=action(client,s,"close");s=action(client,s,"reveal");s=action(client,s,"reveal")
+    s=action(client,s,"close");s=action(client,s,"quiz_results");s=action(client,s,"reveal");s=action(client,s,"reveal")
     early=client.post("/api/question-game/action",headers=ADMIN,json={"game_id":s["game_id"],"revision":s["revision"],"action":"send_packs"})
     assert early.status_code==409
     s=action(client,s,"finish")
@@ -122,7 +122,7 @@ def test_captain_replace_and_expiry_closes_on_server(api):
     s=action(client,s,"captain",{"entry_id":team["id"],"user_id":new})
     assert s["entries"][0]["captain_id"]==new
     s["ends_at"]=0;q.save_state(s)
-    assert client.get("/api/question-game/clock").json()["stage"]=="review"
+    assert client.get("/api/question-game/clock").json()["stage"]=="quiz_wait"
 
 def test_agenda_question_snapshot_never_contains_quiz_answers(api):
     from api import agendas
@@ -131,3 +131,38 @@ def test_agenda_question_snapshot_never_contains_quiz_answers(api):
     public=agendas._public(row)
     assert "Paris" not in str(public)
     assert public["items"][0]["content_snapshot"]["question_game_template_id"]=="private-template"
+
+def test_quiz_http_flow_collects_then_reveals_each_question_and_final_winner_cards(api):
+    client,q,*_=api
+    s=client.post("/api/question-game/start",headers=ADMIN,json=config(count=2)).json()
+    for uid in [1,2]:
+        assert client.post("/api/question-game/join",headers=member(uid),json={"game_id":s["game_id"]}).status_code==200
+    s=client.get("/api/question-game/host-state",headers=ADMIN).json()
+    for number in [1,2]:
+        s=action(client,s,"begin")
+        for uid in [1,2]:
+            text="Paris" if uid==number else "Wrong"
+            assert client.post("/api/question-game/submit",headers=member(uid),json={"game_id":s["game_id"],"round":number,"text":text}).status_code==200
+        s=client.get("/api/question-game/host-state",headers=ADMIN).json()
+        s=action(client,s,"close")
+        public=client.get("/api/question-game/state").json()
+        assert s["stage"]=="quiz_wait" and "Paris" not in str(public)
+        assert not any(e["score"] for e in public["leaderboard"])
+        assert public["winner_cards"]==[]
+    s=action(client,s,"quiz_results")
+    for number in [1,2]:
+        assert s["round"]==number
+        s=action(client,s,"reveal")
+        public=client.get("/api/question-game/state").json()
+        assert [c["id"] for c in public["cards"]]==[str(number)]
+        s=action(client,s,"reveal")
+        public=client.get("/api/question-game/state").json()
+        assert [c["answer"] for c in public["cards"]]==["Wrong"]
+        if number==1:s=action(client,s,"next_result")
+    s=action(client,s,"finish")
+    public=client.get("/api/question-game/state").json()
+    assert len(public["winner_cards"])==2
+    assert all(c["answer"]=="1 point" for c in public["winner_cards"])
+    assert not s["rewards_sent"]
+    action(client,s,"end")
+    assert client.get("/api/question-game/state").json()["winner_cards"]==[]
