@@ -372,6 +372,7 @@ def public_state(state, user_id=None):
         "stage": state["stage"], "revision": state["revision"], "game_id": state["game_id"],
         "title": state["title"], "mode": state["mode"], "team_size": state["team_size"],
         "quiz_phase": state.get("quiz_phase", ""),
+        "celebration_at": state.get("celebration_at"),
         "round": state["round"], "total_rounds": len(state["questions"]),
         "question": state["questions"][state["round"]-1]["text"] if state["round"] else "",
         "correct_answer": state["questions"][state["round"]-1]["answers"][0]
