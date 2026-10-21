@@ -258,6 +258,10 @@ def action(payload: Action, _=Depends(host)):
             return q.begin_round(s)
         if kind == "close":
             return q.close_round(s)
+        if kind == "quiz_results":
+            return q.start_quiz_results(s)
+        if kind == "next_result":
+            return q.next_quiz_result(s)
         if kind == "review":
             return q.review_answers(s, p.get("corrections", {}), p.get("merges", {}))
         if kind == "reveal":
