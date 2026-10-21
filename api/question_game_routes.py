@@ -164,6 +164,8 @@ def finish(state):
     state["reward_status"] = {}
     state["rewards_sent"] = False
     state["stage"] = "finished"
+    # Allow the polling answer board to finish fading before celebration sources start.
+    state["celebration_at"] = time.time() + 2.2
     return state
 
 
