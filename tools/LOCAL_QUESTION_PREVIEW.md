@@ -45,3 +45,21 @@ Game state, chat and reward grants use `.local-question-preview/`, never the
 production database. No Render configuration or live secrets are required.
 The preview blocks external API fetches. To reset all local data, stop the
 server and delete `.local-question-preview/`. Stop the server with Ctrl+C.
+
+## Quiz answer review and winner overlays
+
+New quizzes collect every question before showing answers. After closing the last
+question, click START ANSWER REVEAL. For each question, review marking, reveal the
+correct players, show incorrect answers, then review the next question. Scores
+update during this results phase. Crowd games retain their round-by-round flow.
+
+Separate OBS browser sources are available from Host Control:
+
+- `question-game-overlay.html?view=winners`: customised winner cards with shimmer and twinkles.
+- `question-game-overlay.html?view=fireworks`: transparent looping fireworks.
+- `question-game-overlay.html?view=confetti`: transparent looping confetti.
+
+All three follow Final Results and disappear when you end the game or start a
+new one. Keep each desired source open in OBS; they remain transparent until the
+final results. Pack sending is a separate host action. Start a new quiz after
+updating to use the deferred answer-review flow; existing games keep their phase.
