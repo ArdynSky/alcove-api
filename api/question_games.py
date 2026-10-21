@@ -141,6 +141,8 @@ def create_game(config):
         "submissions": {}, "round_points": {}, "reveal_groups": [], "reveal_index": -1,
         "revealed": [], "active_ids": [], "active_kind": "", "round_members": [],
         "opened_at": None, "ends_at": None, "winners": [], "reward_status": None,
+        "quiz_phase": "collecting" if config.get("mode", "crowd") == "quiz" else "",
+        "quiz_rounds": [],
     }
 
 
@@ -150,6 +152,8 @@ def join_game(state, person):
         return state
     if state["stage"] in {"finished", "ended", "idle"}:
         fail("Registration is closed.")
+    if state.get("quiz_phase") == "results":
+        fail("The quiz is complete. Join the next game.")
     if state["team_size"] > 1 and state["stage"] != "lobby":
         fail("Teams are fixed for this game. Join the next game.")
     person = {
@@ -193,7 +197,9 @@ def make_entries(state):
 
 
 def begin_round(state):
-    if state["stage"] not in {"lobby", "all_answers"}:
+    if state.get("quiz_phase") == "results":
+        fail("Advance to the next question's results.")
+    if state["stage"] not in {"lobby", "all_answers", "quiz_wait"}:
         fail("Show all answers before the next question.")
     if state["round"] >= len(state["questions"]):
         fail("Reveal the final results.")
@@ -265,10 +271,6 @@ def calculate(state):
             points[eid] = 1 if correct else 0
             if correct:
                 winners.append(eid)
-        for ids in groups.values():
-            incorrect = [eid for eid in ids if not points[eid]]
-            if len(incorrect) > 1:
-                reveals.append({"ids": incorrect, "kind": "incorrect"})
         if winners:
             reveals.append({"ids": winners, "kind": "winner"})
     state.update(round_points=points, reveal_groups=reveals)
@@ -278,8 +280,39 @@ def calculate(state):
 def close_round(state):
     if state["stage"] != "answering":
         fail("This question is already closed.")
+    if state.get("quiz_phase") == "collecting":
+        state["quiz_rounds"].append({
+            "round": state["round"], "submissions": copy.deepcopy(state["submissions"]),
+            "round_members": list(state["round_members"]),
+        })
+        state.update(stage="quiz_wait", ends_at=None)
+        return state
     state.update(stage="review", merges={}, corrections={})
     return calculate(state)
+
+
+def load_quiz_result(state, number):
+    saved = state["quiz_rounds"][number - 1]
+    state.update(round=number, quiz_phase="results", stage="review",
+                 submissions=copy.deepcopy(saved["submissions"]),
+                 round_members=list(saved["round_members"]), merges={}, corrections={},
+                 round_points={}, reveal_groups=[], reveal_index=-1,
+                 revealed=[], active_ids=[], active_kind="", ends_at=None)
+    return calculate(state)
+
+
+def start_quiz_results(state):
+    if (state.get("quiz_phase") != "collecting" or state["stage"] != "quiz_wait"
+            or len(state["quiz_rounds"]) != len(state["questions"])):
+        fail("Complete all quiz questions before revealing answers.")
+    return load_quiz_result(state, 1)
+
+
+def next_quiz_result(state):
+    if (state.get("quiz_phase") != "results" or state["stage"] != "all_answers"
+            or state["round"] >= len(state["questions"])):
+        fail("Show incorrect answers before the next question's results.")
+    return load_quiz_result(state, state["round"] + 1)
 
 
 def review_answers(state, corrections, merges):
@@ -301,6 +334,9 @@ def reveal_next(state):
     if index >= len(state["reveal_groups"]):
         state.update(stage="all_answers", active_ids=[], active_kind="")
         state["revealed"] = list(state["submissions"])
+        if state["mode"] == "quiz":
+            state["active_ids"] = [eid for eid in state["submissions"] if not state["round_points"].get(eid)]
+            state["active_kind"] = "incorrect"
         return state
     group = state["reveal_groups"][index]
     for entry in state["entries"]:
@@ -316,6 +352,8 @@ def public_state(state, user_id=None):
         return {"stage": "idle", "revision": state["revision"]}
     mine = entry_for(state, user_id)
     ids = list(state["submissions"]) if state["stage"] == "all_answers" else state["active_ids"]
+    if state["mode"] == "quiz" and state["stage"] == "all_answers":
+        ids = state["active_ids"]
     cards = [{
         "id": e["id"], "name": e["name"], "members": [m["display_name"] for m in e["members"]],
         "answer": state["submissions"][e["id"]]["text"], "style": e["style"],
@@ -333,8 +371,11 @@ def public_state(state, user_id=None):
     return {
         "stage": state["stage"], "revision": state["revision"], "game_id": state["game_id"],
         "title": state["title"], "mode": state["mode"], "team_size": state["team_size"],
+        "quiz_phase": state.get("quiz_phase", ""),
         "round": state["round"], "total_rounds": len(state["questions"]),
         "question": state["questions"][state["round"]-1]["text"] if state["round"] else "",
+        "correct_answer": state["questions"][state["round"]-1]["answers"][0]
+                          if state["mode"] == "quiz" and state["stage"] in {"revealing", "all_answers", "finished"} else "",
         "ends_at": state["ends_at"], "background_url": state["background_url"],
         "participant_count": len(state["participants"]),
         "joined": any(p["user_id"] == str(user_id) for p in state["participants"]),
@@ -344,5 +385,10 @@ def public_state(state, user_id=None):
         "eligible_this_round": bool(mine and mine["id"] in state["round_members"]),
         "overlay_cards": overlay_cards, "cards": cards, "active_ids": state["active_ids"], "active_kind": state["active_kind"],
         "leaderboard": [{"id": e["id"], "name": e["name"], "score": e["score"]} for e in sorted(state["entries"], key=lambda e: -e["score"])],
+        "winner_cards": [{"id": e["id"], "name": e["name"], "style": e["style"],
+                          "members": [m["display_name"] for m in e["members"]],
+                          "answer": str(e["score"]) + (" point" if e["score"] == 1 else " points")}
+                         for e in state["entries"] if state["stage"] == "finished" and e["id"] in state["winners"]],
         "winners": state["winners"], "reward_status": state["reward_status"],
     }
+
