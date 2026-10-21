@@ -172,6 +172,16 @@ def _public(row):
     cursor = start
     total = 0
     for item in data["items"]:
+        # Question templates are host-only. Public agendas carry references, never answers.
+        snapshot = item.get("content_snapshot")
+        if isinstance(snapshot, dict) and isinstance(snapshot.get("question_game"), dict):
+            snapshot = dict(snapshot)
+            template = snapshot.pop("question_game")
+            snapshot["question_game_template_id"] = template.get("id")
+            item["content_snapshot"] = snapshot
+        if isinstance(item.get("question_game"), dict):
+            template = item.pop("question_game")
+            item["question_game_template_id"] = template.get("id")
         item["starts_at"] = cursor.astimezone(timezone.utc).isoformat()
         duration = max(1, int(item.get("duration_minutes") or 1))
         total += duration
