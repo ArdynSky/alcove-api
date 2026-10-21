@@ -138,7 +138,7 @@ def audience_state(user_id: Optional[str] = None):
         "submissions_open": _submissions_open(state),
         "count": len(thoughts),
         "mine": mine,
-        "overlay": _overlay(sid, settings),
+        "overlay": _overlay(sid, settings) if state.get("status") not in {"idle", "ended"} else None,
     }
 
 
@@ -223,7 +223,7 @@ def audience_submissions():
     return {
         "session_id": sid,
         "submissions_open": _submissions_open(state),
-        "overlay": _overlay(sid, settings),
+        "overlay": _overlay(sid, settings) if state.get("status") not in {"idle", "ended"} else None,
         "submissions": _thoughts(sid),
     }
 

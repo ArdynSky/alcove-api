@@ -10210,10 +10210,12 @@ def start_room_discussion(payload: RoomDiscussionStart):
 
 @app.post("/api/room-discussion/end")
 def end_room_discussion():
+    global now_showing_media
     discussion = room_discussion_payload()
     if discussion.get("status") != "active":
         return {"status": "error", "message": "No active discussion to end."}
     archive_active_poll()
+    now_showing_media = None
     state["room_discussion"] = {
         **discussion,
         "status": "ended",

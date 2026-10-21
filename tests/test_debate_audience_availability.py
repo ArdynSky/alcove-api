@@ -13,6 +13,20 @@ from api import debate_audience
 
 
 class DebateAudienceAvailabilityTests(unittest.TestCase):
+    def test_ending_debate_hides_selected_thought_without_erasing_it(self):
+        from unittest.mock import patch
+        thought = {"id": "thought", "reason": "Keep the archive"}
+        state = {"session_id": "debate", "status": "results"}
+        with patch.object(debate_audience, "_load", lambda: state), \
+             patch.object(debate_audience, "_ensure_settings", return_value={}), \
+             patch.object(debate_audience, "_thoughts", return_value=[thought]), \
+             patch.object(debate_audience, "_overlay", return_value=thought):
+            self.assertEqual(debate_audience.audience_state()["overlay"], thought)
+            state["status"] = "ended"
+            self.assertIsNone(debate_audience.audience_state()["overlay"])
+            self.assertIsNone(debate_audience.audience_submissions()["overlay"])
+            self.assertEqual(debate_audience.audience_submissions()["submissions"], [thought])
+
     def test_thoughts_are_open_through_debate_and_close_for_voting(self):
         open_stages = {
             "pooling", "registration_closed", "selected", "intro_for", "speaker_for",
