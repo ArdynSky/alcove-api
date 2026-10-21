@@ -69,6 +69,19 @@ class RoomQATests(unittest.TestCase):
         self.assertEqual(listed.status_code, 200)
         self.assertEqual(listed.json()[0]["answer"], "Tonight we are talking about the wheel.")
 
+    def test_discussion_end_clears_on_air_media(self):
+        original = main.now_showing_media
+        try:
+            self._start_discussion()
+            main.now_showing_media = {"id": 123, "url": "/old-image.png"}
+            ended = self.client.post("/api/room-discussion/end")
+            self.assertEqual(ended.json()["status"], "ok")
+            self.assertIsNone(main.now_showing_media)
+            self._start_discussion()
+            self.assertIsNone(main.now_showing_media)
+        finally:
+            main.now_showing_media = original
+
     def test_comment_goes_to_host_inbox_not_answerable(self):
         self._start_discussion()
         created = self.client.post(
