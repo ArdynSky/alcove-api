@@ -15,6 +15,7 @@ here writes the profile blob.
 from __future__ import annotations
 
 import datetime
+import hashlib
 import json
 import os
 import sqlite3
@@ -96,6 +97,19 @@ CREATE INDEX IF NOT EXISTS idx_care_reports_reporter_created
     ON care_reports(reporter_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_care_reports_status_created
     ON care_reports(status, created_at);
+
+CREATE TABLE IF NOT EXISTS care_followup_receipts (
+    report_id TEXT NOT NULL,
+    resolved_at TEXT NOT NULL,
+    decision TEXT NOT NULL,
+    outcome TEXT NOT NULL,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at TEXT,
+    updated_at TEXT NOT NULL,
+    result_json TEXT,
+    error TEXT,
+    PRIMARY KEY (report_id, resolved_at, decision)
+);
 
 CREATE TABLE IF NOT EXISTS exp_grants (
     id TEXT PRIMARY KEY,
@@ -494,6 +508,13 @@ class CareReportResolvePayload(BaseModel):
     phrase: str | None = None
 
 
+class CareFollowupAckPayload(BaseModel):
+    resolution_key: str
+    outcome: Literal["completed", "blocked", "retry"]
+    result: dict | None = None
+    error: str | None = None
+
+
 class TerminologyUpsertPayload(BaseModel):
     admin_secret: str | None = None
     decision: Literal["keep", "teach", "remove"]
@@ -570,7 +591,70 @@ def _public_care_report(row: dict) -> dict:
         "admin_user_id": row.get("admin_user_id"),
         "decision": row.get("decision"),
         "source": row.get("source"),
+        "followup": row.get("followup"),
+        "resolution_key": _care_resolution_key(row) if row.get("resolved_at") else None,
     }
+
+
+def _care_resolution_key(row: dict) -> str:
+    identity = [row.get("id"), row.get("resolved_at"), row.get("decision")]
+    return hashlib.sha256(json.dumps(identity, separators=(",", ":")).encode()).hexdigest()
+
+
+def pending_care_followups(limit: int = 40) -> list[dict]:
+    """Bounded, oldest-first work for the existing bot admin-jobs poll."""
+    conn = _db()
+    try:
+        rows = conn.execute("""
+            SELECT c.* FROM care_reports c
+            LEFT JOIN care_followup_receipts r ON r.report_id=c.id
+                AND r.resolved_at=c.resolved_at AND r.decision=c.decision
+            WHERE c.status IN ('kept','removed','taught') AND c.resolved_at IS NOT NULL
+                AND (r.report_id IS NULL OR (r.outcome='retry' AND r.next_attempt_at <= ?))
+            ORDER BY c.resolved_at ASC, c.id ASC LIMIT ?
+        """, (_now(), max(1, min(int(limit), 100)))).fetchall()
+        return [dict(_public_care_report(dict(row)), resolution_key=_care_resolution_key(dict(row))) for row in rows]
+    finally:
+        conn.close()
+
+
+@router.get("/api/bot-sync/care-followups")
+def bot_pending_care_followups(x_bot_sync_secret: str | None = Header(default=None), limit: int = 40):
+    _require_bot(x_bot_sync_secret)
+    return {"status": "ok", "care_followups": pending_care_followups(limit)}
+
+
+@router.post("/api/bot-sync/care-followups/{report_id}/ack")
+def acknowledge_care_followup(report_id: str, payload: CareFollowupAckPayload,
+                              x_bot_sync_secret: str | None = Header(default=None)):
+    _require_bot(x_bot_sync_secret)
+    conn = _db()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        report = _load_care_report(conn, report_id)
+        if not report:
+            raise _http(404, "Care report not found")
+        if not report.get("resolved_at") or payload.resolution_key != _care_resolution_key(report):
+            raise _http(409, "Care report resolution changed")
+        identity = (report_id, report['resolved_at'], report['decision'])
+        receipt = conn.execute("SELECT * FROM care_followup_receipts WHERE report_id=? AND resolved_at=? AND decision=?", identity).fetchone()
+        if receipt and receipt['outcome'] in {'completed', 'blocked'}:
+            return {"status": "ok", "already_done": True}
+        attempts = (receipt['attempts'] if receipt else 0) + 1
+        next_attempt = None
+        if payload.outcome == 'retry':
+            next_attempt = (_parse_utc(_now()) + datetime.timedelta(seconds=min(3600, 20 * 2 ** min(attempts, 8)))).isoformat().replace('+00:00', 'Z')
+        error = _clean_text(payload.error, limit=MAX_ERROR_LEN, field='error')
+        conn.execute("""INSERT INTO care_followup_receipts
+            (report_id,resolved_at,decision,outcome,attempts,next_attempt_at,updated_at,result_json,error)
+            VALUES (?,?,?,?,?,?,?,?,?) ON CONFLICT(report_id,resolved_at,decision) DO UPDATE SET
+            outcome=excluded.outcome,attempts=excluded.attempts,next_attempt_at=excluded.next_attempt_at,
+            updated_at=excluded.updated_at,result_json=excluded.result_json,error=excluded.error
+        """, identity + (payload.outcome, attempts, next_attempt, _now(), json.dumps(payload.result or {}), error))
+        conn.commit()
+        return {"status": "ok", "already_done": False, "next_attempt_at": next_attempt}
+    finally:
+        conn.close()
 
 
 def _normalize_terminology_phrase(text: str | None) -> str:
@@ -1593,6 +1677,16 @@ def list_care_reports(
             """,
             tuple(params) + (limit,),
         ).fetchall()
+        reports = []
+        for row in rows:
+            report = dict(row)
+            receipt = conn.execute("SELECT * FROM care_followup_receipts WHERE report_id=? AND resolved_at=? AND decision=?",
+                                   (report['id'], report['resolved_at'], report['decision'])).fetchone()
+            if receipt:
+                report['followup'] = dict(receipt)
+                report['followup']['result'] = json.loads(receipt['result_json'] or '{}')
+                report['followup'].pop('result_json', None)
+            reports.append(_public_care_report(report))
         activity = _reporter_activity(conn, reporter) if reporter is not None else None
     finally:
         conn.close()
@@ -1600,7 +1694,7 @@ def list_care_reports(
         "status": "ok",
         "period": normalized_period,
         "since": since,
-        "reports": [_public_care_report(dict(row)) for row in rows],
+        "reports": reports,
         "reporter_activity": activity,
     }
 

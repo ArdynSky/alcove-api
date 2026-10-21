@@ -76,6 +76,8 @@ except ImportError:
     pass
 
 app = FastAPI()
+from .live_room_events import install_live_room_events
+install_live_room_events(app)
 app.include_router(home_alerts_router)
 app.include_router(team_games_router)
 app.include_router(question_game_router)
@@ -9171,7 +9173,8 @@ def bot_pending_admin_jobs(x_bot_sync_secret: str | None = Header(default=None))
     if bulk_job.get("status") == "pending":
         jobs.append({"job": "bulk_verify_group", **bulk_job})
     jobs.extend(pending_bot_action_jobs())
-    return {"status": "ok", "jobs": jobs}
+    from .safety_enforcement import pending_care_followups
+    return {"status": "ok", "jobs": jobs, "care_followups": pending_care_followups(limit=40)}
 
 
 @app.post("/api/bot-sync/admin-jobs/bulk-verify-group")
