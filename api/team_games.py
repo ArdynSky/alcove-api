@@ -308,13 +308,18 @@ async def team_game_background(file: UploadFile = File(...)):
     state = _load_state()
     content_type = (file.content_type or "").lower()
     ext = Path(file.filename or "background.mp4").suffix.lower()
-    if content_type not in {"video/mp4", "video/webm"} and ext not in {".mp4", ".webm"}:
-        raise HTTPException(status_code=400, detail="Please upload an MP4 or WebM video")
-    data = await file.read()
+    media_extensions = {
+        "video/mp4": ".mp4", "video/webm": ".webm",
+        "image/png": ".png", "image/jpeg": ".jpg", "image/webp": ".webp",
+    }
+    allowed_extensions = {".mp4", ".webm", ".png", ".jpg", ".jpeg", ".webp"}
+    if content_type not in media_extensions and ext not in allowed_extensions:
+        raise HTTPException(status_code=400, detail="Please upload a PNG, JPEG, WebP, MP4, or WebM file")
+    data = await file.read(40 * 1024 * 1024 + 1)
     if len(data) > 40 * 1024 * 1024:
         raise HTTPException(status_code=413, detail="Background video must be under 40 MB")
-    if ext not in {".mp4", ".webm"}:
-        ext = ".mp4" if "mp4" in content_type else ".webm"
+    if ext not in allowed_extensions:
+        ext = media_extensions[content_type]
     old = state.get("background_filename")
     filename = f"{state.get('game_type') or 'activity'}-{uuid.uuid4().hex[:12]}{ext}"
     (BACKGROUND_DIR / filename).write_bytes(data)
@@ -338,7 +343,7 @@ def team_game_background_media(filename: str):
     path = BACKGROUND_DIR / safe
     if not path.exists() or not path.is_file():
         raise HTTPException(status_code=404, detail="Background video not found")
-    return FileResponse(path)
+    return FileResponse(path, headers={"Cache-Control": "public, max-age=2592000"})
 
 
 @router.post("/join")
@@ -521,7 +526,7 @@ def team_game_media(filename: str):
     path = UPLOAD_DIR / safe
     if not path.exists() or not path.is_file():
         raise HTTPException(status_code=404, detail="Image not found")
-    return FileResponse(path)
+    return FileResponse(path, headers={"Cache-Control": "public, max-age=2592000"})
 
 
 @router.post("/reveal")

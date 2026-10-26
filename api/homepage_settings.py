@@ -484,10 +484,11 @@ async def upload_homepage_media(
     slot: str = Form(""),
 ):
     _admin(admin_secret)
-    content = await file.read()
+    ext = Path(file.filename or "upload.bin").suffix.lower()
+    limit = VIDEO_MAX_BYTES if ext in VIDEO_EXTENSIONS else IMAGE_MAX_BYTES
+    content = await file.read(limit + 1)
     if not content:
         raise HTTPException(status_code=400, detail="Empty file")
-    ext = Path(file.filename or "upload.bin").suffix.lower()
     if ext in IMAGE_EXTENSIONS:
         if len(content) > IMAGE_MAX_BYTES:
             raise HTTPException(status_code=400, detail="Image too large (max 5 MB)")
@@ -536,7 +537,7 @@ def optimize_homepage_media(admin_secret: str = Form(...)):
 def get_homepage_media(filename: str):
     ensure_homepage_media_optimized()
     path = _resolve_media_file(filename)
-    return FileResponse(path, media_type=_media_type_for(path))
+    return FileResponse(path, media_type=_media_type_for(path), headers={"Cache-Control": "public, max-age=2592000"})
 
 
 @router.delete("/api/admin/homepage-media/{filename}")
