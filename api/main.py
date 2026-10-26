@@ -19,6 +19,7 @@ import io
 import json
 import random
 import sqlite3
+from contextlib import closing
 import threading
 import uuid
 import zipfile
@@ -627,7 +628,7 @@ def ensure_state_store() -> None:
     directory = os.path.dirname(STATE_DB_PATH)
     if directory:
         os.makedirs(directory, exist_ok=True)
-    with sqlite3.connect(STATE_DB_PATH) as conn:
+    with closing(sqlite3.connect(STATE_DB_PATH)) as conn, conn:
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS runtime_state_store (
@@ -693,7 +694,7 @@ def get_admin_job(name: str) -> dict:
 def load_runtime_state_from_db() -> dict | None:
     ensure_state_store()
     try:
-        with sqlite3.connect(STATE_DB_PATH) as conn:
+        with closing(sqlite3.connect(STATE_DB_PATH)) as conn, conn:
             row = conn.execute(
                 "SELECT payload_json FROM runtime_state_store WHERE state_key = ?",
                 ("alcove_runtime",),
@@ -716,7 +717,7 @@ def save_runtime_state_to_db(payload: dict, serialized: str | None = None) -> No
     payload_json = serialized if serialized is not None else json.dumps(
         payload, separators=(",", ":"), sort_keys=True
     )
-    with sqlite3.connect(STATE_DB_PATH) as conn:
+    with closing(sqlite3.connect(STATE_DB_PATH)) as conn, conn:
         conn.execute(
             """
             INSERT INTO runtime_state_store (state_key, payload_json, updated_at)
@@ -732,7 +733,7 @@ def save_runtime_state_to_db(payload: dict, serialized: str | None = None) -> No
 
 def ensure_pulse_archive_store() -> None:
     ensure_state_store()
-    with sqlite3.connect(STATE_DB_PATH) as conn:
+    with closing(sqlite3.connect(STATE_DB_PATH)) as conn, conn:
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS pulse_archive_meta (
@@ -801,7 +802,7 @@ def ensure_pulse_archive_store() -> None:
 
 def pulse_archive_meta_get(key: str) -> str | None:
     ensure_pulse_archive_store()
-    with sqlite3.connect(STATE_DB_PATH) as conn:
+    with closing(sqlite3.connect(STATE_DB_PATH)) as conn, conn:
         row = conn.execute(
             "SELECT meta_value FROM pulse_archive_meta WHERE meta_key = ?",
             (key,),
@@ -811,7 +812,7 @@ def pulse_archive_meta_get(key: str) -> str | None:
 
 def pulse_archive_meta_set(key: str, value: str) -> None:
     ensure_pulse_archive_store()
-    with sqlite3.connect(STATE_DB_PATH) as conn:
+    with closing(sqlite3.connect(STATE_DB_PATH)) as conn, conn:
         conn.execute(
             """
             INSERT INTO pulse_archive_meta (meta_key, meta_value)
@@ -854,7 +855,7 @@ def archive_pulse_question_from_suggestion(entry: dict) -> None:
         return
     ensure_pulse_archive_store()
     archived_at = now_iso()
-    with sqlite3.connect(STATE_DB_PATH) as conn:
+    with closing(sqlite3.connect(STATE_DB_PATH)) as conn, conn:
         conn.execute(
             """
             INSERT INTO pulse_archive_questions (
@@ -908,7 +909,7 @@ def archive_completed_pulse_entry(entry: dict) -> None:
     suggestion_id = pulse_suggestion_id_for_question(question, pool)
     ensure_pulse_archive_store()
     archived_at = now_iso()
-    with sqlite3.connect(STATE_DB_PATH) as conn:
+    with closing(sqlite3.connect(STATE_DB_PATH)) as conn, conn:
         conn.execute(
             """
             INSERT INTO pulse_archive_answers (
@@ -980,7 +981,7 @@ def permanently_delete_pulse_archive_answer(pulse_id: int) -> dict:
     """Hard-delete one archived answer and its live runtime twin (if present)."""
     ensure_pulse_archive_store()
     pid = int(pulse_id)
-    with sqlite3.connect(STATE_DB_PATH) as conn:
+    with closing(sqlite3.connect(STATE_DB_PATH)) as conn, conn:
         cur = conn.execute("DELETE FROM pulse_archive_answers WHERE pulse_id = ?", (pid,))
         archive_deleted = int(cur.rowcount or 0)
         conn.commit()
@@ -1007,7 +1008,7 @@ def permanently_delete_pulse_archive_question(suggestion_id: int) -> dict:
     """Hard-delete one archived question, cascade its answers, and soft-delete the live suggestion."""
     ensure_pulse_archive_store()
     sid = int(suggestion_id)
-    with sqlite3.connect(STATE_DB_PATH) as conn:
+    with closing(sqlite3.connect(STATE_DB_PATH)) as conn, conn:
         row = conn.execute(
             """
             SELECT suggestion_id, question, pool
@@ -1129,14 +1130,14 @@ def pulse_archive_answer_count_for_question(question: str | None, pool: str | No
     if pool:
         query += " AND pool = ?"
         params.append((pool or "green").strip().lower())
-    with sqlite3.connect(STATE_DB_PATH) as conn:
+    with closing(sqlite3.connect(STATE_DB_PATH)) as conn, conn:
         row = conn.execute(query, params).fetchone()
     return int(row[0] or 0) if row else 0
 
 
 def pulse_archive_stats_payload() -> dict:
     ensure_pulse_archive_store()
-    with sqlite3.connect(STATE_DB_PATH) as conn:
+    with closing(sqlite3.connect(STATE_DB_PATH)) as conn, conn:
         answer_count = int(conn.execute("SELECT COUNT(*) FROM pulse_archive_answers").fetchone()[0] or 0)
         question_count = int(conn.execute("SELECT COUNT(*) FROM pulse_archive_questions").fetchone()[0] or 0)
         first_day = conn.execute(
@@ -1253,7 +1254,7 @@ def query_pulse_archive_answers(
     offset = max(0, (max(1, page) - 1) * max(1, min(limit, 200)))
     row_limit = max(1, min(limit, 200))
     order_sql = pulse_archive_answer_order_sql(sort)
-    with sqlite3.connect(STATE_DB_PATH) as conn:
+    with closing(sqlite3.connect(STATE_DB_PATH)) as conn, conn:
         total = int(conn.execute(
             f"SELECT COUNT(*) FROM pulse_archive_answers WHERE {where_sql}",
             params,
@@ -1335,7 +1336,7 @@ def query_pulse_archive_questions(
     offset = max(0, (max(1, page) - 1) * max(1, min(limit, 200)))
     row_limit = max(1, min(limit, 200))
     order_sql = pulse_archive_question_order_sql(sort)
-    with sqlite3.connect(STATE_DB_PATH) as conn:
+    with closing(sqlite3.connect(STATE_DB_PATH)) as conn, conn:
         total = int(conn.execute(
             f"SELECT COUNT(*) FROM pulse_archive_questions WHERE {where_sql}",
             params,
@@ -1579,7 +1580,7 @@ def build_member_pulse_archive_payload(
 
 def ensure_spotlight_archive_store() -> None:
     ensure_state_store()
-    with sqlite3.connect(STATE_DB_PATH) as conn:
+    with closing(sqlite3.connect(STATE_DB_PATH)) as conn, conn:
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS spotlight_archive (
@@ -1620,7 +1621,7 @@ def archive_published_spotlight(entry: dict) -> None:
         return
     ensure_spotlight_archive_store()
     archived_at = now_iso()
-    with sqlite3.connect(STATE_DB_PATH) as conn:
+    with closing(sqlite3.connect(STATE_DB_PATH)) as conn, conn:
         conn.execute(
             """
             INSERT INTO spotlight_archive (
@@ -1760,7 +1761,7 @@ def query_spotlight_archive(
         order_sql = "published_at DESC, spotlight_id DESC"
     offset = max(0, (max(1, page) - 1) * max(1, min(limit, 200)))
     row_limit = max(1, min(limit, 200))
-    with sqlite3.connect(STATE_DB_PATH) as conn:
+    with closing(sqlite3.connect(STATE_DB_PATH)) as conn, conn:
         total = int(conn.execute(
             f"SELECT COUNT(*) FROM spotlight_archive WHERE {where_sql}",
             params,
@@ -1814,7 +1815,7 @@ def sanitize_member_spotlight_entry(entry: dict, viewer: dict) -> dict:
 def spotlight_archive_stats_payload() -> dict:
     ensure_spotlight_archive_store()
     backfill_spotlight_archive_from_runtime()
-    with sqlite3.connect(STATE_DB_PATH) as conn:
+    with closing(sqlite3.connect(STATE_DB_PATH)) as conn, conn:
         count = int(conn.execute("SELECT COUNT(*) FROM spotlight_archive").fetchone()[0] or 0)
         first_day = conn.execute(
             "SELECT MIN(day_key) FROM spotlight_archive WHERE COALESCE(day_key, '') != ''"
@@ -1835,7 +1836,7 @@ def permanently_delete_spotlight_archive_entry(spotlight_id: int) -> dict:
     """Hard-delete one published Spotlight archive row and its runtime twin if present."""
     ensure_spotlight_archive_store()
     sid = int(spotlight_id)
-    with sqlite3.connect(STATE_DB_PATH) as conn:
+    with closing(sqlite3.connect(STATE_DB_PATH)) as conn, conn:
         cur = conn.execute("DELETE FROM spotlight_archive WHERE spotlight_id = ?", (sid,))
         archive_deleted = int(cur.rowcount or 0)
         conn.commit()
@@ -1873,7 +1874,7 @@ def permanently_delete_spotlight_runtime_entry(spotlight_id: int) -> dict:
     spotlight_entries[:] = kept
     # Also clear any published archive twin so member Archive stays consistent.
     ensure_spotlight_archive_store()
-    with sqlite3.connect(STATE_DB_PATH) as conn:
+    with closing(sqlite3.connect(STATE_DB_PATH)) as conn, conn:
         cur = conn.execute("DELETE FROM spotlight_archive WHERE spotlight_id = ?", (sid,))
         archive_deleted = int(cur.rowcount or 0)
         conn.commit()
@@ -2040,7 +2041,7 @@ def archive_summary_payload(viewer: dict | None = None) -> dict:
     pulse_stats = pulse_archive_stats_payload()
     backfill_spotlight_archive_from_runtime()
     ensure_spotlight_archive_store()
-    with sqlite3.connect(STATE_DB_PATH) as conn:
+    with closing(sqlite3.connect(STATE_DB_PATH)) as conn, conn:
         spotlight_count = int(conn.execute("SELECT COUNT(*) FROM spotlight_archive").fetchone()[0] or 0)
     wheel_result = query_archive_wheel_entries(viewer=viewer, page=1, limit=1)
     return {
@@ -5259,7 +5260,7 @@ def fox_db_rows(query: str, params=()):
         return []
 
     try:
-        with sqlite3.connect(FOX_LOGS_DB_PATH) as conn:
+        with closing(sqlite3.connect(FOX_LOGS_DB_PATH)) as conn, conn:
             conn.row_factory = sqlite3.Row
             ensure_fox_read_tables(conn)
             return [dict(row) for row in conn.execute(query, params).fetchall()]
@@ -8691,7 +8692,7 @@ async def admin_fox_banner_upload(
     label: str = Form(""),
 ):
     verify_admin_secret(admin_secret)
-    content = await file.read()
+    content = await file.read(fox_messages_store.MAX_BANNER_BYTES + 1)
     state = fox_messages_store.load_fox_messages_state()
     try:
         entry = fox_messages_store.save_banner_upload(
@@ -8812,7 +8813,10 @@ def public_reward_asset_file(filename: str):
         media_type = "image/webp"
     elif lower.endswith(".gif"):
         media_type = "image/gif"
-    return FileResponse(file_path, media_type=media_type)
+    return FileResponse(
+        file_path, media_type=media_type,
+        headers={"Cache-Control": "public, max-age=2592000"},
+    )
 
 
 @app.get("/api/admin/reward-assets")
@@ -8831,7 +8835,7 @@ async def admin_reward_asset_upload(
     kind: str = Form("icon"),
 ):
     verify_admin_secret(admin_secret)
-    content = await file.read()
+    content = await file.read(REWARD_ASSET_MAX_BYTES + 1)
     if not content:
         raise HTTPException(status_code=400, detail="Empty file")
     if len(content) > REWARD_ASSET_MAX_BYTES:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import datetime
 import os
 import sqlite3
+from contextlib import closing
 from typing import Literal
 
 from fastapi import APIRouter, Query
@@ -31,7 +32,7 @@ def _ensure_store() -> None:
     directory = os.path.dirname(STATE_DB_PATH)
     if directory:
         os.makedirs(directory, exist_ok=True)
-    with sqlite3.connect(STATE_DB_PATH) as conn:
+    with closing(sqlite3.connect(STATE_DB_PATH)) as conn, conn:
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS home_alerts (
@@ -53,7 +54,7 @@ def _ensure_store() -> None:
 
 def _trim_old_rows() -> None:
     cutoff = (datetime.datetime.utcnow() - datetime.timedelta(days=90)).isoformat() + "Z"
-    with sqlite3.connect(STATE_DB_PATH) as conn:
+    with closing(sqlite3.connect(STATE_DB_PATH)) as conn, conn:
         conn.execute(
             "DELETE FROM home_alerts WHERE COALESCE(consumed_at, created_at) < ?",
             (cutoff,),
@@ -83,7 +84,7 @@ def push_home_alert(payload: HomeAlertPush):
     surface, _label = ALERT_TYPES[alert_type]
     _ensure_store()
     created_at = _now_iso()
-    with sqlite3.connect(STATE_DB_PATH) as conn:
+    with closing(sqlite3.connect(STATE_DB_PATH)) as conn, conn:
         conn.execute(
             """
             INSERT INTO home_alerts (user_id, event_id, alert_type, surface, created_at, consumed_at)
@@ -113,7 +114,7 @@ def list_home_alerts(
         clauses.append("surface = ?")
         params.append(surface)
 
-    with sqlite3.connect(STATE_DB_PATH) as conn:
+    with closing(sqlite3.connect(STATE_DB_PATH)) as conn, conn:
         rows = conn.execute(
             f"""
             SELECT event_id, alert_type, surface, created_at
@@ -155,7 +156,7 @@ def consume_home_alerts(payload: HomeAlertConsume):
         clauses.append("surface = ?")
         params.append(payload.surface)
 
-    with sqlite3.connect(STATE_DB_PATH) as conn:
+    with closing(sqlite3.connect(STATE_DB_PATH)) as conn, conn:
         cursor = conn.execute(
             f"UPDATE home_alerts SET consumed_at = ? WHERE {' AND '.join(clauses)}",
             [_now_iso(), *params],
