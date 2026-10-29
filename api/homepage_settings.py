@@ -164,10 +164,47 @@ def default_homepage_settings() -> dict:
         "fallback_image_url": "",
         "logo_url": "",
         "bottom_banner_url": "",
+        # Up to three bottom overlays. Image 1 is also mirrored in bottom_banner_url
+        # so older clients keep working.
+        "bottom_banner_urls": [],
         # Default lobby loop on live-holding when no VC / no per-agenda holding video.
         "idle_holding_video_url": "",
         "tiles": {key: _default_tile(key) for key in TILE_KEYS},
     }
+
+
+def _normalize_bottom_banner_urls(raw: Any) -> list[str]:
+    urls: list[str] = []
+    if isinstance(raw, dict):
+        candidates = (
+            raw.get("bottom_banner_urls")
+            or raw.get("bottomBannerUrls")
+            or raw.get("bottom_banners")
+            or []
+        )
+        if isinstance(candidates, list):
+            for item in candidates:
+                cleaned = _clean_url(item)
+                if cleaned and cleaned not in urls:
+                    urls.append(cleaned)
+        for key in (
+            "bottom_banner_url",
+            "bottomBannerUrl",
+            "bottom_banner",
+            "bottom_banner_url_2",
+            "bottomBannerUrl2",
+            "bottom_banner_url_3",
+            "bottomBannerUrl3",
+        ):
+            cleaned = _clean_url(raw.get(key))
+            if cleaned and cleaned not in urls:
+                urls.append(cleaned)
+    elif isinstance(raw, list):
+        for item in raw:
+            cleaned = _clean_url(item)
+            if cleaned and cleaned not in urls:
+                urls.append(cleaned)
+    return urls[:3]
 
 
 def _normalize_tile(key: str, raw: Any) -> dict:
@@ -202,6 +239,7 @@ def normalize_homepage_settings(raw: Any) -> dict:
     if not isinstance(raw, dict):
         return base
     tiles_raw = raw.get("tiles") if isinstance(raw.get("tiles"), dict) else {}
+    bottom_banner_urls = _normalize_bottom_banner_urls(raw)
     return {
         "background_video_url": _clean_url(
             raw.get("background_video_url")
@@ -216,12 +254,8 @@ def normalize_homepage_settings(raw: Any) -> dict:
             or ""
         ),
         "logo_url": _clean_url(raw.get("logo_url") or raw.get("logoUrl") or ""),
-        "bottom_banner_url": _clean_url(
-            raw.get("bottom_banner_url")
-            or raw.get("bottomBannerUrl")
-            or raw.get("bottom_banner")
-            or ""
-        ),
+        "bottom_banner_url": bottom_banner_urls[0] if bottom_banner_urls else "",
+        "bottom_banner_urls": bottom_banner_urls,
         "idle_holding_video_url": _clean_url(
             raw.get("idle_holding_video_url")
             or raw.get("idleHoldingVideoUrl")
@@ -433,6 +467,7 @@ class HomepageSettingsUpdate(BaseModel):
     fallback_image_url: Optional[str] = ""
     logo_url: Optional[str] = ""
     bottom_banner_url: Optional[str] = ""
+    bottom_banner_urls: Optional[list[str]] = None
     idle_holding_video_url: Optional[str] = ""
     tiles: dict[str, HomepageTileUpdate] = Field(default_factory=dict)
 
@@ -463,12 +498,27 @@ def update_homepage_settings(payload: HomepageSettingsUpdate):
             "info_title": data.get("info_title") or current_tile["info_title"],
             "info_description": data.get("info_description") or current_tile["info_description"],
         }
+    if payload.bottom_banner_urls is not None:
+        bottom_payload = {
+            "bottom_banner_urls": payload.bottom_banner_urls,
+            "bottom_banner_url": payload.bottom_banner_url or "",
+        }
+    else:
+        # Older clients (Host Control idle-lobby save) only send image 1.
+        # Keep images 2–3 from the stored settings.
+        preserved = list(current.get("bottom_banner_urls") or [])
+        first = _clean_url(payload.bottom_banner_url)
+        if first:
+            preserved = [first, *[url for url in preserved[1:] if url != first]]
+        elif preserved:
+            preserved = preserved[1:]
+        bottom_payload = {"bottom_banner_urls": preserved}
     settings = save_homepage_settings(
         {
             "background_video_url": payload.background_video_url or "",
             "fallback_image_url": payload.fallback_image_url or "",
             "logo_url": payload.logo_url or "",
-            "bottom_banner_url": payload.bottom_banner_url or "",
+            **bottom_payload,
             "idle_holding_video_url": payload.idle_holding_video_url or "",
             "tiles": tiles,
         }
