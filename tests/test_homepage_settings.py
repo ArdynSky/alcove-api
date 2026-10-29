@@ -43,6 +43,7 @@ class HomepageSettingsTests(unittest.TestCase):
         self.assertEqual(settings["fallback_image_url"], "")
         self.assertEqual(settings["logo_url"], "")
         self.assertEqual(settings["bottom_banner_url"], "")
+        self.assertEqual(settings["bottom_banner_urls"], [])
         self.assertEqual(settings["idle_holding_video_url"], "")
         self.assertEqual(settings["tiles"]["live_room"]["cta"], "LET'S GO!")
         self.assertEqual(settings["tiles"]["live_room"]["preview_opacity"], 50)
@@ -55,6 +56,11 @@ class HomepageSettingsTests(unittest.TestCase):
             "fallback_image_url": "https://example.com/bg.jpg",
             "logo_url": "https://example.com/logo.png",
             "bottom_banner_url": "https://example.com/bottom-banner.png",
+            "bottom_banner_urls": [
+                "https://example.com/bottom-banner.png",
+                "https://example.com/bottom-banner-2.png",
+                "https://example.com/bottom-banner-3.png",
+            ],
             "idle_holding_video_url": "https://example.com/idle-lobby.mp4",
             "tiles": {
                 "live_room": {
@@ -91,6 +97,14 @@ class HomepageSettingsTests(unittest.TestCase):
         loaded = self.client.get("/api/homepage-settings").json()["settings"]
         self.assertEqual(loaded["background_video_url"], "https://example.com/bg.mp4")
         self.assertEqual(loaded["bottom_banner_url"], "https://example.com/bottom-banner.png")
+        self.assertEqual(
+            loaded["bottom_banner_urls"],
+            [
+                "https://example.com/bottom-banner.png",
+                "https://example.com/bottom-banner-2.png",
+                "https://example.com/bottom-banner-3.png",
+            ],
+        )
         self.assertEqual(loaded["idle_holding_video_url"], "https://example.com/idle-lobby.mp4")
         self.assertEqual(loaded["tiles"]["connect"]["cta"], "ENTER")
         self.assertEqual(loaded["tiles"]["live_room"]["info_description"], "Custom live room copy.")
@@ -98,6 +112,36 @@ class HomepageSettingsTests(unittest.TestCase):
         self.assertEqual(loaded["tiles"]["profile"]["preview_opacity"], 25)
         self.assertEqual(loaded["tiles"]["connect"]["preview_opacity"], 50)
         self.assertEqual(loaded["tiles"]["archive"]["preview_opacity"], 50)
+
+    def test_idle_lobby_save_keeps_extra_bottom_banners(self):
+        seed = self.client.post(
+            "/api/homepage-settings",
+            json={
+                "admin_secret": "test-admin-secret",
+                "bottom_banner_urls": [
+                    "https://example.com/one.png",
+                    "https://example.com/two.png",
+                ],
+                "tiles": {},
+            },
+        )
+        self.assertEqual(seed.status_code, 200, seed.text)
+        follow = self.client.post(
+            "/api/homepage-settings",
+            json={
+                "admin_secret": "test-admin-secret",
+                "bottom_banner_url": "https://example.com/one.png",
+                "idle_holding_video_url": "https://example.com/idle.mp4",
+                "tiles": {},
+            },
+        )
+        self.assertEqual(follow.status_code, 200, follow.text)
+        loaded = follow.json()["settings"]
+        self.assertEqual(
+            loaded["bottom_banner_urls"],
+            ["https://example.com/one.png", "https://example.com/two.png"],
+        )
+        self.assertEqual(loaded["idle_holding_video_url"], "https://example.com/idle.mp4")
 
     def test_upload_rejects_unsupported_type(self):
         response = self.client.post(
