@@ -68,11 +68,10 @@ CARE_DECISIONS = {
 TERMINAL_JOB_STATUSES = {"completed", "failed"}
 QUEUE_STATUSES = {"open", "acted", "dismissed"}
 
-# TODO(fox-logs): flood_flags has message_excerpt but no message_id or chat_id.
-# TODO(fox-logs): link_violations and tone_flags have message_id but no chat_id.
+# Older fox_logs flood rows may lack message_id/chat_id. Synced safety-events and
+# current F.O.X floods store both; missing[] is computed per row below.
 ACTION_QUEUE_ROW_GAPS = [
-    "flood_flags has no message_id or chat_id; those fields are null and listed in missing.",
-    "link_violations and tone_flags have message_id but no chat_id.",
+    "Older flood_flags rows may omit message_id/chat_id until F.O.X re-syncs them.",
     "strike_count is null when fox_logs.db is unavailable; 0 means the user has no active strikes.",
     "display_name is empty when neither the source row nor user_profiles has one.",
 ]
@@ -885,12 +884,14 @@ def _strike_counts(user_ids: list[int]) -> dict[int, int] | None:
     return counts
 
 
-def _schema_missing(kind: str) -> list[str]:
-    if kind == "flood":
-        return ["message_id", "chat_id"]
-    if kind in {"link", "tone"}:
-        return ["chat_id"]
-    return []
+def _schema_missing(kind: str, *, message_id: int | None = None, chat_id: int | None = None) -> list[str]:
+    missing: list[str] = []
+    if kind in {"flood", "link", "tone", "care_report"}:
+        if message_id is None:
+            missing.append("message_id")
+        if chat_id is None:
+            missing.append("chat_id")
+    return missing
 
 
 def _identity(user_id, username, display_name, profiles: dict[int, dict]) -> dict:
@@ -953,7 +954,9 @@ def _queue_row(
     detail: dict | None = None,
 ) -> dict:
     identity = _identity(user_id, username, display_name, profiles)
-    missing = list(_schema_missing(kind))
+    coerced_message_id = int(message_id) if message_id else None
+    coerced_chat_id = int(chat_id) if chat_id is not None else None
+    missing = list(_schema_missing(kind, message_id=coerced_message_id, chat_id=coerced_chat_id))
     strike_count = None
     if strikes is None:
         missing.append("strike_count")
@@ -961,7 +964,7 @@ def _queue_row(
         strike_count = int(strikes.get(int(user_id), 0))
     job_id = resolution.get("job_id") if resolution else None
     job = jobs.get(job_id) if job_id else None
-    message_ids = [int(message_id)] if message_id else []
+    message_ids = [coerced_message_id] if coerced_message_id else []
     return {
         "id": row_id,
         "kind": kind,
@@ -970,9 +973,9 @@ def _queue_row(
         "display_name": identity.get("display_name") or "",
         "label": identity.get("label") or "",
         "excerpt": excerpt or None,
-        "message_id": int(message_id) if message_id else None,
+        "message_id": coerced_message_id,
         "message_ids": message_ids,
-        "chat_id": chat_id,
+        "chat_id": coerced_chat_id,
         "strike_count": strike_count,
         "created_at": created_at,
         "status": _row_status(resolution, care_status),
