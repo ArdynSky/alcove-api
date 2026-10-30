@@ -329,10 +329,13 @@ def normalize_profile(raw: Any) -> dict:
         "levelRewardsClaimed": _union_str_list(data.get("levelRewardsClaimed"))[:80],
         "claimReceipts": claim_receipts,
         "claimEventIds": _trim_dict(data.get("claimEventIds"), MAX_CLAIM_EVENT_IDS),
+        # Approval receipts outlive the rolling general event/history windows.
+        "approvalClaims": {str(k): True for k, v in _as_dict(data.get("approvalClaims")).items() if v and len(str(k)) <= 240},
         "expHistory": _dedupe_exp_history(data.get("expHistory")),
         "achievementsClaimed": _union_str_list(data.get("achievementsClaimed"))[:200],
         "achievementsNotified": _union_str_list(data.get("achievementsNotified"))[:200],
         "progressionResetToken": str(data.get("progressionResetToken") or "")[:120],
+        "progressionAdminResetToken": str(data.get("progressionAdminResetToken") or "")[:120],
         "progressionResetAt": str(data.get("progressionResetAt") or "")[:80],
         "spotlightColourSet": colour_set,
         "stats": clean_stats,
@@ -417,6 +420,7 @@ def merge_profiles(base: dict | None, incoming: dict | None) -> dict:
         "levelRewardsClaimed": _union_str_list(left["levelRewardsClaimed"], right["levelRewardsClaimed"]),
         "claimReceipts": {**left["claimReceipts"], **right["claimReceipts"]},
         "claimEventIds": {**left["claimEventIds"], **right["claimEventIds"]},
+        "approvalClaims": {**left["approvalClaims"], **right["approvalClaims"]},
         "expHistory": _dedupe_exp_history(older.get("expHistory"), newer.get("expHistory")),
         "achievementsClaimed": _union_str_list(left["achievementsClaimed"], right["achievementsClaimed"]),
         "achievementsNotified": _union_str_list(left["achievementsNotified"], right["achievementsNotified"]),
@@ -474,6 +478,11 @@ def save_profile(user_id: str, incoming: dict, *, replace: bool = False) -> dict
         payload["updated_at"] = _now()
     with _LOCK:
         current = _load_stored_profile(key)
+        # A delayed upload (even replace=True) must not undo an admin bulk reset.
+        from .progress_reset import reset_checkpoint
+        checkpoint = reset_checkpoint(key)
+        if checkpoint and payload.get("progressionAdminResetToken") != checkpoint["reset_token"]:
+            return current or normalize_profile({})
         preserved_member_since = canonical_member_since(
             (current or {}).get("memberSince")
         )

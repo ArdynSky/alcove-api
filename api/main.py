@@ -48,6 +48,7 @@ from . import debate_audience  # noqa: F401 — registers audience/archive route
 from .agendas import router as agendas_router
 from .live_room_test import apply_authorization_identity, router as live_room_test_router
 from .member_progress import router as member_progress_router
+from .progress_reset import router as progress_reset_router, approval_metadata, serialized_change, reset_checkpoint
 from .homepage_settings import router as homepage_settings_router
 from .homepage_settings import ensure_homepage_media_optimized
 from .help_cms import router as help_cms_router
@@ -87,6 +88,7 @@ app.include_router(debate_games_router)
 app.include_router(agendas_router)
 app.include_router(live_room_test_router)
 app.include_router(member_progress_router)
+app.include_router(progress_reset_router)
 app.include_router(homepage_settings_router)
 app.include_router(help_cms_router)
 app.include_router(safety_enforcement_router)
@@ -1787,7 +1789,7 @@ def query_spotlight_archive(
     }
 
 
-def sanitize_member_spotlight_entry(entry: dict, viewer: dict) -> dict:
+def sanitize_member_spotlight_entry(entry: dict, viewer: dict, checkpoint=False) -> dict:
     nominator = {
         "user_id": entry.get("nominator_user_id"),
         "username": entry.get("nominator_username"),
@@ -1797,6 +1799,8 @@ def sanitize_member_spotlight_entry(entry: dict, viewer: dict) -> dict:
         "username": entry.get("nominee_username"),
     }
     return {
+        "status": "approved",
+        **approval_metadata(viewer.get("user_id"), "spotlight", {**entry, "status": "approved"}, checkpoint=checkpoint),
         "spotlight_id": entry.get("spotlight_id"),
         "nominee_display_name": entry.get("nominee_display_name") or entry.get("nominee_username"),
         "nominee_username": entry.get("nominee_username"),
@@ -2880,6 +2884,7 @@ def apply_pulse_suggestion_schedule(entry: dict, mode: str | None = None, *, app
         return entry
     if approve or schedule == "today":
         entry["status"] = "approved"
+        entry.setdefault("progression_approved_at", now_iso())
         entry["active_from_day_key"] = active_from_for_schedule_mode(schedule)
     return entry
 
@@ -3876,11 +3881,12 @@ def pulse_answers_to_suggestion(identity, suggestion):
     return answers
 
 
-def pulse_owned_suggestion_payload(identity, suggestion):
+def pulse_owned_suggestion_payload(identity, suggestion, checkpoint=False):
     question = pulse_suggestion_question(suggestion)
     answers = pulse_answers_to_suggestion(identity, suggestion)
     active_from = (suggestion.get("active_from_day_key") or "").strip()
     return {
+        **approval_metadata(identity.get("user_id"), "pulse", suggestion, checkpoint=checkpoint),
         "suggestion_id": suggestion.get("id"),
         "question": question,
         "pool": suggestion.get("pool") or "green",
@@ -3900,11 +3906,12 @@ def pulse_owned_suggestion_payload(identity, suggestion):
 
 
 def pulse_my_pulses_payload(identity):
+    checkpoint = reset_checkpoint(identity.get("user_id"))
     today_key = pulse_day_key()
     today_rows = []
     past_rows = []
     for suggestion in pulse_suggestions_for_user(identity.get("user_id"), identity.get("username")):
-        row = pulse_owned_suggestion_payload(identity, suggestion)
+        row = pulse_owned_suggestion_payload(identity, suggestion, checkpoint)
         status = (suggestion.get("status") or "").strip().lower()
         active_from = (suggestion.get("active_from_day_key") or "").strip()
         submitted_day = (suggestion.get("day_key") or "").strip()
@@ -4715,6 +4722,7 @@ def drain_pulse_admin_telegram_backlog() -> None:
 drain_pulse_admin_telegram_backlog()
 
 
+@serialized_change
 def apply_admin_pulse_question_action(
     entry: dict,
     action: str,
@@ -6102,6 +6110,7 @@ def get_spotlight_entry(entry_id: int):
 def spotlight_nominations_for_user(user_id=None, username=None):
     """Spotlight nominations submitted by this resident (nominator), newest first."""
     viewer = archive_viewer_identity(user_id, username)
+    checkpoint = reset_checkpoint(viewer.get("user_id"))
     nominations = []
     for entry in spotlight_entries:
         nominator = {
@@ -6116,6 +6125,7 @@ def spotlight_nominations_for_user(user_id=None, username=None):
         reason = (entry.get("edited_reason") or entry.get("reason") or "").strip()
         nominations.append(
             {
+                **approval_metadata(viewer.get("user_id"), "spotlight", entry, checkpoint=checkpoint),
                 "spotlight_id": sid,
                 "status": entry.get("status"),
                 "published_at": entry.get("published_at"),
@@ -6133,6 +6143,7 @@ def spotlight_nominations_for_user(user_id=None, username=None):
 def spotlight_awards_for_user(user_id=None, username=None):
     """Published Spotlight awards for this resident (nominee), newest first."""
     viewer = archive_viewer_identity(user_id, username)
+    checkpoint = reset_checkpoint(viewer.get("user_id"))
     awards = []
     seen = set()
 
@@ -6155,6 +6166,7 @@ def spotlight_awards_for_user(user_id=None, username=None):
         seen.add(sid)
         awards.append(
             {
+                **approval_metadata(viewer.get("user_id"), "spotlight", {**entry, "status": "approved"}, checkpoint=checkpoint),
                 "spotlight_id": sid,
                 "published_at": entry.get("published_at"),
                 "style": entry.get("style"),
@@ -6184,6 +6196,7 @@ def spotlight_awards_for_user(user_id=None, username=None):
         reason = (entry.get("edited_reason") or entry.get("reason") or "").strip()
         awards.append(
             {
+                **approval_metadata(viewer.get("user_id"), "spotlight", entry, checkpoint=checkpoint),
                 "spotlight_id": sid,
                 "published_at": entry.get("published_at"),
                 "style": entry.get("style"),
@@ -8451,7 +8464,8 @@ def member_archive_spotlight(
         page=page,
         limit=limit,
     )
-    entries = [sanitize_member_spotlight_entry(entry, viewer) for entry in result.get("entries") or []]
+    checkpoint = reset_checkpoint(viewer.get("user_id"))
+    entries = [sanitize_member_spotlight_entry(entry, viewer, checkpoint) for entry in result.get("entries") or []]
     return {
         "status": "ok",
         "entries": entries,
@@ -9086,6 +9100,7 @@ def admin_create_pulse_question(payload: AdminPulseQuestionCreate):
 
 
 @app.post("/api/admin/pulse-questions/{suggestion_id}")
+@serialized_change
 def admin_pulse_question_action(suggestion_id: int, payload: AdminPulseQuestionAction):
     verify_admin_secret(payload.admin_secret)
     entry = find_pulse_question_suggestion(suggestion_id)
@@ -9102,6 +9117,7 @@ def admin_pulse_question_action(suggestion_id: int, payload: AdminPulseQuestionA
 
 
 @app.post("/api/admin/spotlights/{entry_id}")
+@serialized_change
 def admin_spotlight_action(entry_id: int, payload: AdminSpotlightAction):
     verify_admin_secret(payload.admin_secret)
     with spotlight_submit_lock:
@@ -9127,6 +9143,7 @@ def admin_spotlight_action(entry_id: int, payload: AdminSpotlightAction):
             if current_status == "approved":
                 return {"status": "ok", "entry": entry, "already_done": True}
             entry["status"] = "approved"
+            entry.setdefault("progression_approved_at", now_iso())
             entry["reviewed_at"] = now_iso()
             entry["publish_pending"] = True
         elif action == "delete":
@@ -11181,6 +11198,7 @@ def bot_publish_pending_spotlights(x_bot_sync_secret: str | None = Header(defaul
 
 
 @app.post("/api/bot-sync/spotlights/{entry_id}")
+@serialized_change
 def bot_update_spotlight(entry_id: int, payload: SpotlightReviewUpdate, x_bot_sync_secret: str | None = Header(default=None)):
     verify_bot_sync_secret(x_bot_sync_secret)
     with spotlight_submit_lock:
@@ -11200,6 +11218,8 @@ def bot_update_spotlight(entry_id: int, payload: SpotlightReviewUpdate, x_bot_sy
             if current_status == "approved" and next_status == "approved" and entry.get("published_at"):
                 return {"status": "ok", "entry": entry, "already_done": True}
             entry["status"] = payload.status
+            if next_status == "approved":
+                entry.setdefault("progression_approved_at", now_iso())
         if payload.edited_reason is not None:
             entry["edited_reason"] = payload.edited_reason
         if payload.review_message_sent is not None:
@@ -12083,6 +12103,7 @@ def bot_reserved_pulse_question_list(x_bot_sync_secret: str | None = Header(defa
 
 
 @app.post("/api/bot-sync/pulse-questions/by-id/{suggestion_id}/schedule")
+@serialized_change
 def bot_schedule_reserved_pulse_question(
     suggestion_id: int,
     payload: dict | None = None,
@@ -12097,6 +12118,7 @@ def bot_schedule_reserved_pulse_question(
     if not day_key:
         return {"status": "error", "message": "active_from_day_key is required."}
     entry["status"] = "approved"
+    entry.setdefault("progression_approved_at", now_iso())
     entry["schedule_mode"] = "reserve"
     entry["active_from_day_key"] = day_key
     if payload.get("reviewed_by") is not None:
@@ -12214,6 +12236,7 @@ def bot_pulse_question_suggestion(suggestion_id: int, x_bot_sync_secret: str | N
 
 
 @app.post("/api/bot-sync/pulse-questions/by-id/{suggestion_id}")
+@serialized_change
 def bot_update_pulse_question_suggestion(suggestion_id: int, payload: dict | None = None, x_bot_sync_secret: str | None = Header(default=None)):
     verify_bot_sync_secret(x_bot_sync_secret)
     entry = find_pulse_question_suggestion(suggestion_id)
@@ -12241,6 +12264,8 @@ def bot_update_pulse_question_suggestion(suggestion_id: int, payload: dict | Non
         entry["needs_admin_notify"] = bool(payload.get("needs_admin_notify"))
     if "status" in payload and not payload.get("approve") and not payload.get("reject"):
         entry["status"] = payload.get("status")
+        if entry["status"] == "approved":
+            entry.setdefault("progression_approved_at", now_iso())
     if "review_message_sent" in payload:
         entry["review_message_sent"] = bool(payload.get("review_message_sent"))
     if "reviewed_by" in payload:
