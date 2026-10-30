@@ -580,8 +580,9 @@ class SafetyEnforcementTests(unittest.TestCase):
         self.assertEqual(care_rows[0]["display_name"], "")
 
     def test_member_lists_and_claims_own_exp_grant(self):
+        member_client = TestClient(main.app, headers={"X-Bot-Sync-Secret": main.BOT_SYNC_SECRET})
         def remove_report(reporter_id: int, target_user_id: int):
-            created = self.client.post(
+            created = member_client.post(
                 "/api/bot-sync/care-reports",
                 headers=BOT_HEADERS,
                 json={
@@ -593,7 +594,7 @@ class SafetyEnforcementTests(unittest.TestCase):
             )
             self.assertEqual(created.status_code, 200, created.text)
             report_id = created.json()["report"]["id"]
-            removed = self.client.post(
+            removed = member_client.post(
                 f"/api/admin/safety/care-reports/{report_id}/resolve",
                 json={"admin_secret": SECRET, "decision": "remove", "admin_user_id": 7},
             )
@@ -603,7 +604,7 @@ class SafetyEnforcementTests(unittest.TestCase):
         report_id, grant = remove_report(900, 504)
         _, other_grant = remove_report(902, 501)
 
-        listed = self.client.get("/api/exp-grants", params={"user_id": 900})
+        listed = member_client.get("/api/exp-grants", params={"user_id": 900})
         self.assertEqual(listed.status_code, 200, listed.text)
         self.assertEqual([row["id"] for row in listed.json()["grants"]], [grant["id"]])
         self.assertEqual(listed.json()["grants"][0]["amount"], 30)
@@ -611,25 +612,25 @@ class SafetyEnforcementTests(unittest.TestCase):
         self.assertEqual(listed.json()["grants"][0]["dedupe_key"], f"care_report:{report_id}")
         self.assertEqual(listed.json()["grants"][0]["user_id"], 900)
 
-        someone_else = self.client.get("/api/exp-grants", params={"user_id": 901})
+        someone_else = member_client.get("/api/exp-grants", params={"user_id": 901})
         self.assertEqual(someone_else.status_code, 200, someone_else.text)
         self.assertEqual(someone_else.json()["grants"], [])
-        self.assertEqual(self.client.get("/api/exp-grants").status_code, 422)
+        self.assertEqual(member_client.get("/api/exp-grants").status_code, 422)
 
-        wrong = self.client.post(
+        wrong = member_client.post(
             f"/api/exp-grants/{grant['id']}/claim",
             json={"user_id": 901},
         )
         self.assertEqual(wrong.status_code, 403)
         self.assertEqual(
-            [row["id"] for row in self.client.get("/api/exp-grants", params={"user_id": 900}).json()["grants"]],
+            [row["id"] for row in member_client.get("/api/exp-grants", params={"user_id": 900}).json()["grants"]],
             [grant["id"]],
         )
 
-        missing = self.client.post("/api/exp-grants/missing-grant/claim", json={"user_id": 900})
+        missing = member_client.post("/api/exp-grants/missing-grant/claim", json={"user_id": 900})
         self.assertEqual(missing.status_code, 404)
 
-        claimed = self.client.post(
+        claimed = member_client.post(
             f"/api/exp-grants/{grant['id']}/claim",
             json={"user_id": 900},
         )
@@ -639,7 +640,7 @@ class SafetyEnforcementTests(unittest.TestCase):
         self.assertEqual(claimed.json()["grant"]["dedupe_key"], f"care_report:{report_id}")
         self.assertTrue(claimed.json()["grant"]["applied_at"])
 
-        again = self.client.post(
+        again = member_client.post(
             f"/api/exp-grants/{grant['id']}/claim",
             json={"user_id": 900},
         )
@@ -647,20 +648,20 @@ class SafetyEnforcementTests(unittest.TestCase):
         self.assertTrue(again.json()["already_done"])
         self.assertEqual(again.json()["grant"]["status"], "applied")
         self.assertEqual(again.json()["grant"]["applied_at"], claimed.json()["grant"]["applied_at"])
-        self.assertEqual(self.client.get("/api/exp-grants", params={"user_id": 900}).json()["grants"], [])
+        self.assertEqual(member_client.get("/api/exp-grants", params={"user_id": 900}).json()["grants"], [])
 
-        failed = self.client.post(
+        failed = member_client.post(
             f"/api/bot-sync/exp-grants/{other_grant['id']}/complete",
             headers=BOT_HEADERS,
             json={"status": "failed", "error": "ledger skipped"},
         )
         self.assertEqual(failed.status_code, 200, failed.text)
-        blocked = self.client.post(
+        blocked = member_client.post(
             f"/api/exp-grants/{other_grant['id']}/claim",
             json={"user_id": 902},
         )
         self.assertEqual(blocked.status_code, 409)
-        self.assertEqual(self.client.get("/api/exp-grants", params={"user_id": 902}).json()["grants"], [])
+        self.assertEqual(member_client.get("/api/exp-grants", params={"user_id": 902}).json()["grants"], [])
 
 
 if __name__ == "__main__":

@@ -19,7 +19,8 @@ from api import main
 
 class RoomQATests(unittest.TestCase):
     def setUp(self):
-        self.client = TestClient(main.app)
+        # Exercise feature logic through the authenticated internal transport.
+        self.client = TestClient(main.app, headers={"X-Bot-Sync-Secret": main.BOT_SYNC_SECRET})
         self._items = list(main.room_qa_items)
         self._archive = list(main.room_qa_archive)
         self._discussion = dict(main.state.get("room_discussion") or {})

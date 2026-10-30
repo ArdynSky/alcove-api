@@ -299,6 +299,12 @@ def identity_from_authorization(authorization: Optional[str]) -> Optional[dict]:
         user = _load_token(token, PURPOSE_SESSION, consume=False)
     except HTTPException:
         return None
+    if not _is_host(user.get('id') or user.get('user_id')):
+        from .member_access import authorize_identity
+        try:
+            authorize_identity(user)
+        except HTTPException:
+            return None
     public = _public_user(user)
     public["role"] = _role_for(user)
     return public
@@ -358,6 +364,9 @@ class EventPayload(BaseModel):
 @router.post("/session")
 def create_session(payload: InitDataPayload):
     user = _verify_init_data(payload.init_data)
+    if not _is_host(user.get("id") or user.get("user_id")):
+        from .member_access import authorize_identity
+        authorize_identity(user)
     token, expires = _issue_token(PURPOSE_SESSION, user, SESSION_TTL_SECONDS)
     return _session_payload(user, token, expires)
 
@@ -365,6 +374,9 @@ def create_session(payload: InitDataPayload):
 @router.post("/handoff")
 def create_handoff(payload: InitDataPayload):
     user = _verify_init_data(payload.init_data)
+    if not _is_host(user.get("id") or user.get("user_id")):
+        from .member_access import authorize_identity
+        authorize_identity(user)
     token, expires = _issue_token(PURPOSE_HANDOFF, user, HANDOFF_TTL_SECONDS)
     open_url = f"{_public_base()}/live-room-test.html?handoff={token}"
     return {
@@ -378,6 +390,9 @@ def create_handoff(payload: InitDataPayload):
 @router.post("/claim")
 def claim_handoff(payload: ClaimPayload):
     user = _load_token(payload.token, PURPOSE_HANDOFF, consume=True)
+    if not _is_host(user.get("id") or user.get("user_id")):
+        from .member_access import authorize_identity
+        authorize_identity(user)
     token, expires = _issue_token(PURPOSE_SESSION, user, SESSION_TTL_SECONDS)
     return _session_payload(user, token, expires)
 

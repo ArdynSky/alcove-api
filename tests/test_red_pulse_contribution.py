@@ -23,7 +23,8 @@ RED_QUESTION = main.PULSE_RED_DAILY_QUESTION_DEFAULT
 
 class RedPulseContributionTests(unittest.TestCase):
     def setUp(self):
-        self.client = TestClient(main.app)
+        # Exercise feature logic through the authenticated internal transport.
+        self.client = TestClient(main.app, headers={"X-Bot-Sync-Secret": main.BOT_SYNC_SECRET})
         self._entries = list(main.pulse_entries)
         self._receipts = list(main.pulse_receipts)
         self._alerts = list(main.pulse_red_unlock_notifications)

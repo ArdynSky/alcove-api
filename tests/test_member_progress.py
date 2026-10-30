@@ -23,7 +23,8 @@ from api import main, member_progress
 
 class MemberProgressTests(unittest.TestCase):
     def setUp(self):
-        self.client = TestClient(main.app)
+        # Exercise feature logic through the authenticated internal transport.
+        self.client = TestClient(main.app, headers={"X-Bot-Sync-Secret": "test-admin-secret"})
         self._orig_secret = main.BOT_SYNC_SECRET
         main.BOT_SYNC_SECRET = "test-admin-secret"
         self._orig_resolve = member_progress.resolve_telegram_user
