@@ -42,6 +42,9 @@ HOST = {
 
 class LiveRoomTestAuthTests(unittest.TestCase):
     def setUp(self):
+        from unittest import mock
+        self.membership = mock.patch.object(main, "find_verified_alcove_user", side_effect=lambda user_id=None, username=None: {"user_id": user_id, "verified_at": "2026-01-01"} if str(user_id) == "4242" else None)
+        self.membership.start()
         self.client = TestClient(main.app)
         self._orig_verify = live_room_test._verify_init_data
         live_room_test._verify_init_data = lambda init_data: {
@@ -52,6 +55,7 @@ class LiveRoomTestAuthTests(unittest.TestCase):
             os.remove(live_room_test.DB_PATH)
 
     def tearDown(self):
+        self.membership.stop()
         live_room_test._verify_init_data = self._orig_verify
 
     def test_feature_flag_defaults_off(self):

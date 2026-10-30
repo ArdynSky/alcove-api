@@ -24,6 +24,10 @@ def identity(authorization: str | None = Header(default=None), x_telegram_init_d
         user = {**_public_user(verified), "role": _role_for(verified)}
     if not user:
         q.fail("Open the Live Room through Telegram to take part.", 401)
+    from .live_room_test import _is_host
+    if not _is_host(user.get("id") or user.get("user_id")):
+        from .member_access import authorize_identity
+        authorize_identity(user)
     user["user_id"] = str(user.get("user_id") or user.get("id") or "")
     if not user["user_id"]:
         q.fail("Verified identity is required.", 401)

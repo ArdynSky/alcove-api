@@ -29,6 +29,9 @@ def london(year, month, day, hour=12, minute=0):
 
 class DailyCheckInTests(unittest.TestCase):
     def setUp(self):
+        from unittest import mock
+        self.membership = mock.patch.object(main, "find_verified_alcove_user", side_effect=lambda user_id=None, username=None: {"user_id": user_id, "verified_at": "2026-01-01"})
+        self.membership.start()
         self.client = TestClient(main.app)
         self._orig_verify = main.verify_telegram_init_data
         main.verify_telegram_init_data = self._verify
@@ -43,6 +46,7 @@ class DailyCheckInTests(unittest.TestCase):
         self._reset_db()
 
     def tearDown(self):
+        self.membership.stop()
         main.verify_telegram_init_data = self._orig_verify
         daily_checkin.set_clock(None)
 

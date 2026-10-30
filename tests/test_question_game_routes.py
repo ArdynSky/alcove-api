@@ -20,6 +20,8 @@ def api(tmp_path, monkeypatch):
         uid=value.removeprefix("Bearer user-")
         return {"user_id":uid,"display_name":"Member "+uid,"username":"u"+uid,"role":"participant"}
     monkeypatch.setattr(auth,"identity_from_authorization",identify)
+    from api import main
+    monkeypatch.setattr(main,"find_verified_alcove_user",lambda user_id=None, username=None: {"user_id":user_id,"verified_at":"2026-01-01"} if str(user_id) in {"1","2","3","4"} else None)
     app=FastAPI();app.include_router(r.router)
     return TestClient(app),q,r,cr
 

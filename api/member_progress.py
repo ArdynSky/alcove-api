@@ -504,6 +504,9 @@ def save_profile(user_id: str, incoming: dict, *, replace: bool = False) -> dict
                 (key, serialized, merged["updated_at"]),
             )
             con.commit()
+    if _as_dict(merged.get("claimReceipts")).get("verification_pack"):
+        from .member_access import remember_pack_claim
+        remember_pack_claim(key)
     return merged
 
 

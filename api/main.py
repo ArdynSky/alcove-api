@@ -77,7 +77,11 @@ try:
 except ImportError:
     pass
 
+from .member_access import router as member_access_router, MemberAccessMiddleware
+
 app = FastAPI()
+app.include_router(member_access_router)
+app.add_middleware(MemberAccessMiddleware)
 from .live_room_events import install_live_room_events
 install_live_room_events(app)
 app.include_router(home_alerts_router)
@@ -4298,7 +4302,7 @@ def pack_key_from_choice_store(user_id: int | None, username_key: str) -> str | 
         pack_key = _pack_key_from_choice_record(verification_pack_choices.get(str(int(user_id))))
         if pack_key:
             return pack_key
-    if username_key:
+    if not user_id and username_key:
         return _pack_key_from_choice_record(verification_pack_choices.get(f"name:{username_key}"))
     return None
 
@@ -4373,7 +4377,7 @@ def pack_key_from_synced_resident(user_id: int | None, username_key: str) -> str
         except (TypeError, ValueError):
             same_user = False
         same_username = (
-            bool(username_key)
+            not user_id and bool(username_key)
             and str(user.get("username") or "").strip().lstrip("@").lower() == username_key
         )
         if not (same_user or same_username):
@@ -4404,7 +4408,7 @@ def find_user_verification_pack_key(user_id: int | None = None, username: str | 
         if not isinstance(entry, dict):
             continue
         same_user = numeric_user_id and int(entry.get("user_id") or 0) == numeric_user_id
-        same_username = username_key and (entry.get("username") or "").strip().lstrip("@").lower() == username_key
+        same_username = not numeric_user_id and username_key and (entry.get("username") or "").strip().lstrip("@").lower() == username_key
         if not (same_user or same_username):
             continue
         pack_key = normalize_verification_pack_key(entry.get("selected_pack"))
@@ -4432,7 +4436,7 @@ def find_user_verification_pack_key(user_id: int | None = None, username: str | 
         flow_key = None
         if numeric_user_id:
             flow_key = index["by_user"].get(numeric_user_id)
-        if not flow_key and username_key:
+        if not numeric_user_id and not flow_key and username_key:
             flow_key = index["by_name"].get(username_key)
         if flow_key:
             remember_verification_pack_choice(numeric_user_id, username_key, flow_key)
@@ -4459,17 +4463,22 @@ def find_user_verification_pack_key(user_id: int | None = None, username: str | 
 
 
 def verification_pack_eligibility(user_id: int | None = None, username: str | None = None) -> dict:
+    from .member_access import find_retained_member
+    retained = find_retained_member(user_id, username)
     catalog = load_reward_catalog()
     active = bool(catalog.get("verification_packs_active"))
     packs = catalog.get("verification_packs") or normalize_verification_packs({})
     pack_key = find_user_verification_pack_key(user_id, username)
+    if not pack_key and retained:
+        pack_key = normalize_verification_pack_key(retained.get("fox_form"))
     pack = packs.get(pack_key) if pack_key else None
     return {
         "status": "ok",
         "active": active,
         "activated_at": catalog.get("verification_packs_activated_at"),
         "pack_key": pack_key,
-        "eligible": bool(active and pack),
+        "eligible": bool(active and pack and not (retained or {}).get("verification_pack_claimed")),
+        "already_claimed": bool((retained or {}).get("verification_pack_claimed")),
         "source_key": "verification_pack",
         "pack": pack,
     }
@@ -5558,9 +5567,10 @@ def find_verified_alcove_user(user_id=None, username=None):
             continue
         if user_id is not None and int(user.get("user_id") or 0) == int(user_id):
             return user
-        if username and (user.get("username") or "").lower() == username:
+        if user_id is None and username and (user.get("username") or "").lower() == username:
             return user
-    return None
+    from .member_access import find_retained_member
+    return find_retained_member(user_id, username)
 
 
 def clean_username(username: str | None) -> str | None:
@@ -7592,6 +7602,9 @@ async def cards_websocket_endpoint(websocket: WebSocket):
 
 @app.on_event("startup")
 async def cards_startup_tasks():
+    from .member_access import retain_verified_members, apply_recoveries
+    retain_verified_members(get_verified_alcove_users())
+    apply_recoveries()
     try:
         ensure_homepage_media_optimized()
     except Exception as exc:
@@ -7675,7 +7688,9 @@ def bot_sync_health() -> dict:
 
 @app.get("/api/alcove-users")
 def alcove_users():
-    users = get_verified_alcove_users()
+    from .member_access import retained_members
+    current = get_verified_alcove_users()
+    users = list({**{str(u["user_id"]): u for u in retained_members()}, **{str(u["user_id"]): u for u in current}}.values())
     health = bot_sync_health()
     return {
         "status": "ok",
@@ -7708,6 +7723,9 @@ def submit_miniapp_verification(payload: MiniappVerificationPayload):
     user = verify_telegram_init_data(payload.init_data)
     entry = upsert_miniapp_verification(user)
     update_miniapp_verification_details(entry, payload)
+    if entry.get("status") == "completed":
+        from .member_access import remember_member
+        remember_member({**entry, "verified_at": entry.get("completed_at")}, source="completed_verification")
     save_runtime_state()
     return {"status": "ok", "verification": miniapp_verification_payload(entry)}
 
@@ -7767,6 +7785,9 @@ def bot_sync_alcove(payload: BotSyncPayload, x_bot_sync_secret: str | None = Hea
         synced_alcove_analytics = payload.analytics
     else:
         synced_alcove_analytics = synced_alcove_analytics or {}
+    if users_changed:
+        from .member_access import retain_verified_members
+        retain_verified_members(incoming)
     if users_changed or analytics_changed:
         last_bot_sync_at = payload.synced_at or now_iso()
         save_runtime_state()
@@ -7839,6 +7860,9 @@ def bot_update_miniapp_verification(
             entry["attempt_count"] = max(0, int(payload.get("attempt_count") or 0))
         except (TypeError, ValueError):
             entry["attempt_count"] = int(entry.get("attempt_count") or 0)
+    if status == "completed":
+        from .member_access import remember_member
+        remember_member({**entry, "verified_at": entry.get("completed_at")}, source="completed_verification")
     save_runtime_state()
     return {"status": "ok", "verification": miniapp_verification_payload(entry)}
 
