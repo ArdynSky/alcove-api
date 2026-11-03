@@ -88,15 +88,16 @@ class DailyCheckInTests(unittest.TestCase):
         finally:
             conn.close()
 
-    def test_feeling_required_and_message_optional(self):
+    def test_feeling_and_message_are_both_required(self):
         missing = self._post(feeling="", message="hello")
         self.assertEqual(missing.status_code, 400)
-        blank = self._post(feeling="good", message="   ")
-        self.assertEqual(blank.status_code, 200)
-        body = blank.json()
-        self.assertEqual(body["checkin"]["message"], "")
-        self.assertEqual(body["award"]["amount"], 30)
-        self.assertEqual(body["award"]["reason"], "Daily check-in")
+        for message in (None, "", "   ", "\n\t"):
+            blank = self._post(feeling="good", message=message)
+            self.assertEqual(blank.status_code, 400)
+        self.assertEqual(self._grant_count(1), 0)
+        valid = self._post(feeling="good", message="A good day")
+        self.assertEqual(valid.status_code, 200)
+        self.assertEqual(valid.json()["award"]["amount"], 75)
         self.assertEqual(self._grant_count(1), 1)
 
     def test_message_awards_75_not_105_and_retry_does_not_duplicate(self):

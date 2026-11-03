@@ -580,10 +580,12 @@ def submit_checkin(
     if mood not in FEELINGS:
         raise _http(400, "Choose how you are feeling today.")
     text = normalize_message(message, allow_blank=True, limit=CHECKIN_MESSAGE_LIMIT)
+    if not text:
+        raise _http(400, "Add a message to your check-in.")
     clock = community_clock()
     day = clock["community_date"]
     _assert_same_day(confirmed_day, day)
-    amount = CHECKIN_MESSAGE_EXP if text else CHECKIN_FEELING_EXP
+    amount = CHECKIN_MESSAGE_EXP
     conn = _connect()
     try:
         conn.execute("BEGIN IMMEDIATE")
