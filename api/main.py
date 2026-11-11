@@ -78,9 +78,11 @@ except ImportError:
     pass
 
 from .member_access import router as member_access_router, MemberAccessMiddleware
+from .public_wheel import router as public_wheel_router
 
 app = FastAPI()
 app.include_router(member_access_router)
+app.include_router(public_wheel_router)
 app.add_middleware(MemberAccessMiddleware)
 from .live_room_events import install_live_room_events
 install_live_room_events(app)
@@ -7089,13 +7091,11 @@ def entry_is_approved(entry: dict) -> bool:
 
 def wheel_entry_matches_submitter(entry: dict, telegram_id=None, username=None, display_name=None) -> bool:
     data = entry.get("data") or {}
-    if telegram_id is not None and data.get("telegram_id") == telegram_id:
-        return True
-    if username and (data.get("username") or "").strip().lower() == str(username).strip().lstrip("@").lower():
-        return True
-    if display_name and (data.get("display_name") or "").strip().lower() == str(display_name).strip().lower():
-        return True
-    return False
+    if telegram_id is not None and data.get("telegram_id") is not None:
+        return str(data["telegram_id"]) == str(telegram_id)
+    if username and data.get("username"):
+        return data["username"].strip().lstrip("@").lower() == str(username).strip().lstrip("@").lower()
+    return bool(display_name and (data.get("display_name") or "").strip().lower() == str(display_name).strip().lower())
 
 
 def get_room_users():
@@ -7105,13 +7105,13 @@ def get_room_users():
         name = data.get("display_name")
         if not name:
             continue
-        key = name.strip().lower()
+        key = wheel_user_key(data.get("telegram_id"), data.get("username"), name)
         users.setdefault(key, {
             "display_name": name,
             "username": data.get("username"),
             "user_id": data.get("telegram_id"),
-            "muted": key in muted_users,
-            "submission_limit": wheel_submission_limits.get(key, 1),
+            "muted": name.strip().lower() in muted_users,
+            "submission_limit": wheel_submission_limits.get(name.strip().lower(), 1),
             "current_round_entries": 0,
             "last_seen": entry.get("time"),
         })
@@ -7128,17 +7128,17 @@ def get_room_users():
         name = (comment.get("display_name") or "").strip()
         if not name:
             continue
-        key = name.lower()
+        key = wheel_user_key(comment.get("user_id"), comment.get("username"), name)
         users.setdefault(key, {
             "display_name": name,
             "username": comment.get("username"),
             "user_id": comment.get("user_id"),
-            "muted": key in muted_users,
-            "submission_limit": wheel_submission_limits.get(key, 1),
+            "muted": name.strip().lower() in muted_users,
+            "submission_limit": wheel_submission_limits.get(name.strip().lower(), 1),
             "current_round_entries": 0,
             "last_seen": comment.get("time"),
         })
-        users[key]["muted"] = key in muted_users
+        users[key]["muted"] = name.strip().lower() in muted_users
         if comment.get("username"):
             users[key]["username"] = comment.get("username")
         if comment.get("user_id") is not None:
@@ -7147,8 +7147,9 @@ def get_room_users():
             users[key]["last_seen"] = comment.get("time")
 
     for key, user in users.items():
-        user["muted"] = key in muted_users
-        user["submission_limit"] = wheel_submission_limits.get(key, 1)
+        name_key = str(user.get("display_name") or "").strip().lower()
+        user["muted"] = name_key in muted_users
+        user["submission_limit"] = wheel_submission_limits.get(name_key, 1)
         stats = ensure_wheel_user_engagement(
             user_id=user.get("user_id"),
             username=user.get("username"),
