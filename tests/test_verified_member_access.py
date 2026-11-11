@@ -48,10 +48,10 @@ class VerifiedMemberAccessTests(unittest.TestCase):
         self.assertEqual(data["pack_key"], "dancer")
         self.assertTrue(data["already_claimed"])
 
-    def test_completed_verification_survives_missing_sync_but_selection_does_not_verify(self):
+    def test_bot_confirmed_protocol_admission_survives_missing_sync_but_selection_does_not_verify(self):
         main.miniapp_verifications.append({"user_id": 919308569, "status": "pending", "selected_pack": "dancer"})
         self.assertEqual(self.access().status_code, 403)
-        main.miniapp_verifications[0].update(status="completed", completed_at="2026-07-01T00:00:00Z")
+        main.miniapp_verifications[0].update(status="completed", completed_at="2026-07-01T00:00:00Z", protocol_version=2, admission_confirmed_at="2026-07-01T00:00:00Z")
         self.assertEqual(self.access().status_code, 200)
         main.miniapp_verifications.clear()
         self.assertEqual(self.access().status_code, 200)
@@ -62,9 +62,9 @@ class VerifiedMemberAccessTests(unittest.TestCase):
         response = self.client.get("/api/pulse-status?user_id=123", headers={"X-Telegram-Init-Data": "valid-signed-user"})
         self.assertEqual(response.status_code, 403)
 
-    def test_live_signed_tester_access_is_an_explicit_exception(self):
+    def test_tester_preview_permission_does_not_replace_verification(self):
         with mock.patch.object(main, "load_tester_usernames", return_value=["current_name"]):
-            self.assertEqual(self.access().json()["access_reason"], "tester")
+            self.assertEqual(self.access().status_code, 403)
         self.assertEqual(self.access().status_code, 403)
 
     def test_signature_is_required_for_owners_too(self):
@@ -92,3 +92,4 @@ class VerifiedMemberAccessTests(unittest.TestCase):
         member_progress.save_profile("919308569", {"claimReceipts": {"verification_pack": {"claimedAt": "2026-07-01"}}})
         remember_member({"user_id": 919308569, "verified_at": "2026-07-01", "fox_form": "dancer"})
         self.assertTrue(find_retained_member(919308569)["verification_pack_claimed"])
+

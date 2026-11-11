@@ -324,6 +324,7 @@ asmr_entries = []
 story_entries = []
 spotlight_entries = []
 spotlight_submit_lock = threading.Lock()
+verification_queue_lock = threading.RLock()
 pulse_entries = []
 pulse_receipts = []
 pulse_red_activations = []
@@ -2695,8 +2696,16 @@ class PulseQuestionSuggestion(BaseModel):
 
 class MiniappVerificationPayload(BaseModel):
     init_data: str | None = None
+    session_id: str | None = None
     selected_pack: str | None = None
     feedback: str | None = None
+
+
+class VerificationStepPayload(BaseModel):
+    init_data: str
+    session_id: str
+    step: str
+    value: str | bool
 
 
 class VerificationLogPayload(BaseModel):
@@ -2725,6 +2734,7 @@ class PulseSettingsUpdate(BaseModel):
 
 
 class BotSyncPayload(BaseModel):
+    complete_membership_snapshot: bool = False
     users: list[dict] = []
     analytics: dict = {}
     synced_at: str | None = None
@@ -4984,10 +4994,12 @@ def miniapp_verification_payload(entry: dict) -> dict:
         "completed_at": entry.get("completed_at"),
         "detail": entry.get("detail"),
         "attempt_count": int(entry.get("attempt_count") or 0),
+        "protocol_version": entry.get("protocol_version"),
+        "session_id": entry.get("session_id"),
     }
 
 
-def upsert_miniapp_verification(user: dict) -> dict:
+def upsert_miniapp_verification(user: dict, *, force_new=False) -> dict:
     now = now_iso()
     user_id = int(user.get("id"))
     display_name = " ".join(
@@ -5001,6 +5013,9 @@ def upsert_miniapp_verification(user: dict) -> dict:
         ),
         None,
     )
+    if force_new:
+        existing = None
+
     if existing:
         if existing.get("status") == "failed":
             existing["status"] = "pending"
@@ -5561,16 +5576,22 @@ def get_verified_alcove_users():
 
 
 def find_verified_alcove_user(user_id=None, username=None):
+    from .member_access import (is_replica, authority_member, revoked_member,
+                                find_retained_member, retained_membership_is_authoritative)
+    if is_replica():
+        return authority_member(user_id, username)
     username = (username or "").lstrip("@").lower()
-    for user in get_verified_alcove_users():
+    from .member_access import has_complete_snapshot
+    users = synced_alcove_users if has_complete_snapshot() else get_verified_alcove_users()
+    for user in users:
         if not is_alcove_verified_user(user):
             continue
-        if user_id is not None and int(user.get("user_id") or 0) == int(user_id):
+        matches = (user_id is not None and int(user.get("user_id") or 0) == int(user_id)) or (
+            user_id is None and username and (user.get("username") or "").lower() == username)
+        if matches and not revoked_member(user.get('user_id'), user.get('verified_at')):
             return user
-        if user_id is None and username and (user.get("username") or "").lower() == username:
-            return user
-    from .member_access import find_retained_member
-    return find_retained_member(user_id, username)
+    member = find_retained_member(user_id, username)
+    return member if retained_membership_is_authoritative(member) else None
 
 
 def clean_username(username: str | None) -> str | None:
@@ -7716,17 +7737,54 @@ def alcove_analytics():
     }
 
 
+@app.post("/api/verification/flow/start")
+def start_verification_flow(payload: MiniappVerificationPayload):
+    from . import verification_flow
+    from .member_access import require_authority
+    require_authority()
+    user = verify_telegram_init_data(payload.init_data or '')
+    session = verification_flow.start(user)
+    print(f'verification flow started user_id={user["id"]} protocol=2', flush=True)
+    from .member_access import verified_join_request_url
+    session['join_request_url'] = verified_join_request_url()
+    return {"status": "ok", "session": session}
+
+
+@app.post("/api/verification/flow/step")
+def advance_verification_flow(payload: VerificationStepPayload):
+    from . import verification_flow
+    from .member_access import require_authority
+    require_authority()
+    user = verify_telegram_init_data(payload.init_data)
+    session = verification_flow.advance(user, payload.session_id, payload.step, payload.value)
+    print(f'verification checkpoint user_id={user["id"]} step={payload.step} stage={session["stage"]}', flush=True)
+    from .member_access import verified_join_request_url
+    session['join_request_url'] = verified_join_request_url()
+    return {"status": "ok", "session": session}
+
+
 @app.post("/api/verification/miniapp")
 def submit_miniapp_verification(payload: MiniappVerificationPayload):
-    if not payload.init_data:
-        raise HTTPException(status_code=400, detail="Missing Telegram Mini App data")
-    user = verify_telegram_init_data(payload.init_data)
-    entry = upsert_miniapp_verification(user)
-    update_miniapp_verification_details(entry, payload)
-    if entry.get("status") == "completed":
-        from .member_access import remember_member
-        remember_member({**entry, "verified_at": entry.get("completed_at")}, source="completed_verification")
+    with verification_queue_lock:
+        return _submit_miniapp_verification(payload)
+
+
+def _submit_miniapp_verification(payload: MiniappVerificationPayload):
+    from . import verification_flow
+    from .member_access import require_authority
+    require_authority()
+    user = verify_telegram_init_data(payload.init_data or '')
+    completed = verification_flow.completed(user, payload.session_id)
+    existing = next((e for e in reversed(miniapp_verifications) if int(e.get('user_id') or 0) == int(user['id'])), None)
+    new_generation = bool(existing and existing.get('session_id') != completed['session_id'])
+    if new_generation and existing.get('status') == 'pending':
+        existing.update(status='failed', detail='superseded_by_new_session')
+    entry = upsert_miniapp_verification(user, force_new=new_generation)
+    entry.update(protocol_version=2, session_id=completed['session_id'])
+    trusted_payload = MiniappVerificationPayload(selected_pack=completed['selected_pack'], feedback=completed['feedback'])
+    update_miniapp_verification_details(entry, trusted_payload)
     save_runtime_state()
+    print(f'verification queued user_id={user["id"]} verification_id={entry["id"]} protocol=2', flush=True)
     return {"status": "ok", "verification": miniapp_verification_payload(entry)}
 
 
@@ -7756,20 +7814,34 @@ def verification_log(payload: VerificationLogPayload):
 
 @app.post("/api/bot-sync/alcove")
 def bot_sync_alcove(payload: BotSyncPayload, x_bot_sync_secret: str | None = Header(default=None)):
+    with verification_queue_lock:
+        return _bot_sync_alcove(payload, x_bot_sync_secret)
+
+
+def _bot_sync_alcove(payload: BotSyncPayload, x_bot_sync_secret: str | None = Header(default=None)):
     global synced_alcove_users, synced_alcove_analytics, last_bot_sync_at
 
     verify_bot_sync_secret(x_bot_sync_secret)
 
+    from .member_access import _timestamp, record_complete_snapshot, revoke_member
+    if payload.synced_at and last_bot_sync_at and _timestamp(payload.synced_at) < _timestamp(last_bot_sync_at):
+        return {'status': 'ok', 'users': len(synced_alcove_users), 'synced_at': last_bot_sync_at, 'ignored': 'stale_snapshot'}
     incoming = slim_synced_users(
         [user for user in (payload.users or []) if is_alcove_verified_user(user)]
     )
-    users_changed = bool(incoming) and incoming != synced_alcove_users
+    if payload.complete_membership_snapshot:
+        incoming_ids = {str(u.get('user_id')) for u in incoming}
+        removed = {str(u.get('user_id')) for u in synced_alcove_users} - incoming_ids
+        for uid in removed:
+            revoke_member(uid, 'authoritative_bot_snapshot', payload.synced_at or now_iso())
+        record_complete_snapshot(payload.synced_at or now_iso())
+    users_changed = (bool(incoming) or payload.complete_membership_snapshot) and incoming != synced_alcove_users
     analytics_changed = (
         (not lean_mode_enabled())
         and payload.analytics is not None
         and payload.analytics != synced_alcove_analytics
     )
-    if incoming:
+    if incoming or payload.complete_membership_snapshot:
         synced_alcove_users = incoming
     elif not synced_alcove_users:
         synced_alcove_users = []
@@ -7788,7 +7860,7 @@ def bot_sync_alcove(payload: BotSyncPayload, x_bot_sync_secret: str | None = Hea
     if users_changed:
         from .member_access import retain_verified_members
         retain_verified_members(incoming)
-    if users_changed or analytics_changed:
+    if users_changed or analytics_changed or payload.complete_membership_snapshot:
         last_bot_sync_at = payload.synced_at or now_iso()
         save_runtime_state()
 
@@ -7799,13 +7871,61 @@ def bot_sync_alcove(payload: BotSyncPayload, x_bot_sync_secret: str | None = Hea
     }
 
 
+@app.post("/api/bot-sync/membership/revoke")
+def revoke_membership(payload: dict, x_bot_sync_secret: str | None = Header(default=None)):
+    with verification_queue_lock:
+        return _revoke_membership(payload, x_bot_sync_secret)
+
+
+def _revoke_membership(payload: dict, x_bot_sync_secret: str | None = Header(default=None)):
+    verify_bot_sync_secret(x_bot_sync_secret)
+    from .member_access import revoke_member, require_authority
+    from . import verification_flow
+    require_authority()
+    try:
+        uid = int(payload.get('user_id') or 0)
+    except (TypeError, ValueError):
+        uid = 0
+    if uid <= 0:
+        raise HTTPException(400, 'Valid user_id required')
+    expected_id = payload.get('expected_verification_id')
+    expected_session = payload.get('expected_session_id')
+    if expected_id is not None or expected_session is not None:
+        latest = next((e for e in reversed(miniapp_verifications) if int(e.get('user_id') or 0) == uid), None)
+        if not latest or str(latest.get('id')) != str(expected_id) or latest.get('session_id') != expected_session:
+            raise HTTPException(409, 'Verification was superseded; rollback skipped')
+        from .member_access import _timestamp
+        for member in synced_alcove_users:
+            if int(member.get('user_id') or 0) == uid and _timestamp(member.get('verified_at')) > _timestamp(latest.get('completed_at') or latest.get('requested_at')):
+                raise HTTPException(409, 'Newer membership grant exists; rollback skipped')
+    revoked_at = revoke_member(uid, str(payload.get('reason') or 'manual_unverify')[:120])
+    if expected_session:
+        verification_flow.invalidate_session(uid, expected_session)
+    else:
+        verification_flow.invalidate_user(uid)
+    for entry in miniapp_verifications:
+        if int(entry.get('user_id') or 0) == uid:
+            entry.update(status='revoked', detail='Verification revoked', revoked_at=revoked_at)
+            entry.pop('admission_confirmed_at', None)
+    save_runtime_state()
+    return {'status': 'ok', 'user_id': uid, 'revoked_at': revoked_at}
+
+
+@app.post('/api/bot-sync/admission-policy')
+def record_admission_policy(payload: dict, x_bot_sync_secret: str | None = Header(default=None)):
+    verify_bot_sync_secret(x_bot_sync_secret)
+    from .member_access import require_authority, save_admission_policy
+    require_authority()
+    return {'status': 'ok', 'policy': save_admission_policy(payload)}
+
+
 @app.get("/api/bot-sync/verification/pending")
 def bot_pending_miniapp_verifications(x_bot_sync_secret: str | None = Header(default=None)):
     verify_bot_sync_secret(x_bot_sync_secret)
     entries = [
         miniapp_verification_payload(entry)
         for entry in miniapp_verifications
-        if entry.get("status") == "pending"
+        if entry.get("status") == "pending" and entry.get('protocol_version') == 2 and entry.get('session_id')
     ]
     return {"status": "ok", "entries": entries}
 
@@ -7830,8 +7950,29 @@ def bot_verification_logs(
     }
 
 
+@app.get('/api/bot-sync/verification/{verification_id}')
+def current_bot_verification(verification_id: int, x_bot_sync_secret: str | None = Header(default=None)):
+    verify_bot_sync_secret(x_bot_sync_secret)
+    entry = next((e for e in miniapp_verifications if int(e.get('id') or 0) == verification_id), None)
+    if not entry:
+        raise HTTPException(404, 'Verification not found')
+    latest = next((e for e in reversed(miniapp_verifications) if e.get('user_id') == entry.get('user_id')), None)
+    if latest is not entry:
+        raise HTTPException(409, 'Verification was superseded')
+    return {'status': 'ok', 'verification': miniapp_verification_payload(entry)}
+
+
 @app.post("/api/bot-sync/verification/{verification_id}")
 def bot_update_miniapp_verification(
+    verification_id: int,
+    payload: dict | None = None,
+    x_bot_sync_secret: str | None = Header(default=None),
+):
+    with verification_queue_lock:
+        return _bot_update_miniapp_verification(verification_id, payload, x_bot_sync_secret)
+
+
+def _bot_update_miniapp_verification(
     verification_id: int,
     payload: dict | None = None,
     x_bot_sync_secret: str | None = Header(default=None),
@@ -7844,9 +7985,16 @@ def bot_update_miniapp_verification(
     if not entry:
         return {"status": "error", "message": "Mini App verification not found."}
     payload = payload or {}
+    if entry.get('status') == 'revoked':
+        raise HTTPException(409, 'Verification was revoked; start a fresh verification')
+    latest = next((e for e in reversed(miniapp_verifications) if e.get('user_id') == entry.get('user_id')), None)
+    if latest is not entry or (entry.get('protocol_version') == 2 and payload.get('session_id') != entry.get('session_id')):
+        raise HTTPException(409, 'Verification session was superseded')
     status = payload.get("status")
     if status not in {"pending", "completed", "failed"}:
         return {"status": "error", "message": "Invalid Mini App verification status."}
+    if entry.get('status') == 'completed':
+        return {'status': 'ok', 'verification': miniapp_verification_payload(entry)}
     entry["status"] = status
     entry["completed_at"] = now_iso() if status in {"completed", "failed"} else None
     if "detail" in payload:
@@ -7861,6 +8009,12 @@ def bot_update_miniapp_verification(
         except (TypeError, ValueError):
             entry["attempt_count"] = int(entry.get("attempt_count") or 0)
     if status == "completed":
+        if entry.get('protocol_version') != 2 or not entry.get('session_id'):
+            entry['status'] = 'failed'
+            entry['detail'] = 'Verification must be completed through the current F.O.X flow'
+            save_runtime_state()
+            raise HTTPException(409, entry['detail'])
+        entry['admission_confirmed_at'] = entry['completed_at']
         from .member_access import remember_member
         remember_member({**entry, "verified_at": entry.get("completed_at")}, source="completed_verification")
     save_runtime_state()
@@ -12811,3 +12965,4 @@ def bot_cards_claim_rewards(payload: dict | None = None, x_bot_sync_secret: str 
     reward_ids = (payload or {}).get("reward_ids") or []
     mark_rewards_claimed([int(item) for item in reward_ids])
     return {"status": "ok", "claimed": len(reward_ids)}
+
