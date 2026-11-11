@@ -40,6 +40,7 @@ class OnboardingAuthorityTests(unittest.TestCase):
     def test_bot_confirmed_returning_member_remains_allowed(self):
         main.synced_alcove_users.append({'user_id':42,'verified_at':'2026-01-01'})
         self.assertEqual(self.client.post('/api/membership/access',headers=self.signed).status_code,200)
+        self.assertEqual(self.client.get('/api/membership/status?user_id=42').json()['user'].get('verified_at'),'2026-01-01')
 
     def test_revoke_overrides_stale_bot_snapshot_and_old_completed_record(self):
         main.synced_alcove_users.append({'user_id':42,'verified_at':'2026-01-01'})

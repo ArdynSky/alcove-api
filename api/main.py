@@ -12848,6 +12848,7 @@ def membership_status(user_id: int | None = None, username: str | None = None):
             "user_id": user.get("user_id"),
             "username": user.get("username"),
             "display_name": user.get("display_name") or user.get("label"),
+            "verified_at": user.get("verified_at") or user.get("verification_confirmed_at"),
         },
     }
 
