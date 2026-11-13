@@ -4475,7 +4475,7 @@ def find_user_verification_pack_key(user_id: int | None = None, username: str | 
 
 
 def verification_pack_eligibility(user_id: int | None = None, username: str | None = None) -> dict:
-    from .member_access import find_retained_member, retained_membership_is_authoritative
+    from .member_access import find_retained_member, retained_gift_is_authoritative
     retained = find_retained_member(user_id, username)
     catalog = load_reward_catalog()
     active = bool(catalog.get("verification_packs_active"))
@@ -4484,12 +4484,15 @@ def verification_pack_eligibility(user_id: int | None = None, username: str | No
         # A claimed entitlement must never be changed by an incomplete later
         # verification, a cached choice or a client-authored flow log.
         pack_key = (normalize_verification_pack_key(retained.get("fox_form"))
-                    if retained_membership_is_authoritative(retained) else None)
+                    if retained_gift_is_authoritative(retained) else None)
     else:
         pack_key = find_user_verification_pack_key(user_id, username)
         if not pack_key and retained:
             pack_key = normalize_verification_pack_key(retained.get("fox_form"))
     pack = packs.get(pack_key) if pack_key else None
+    print(f"verification gift check user_id={user_id} active={active} "
+          f"pack_key={pack_key or 'missing'} claimed={bool((retained or {}).get('verification_pack_claimed'))} "
+          f"restorable={bool(pack and (retained or {}).get('verification_pack_claimed'))}", flush=True)
     return {
         "status": "ok",
         "active": active,

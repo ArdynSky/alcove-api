@@ -462,7 +462,7 @@ def _restore_claimed_verification_gift(key: str, profile: dict) -> bool:
     retained = member_access.find_retained_member(user_id=key)
     if not retained or retained.get("verification_pack_claimed") is not True:
         return False
-    if not member_access.retained_membership_is_authoritative(retained):
+    if not member_access.retained_gift_is_authoritative(retained):
         return False
     pack_key = main.normalize_verification_pack_key(retained.get("fox_form"))
     if not pack_key:

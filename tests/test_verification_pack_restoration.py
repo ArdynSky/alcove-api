@@ -163,6 +163,24 @@ class VerificationPackRestorationTests(unittest.TestCase):
         self.assertEqual(result["pack"]["id"], "pup")
         self.assertFalse(result["eligible"])
 
+    def test_current_bot_verified_legacy_member_recovers_original_claimed_gift(self):
+        self.retain(pack="pup", authoritative=False)
+        main.synced_alcove_users.append({"user_id": 42, "verified_at": "2026-10-01T00:00:00Z", "fox_form": "pup"})
+        main.miniapp_verifications.append({"user_id": 42, "status": "pending", "selected_pack": "dancer"})
+        self.seed()
+        eligibility = main.verification_pack_eligibility(42)
+        self.assertEqual(eligibility["pack_key"], "pup")
+        self.assertFalse(eligibility["eligible"])
+        self.assertIn("pup_gift", member_progress.load_profile("42")["owned"]["feedSkins"])
+
+    def test_revoked_current_bot_verified_legacy_member_does_not_restore(self):
+        self.retain(pack="pup", authoritative=False)
+        main.synced_alcove_users.append({"user_id": 42, "verified_at": "2026-10-01T00:00:00Z"})
+        member_access.revoke_member("42", "test", revoked_at="2026-11-13T00:00:00Z")
+        self.seed()
+        self.assertIsNone(main.verification_pack_eligibility(42)["pack"])
+        self.assertNotIn("pup_gift", member_progress.load_profile("42")["owned"]["feedSkins"])
+
     def test_missing_skin_layout_uses_existing_catalog_display_defaults(self):
         self.retain()
         self.catalog["verification_packs"]["pup"]["items"] = [

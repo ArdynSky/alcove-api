@@ -29,4 +29,6 @@ Telegram acceptance of a message is not proof it was seen. Exactly-once remote d
 
 ## Final checks
 
+Follow-up: old pre-protocol members with a currently verified numeric-ID entry in F.O.X's signed bot roster can restore their retained claimed gift. A stale registry import alone remains insufficient; revoked members are excluded. This changes reward restoration evidence only, not membership admission. Eligibility checks now log only account ID, gift key and boolean outcome so subsequent failures can be distinguished without exposing credentials or profile contents.
+
 Bot full suite: 106 passed, 6 subtests. Frontend offline run: 293 passed, four existing failures; six focused repair tests pass. API focused restoration/eligibility/access checks pass; full suite retains the documented daily-checkin fixture failure. Independent review found a mixed pending-choice entitlement issue, reproduced it, and the fix pins already-claimed eligibility to authoritative retained fox_form.

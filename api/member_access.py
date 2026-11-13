@@ -109,6 +109,25 @@ def retained_membership_is_authoritative(member):
             or bool(member.get('admission_confirmed_at') and member.get('verification_protocol_version') == 2))
 
 
+def retained_gift_is_authoritative(member):
+    """Legacy gifts may rely on the current bot roster, never on a stale import.
+
+    This is gift restoration evidence only; it does not change app admission.
+    """
+    if retained_membership_is_authoritative(member):
+        return True
+    if not member or revoked_member(member.get('user_id'), member.get('verified_at')):
+        return False
+    from . import main
+    uid = str(member.get('user_id') or '')
+    return bool(uid and any(
+        str(user.get('user_id') or user.get('id') or '') == uid
+        and str(user.get('verified_at') or '').strip()
+        and not revoked_member(uid, user.get('verified_at'))
+        for user in main.synced_alcove_users if isinstance(user, dict)
+    ))
+
+
 def save_admission_policy(payload):
     allowed = ('private_group', 'own_invites_checked', 'own_invites_secured', 'errors', 'checked_at', 'join_request_url')
     data = {k: payload[k] for k in allowed if k in payload}
