@@ -6,6 +6,7 @@ import os
 import re
 import sqlite3
 import threading
+from contextlib import closing
 from pathlib import Path
 from typing import Any
 
@@ -454,12 +455,85 @@ def _load_stored_profile(key: str) -> dict | None:
     return normalize_profile(payload)
 
 
+def _restore_claimed_verification_gift(key: str, profile: dict) -> bool:
+    """Repair a retained gift entitlement without replaying any progression award."""
+    from . import main, member_access
+
+    retained = member_access.find_retained_member(user_id=key)
+    if not retained or retained.get("verification_pack_claimed") is not True:
+        return False
+    if not member_access.retained_membership_is_authoritative(retained):
+        return False
+    pack_key = main.normalize_verification_pack_key(retained.get("fox_form"))
+    if not pack_key:
+        return False
+    # Restoring an existing entitlement does not depend on new claims being active.
+    catalog = main.load_reward_catalog()
+    pack = (catalog.get("verification_packs") or {}).get(pack_key)
+    if not isinstance(pack, dict) or main.normalize_verification_pack_key(pack.get("id")) != pack_key:
+        return False
+    owned_keys = {"color": "feedColors", "skin": "feedSkins", "sticker": "feedStickers",
+                  "backdrop": "feedBackdrops", "title": "titles"}
+    changed = False
+    for raw_item in pack.get("items") or []:
+        item = main._normalize_reward_pack_item(raw_item)
+        if not item:
+            continue
+        owned = profile["owned"][owned_keys[item["type"]]]
+        if item["id"] not in owned:
+            owned.append(item["id"])
+            changed = True
+        meta_key = f'{item["type"]}:{item["id"]}'
+        old = _as_dict(profile["ownedMeta"].get(meta_key))
+        meta = dict(old)
+        image = old.get("image") or old.get("src") or item.get("image") or ""
+        defaults = {
+            "name": item.get("name") or "", "image": image, "src": image,
+            "obtainedBy": "Verification gift",
+            "obtainedAt": retained.get("verified_at") or retained.get("verification_confirmed_at") or "",
+        }
+        if item.get("swatch"):
+            defaults["swatch"] = item["swatch"]
+        if item["type"] == "skin":
+            default_layout = "banner" if item["id"] in {"foxlove", "pulse", "spotlight", "basechat"} else "stamp"
+            defaults.update(layout=item.get("layout") or default_layout, opacity=0.2)
+        for field, value in defaults.items():
+            if not meta.get(field) and value != "":
+                meta[field] = value
+        if meta != old:
+            profile["ownedMeta"][meta_key] = meta
+            changed = True
+    pending = [row for row in profile["pendingRewards"]
+               if (row.get("sourceKey") or row.get("id")) != "verification_pack"]
+    if pending != profile["pendingRewards"]:
+        profile["pendingRewards"] = pending
+        changed = True
+    return changed
+
+
+def _store_profile(key: str, profile: dict) -> None:
+    """Persist a normalized profile while the caller holds ``_LOCK``."""
+    with closing(_conn()) as con, con:
+        con.execute(
+            """INSERT INTO member_progress (user_id, payload_json, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET
+                payload_json = excluded.payload_json,
+                updated_at = excluded.updated_at""",
+            (key, json.dumps(profile, separators=(",", ":"), ensure_ascii=False), profile["updated_at"]),
+        )
+
+
 def load_profile(user_id: str) -> dict | None:
     key = str(user_id or "").strip()
     if not key:
         return None
     with _LOCK:
         profile = _load_stored_profile(key)
+        candidate = profile if profile is not None else normalize_profile({})
+        if _restore_claimed_verification_gift(key, candidate):
+            _store_profile(key, candidate)
+            profile = candidate
     if profile is None:
         return None
     profile["memberSince"] = (
@@ -482,7 +556,10 @@ def save_profile(user_id: str, incoming: dict, *, replace: bool = False) -> dict
         from .progress_reset import reset_checkpoint
         checkpoint = reset_checkpoint(key)
         if checkpoint and payload.get("progressionAdminResetToken") != checkpoint["reset_token"]:
-            return current or normalize_profile({})
+            current = current or normalize_profile({})
+            if _restore_claimed_verification_gift(key, current):
+                _store_profile(key, current)
+            return current
         preserved_member_since = canonical_member_since(
             (current or {}).get("memberSince")
         )
@@ -491,19 +568,8 @@ def save_profile(user_id: str, incoming: dict, *, replace: bool = False) -> dict
         merged["memberSince"] = authoritative_member_since or preserved_member_since
         if not merged.get("updated_at"):
             merged["updated_at"] = _now()
-        serialized = json.dumps(merged, separators=(",", ":"), ensure_ascii=False)
-        with _conn() as con:
-            con.execute(
-                """
-                INSERT INTO member_progress (user_id, payload_json, updated_at)
-                VALUES (?, ?, ?)
-                ON CONFLICT(user_id) DO UPDATE SET
-                    payload_json = excluded.payload_json,
-                    updated_at = excluded.updated_at
-                """,
-                (key, serialized, merged["updated_at"]),
-            )
-            con.commit()
+        _restore_claimed_verification_gift(key, merged)
+        _store_profile(key, merged)
     if _as_dict(merged.get("claimReceipts")).get("verification_pack"):
         from .member_access import remember_pack_claim
         remember_pack_claim(key)
@@ -617,3 +683,4 @@ def admin_put_profile(user_id: str, payload: AdminMemberProfilePayload):
     _admin(payload.admin_secret)
     stored = save_profile(str(user_id), payload.profile, replace=bool(payload.replace))
     return {"status": "ok", "user_id": str(user_id), "profile": stored}
+
