@@ -75,7 +75,9 @@ class DailyCheckInTests(unittest.TestCase):
         )
 
     def _grant_count(self, user_id=None):
-        conn = sqlite3.connect(daily_checkin._db_path())
+        # Use _connect() so schema exists even when prior posts only failed
+        # validation and never opened the DB (setUp deletes the file).
+        conn = daily_checkin._connect()
         try:
             if user_id is None:
                 row = conn.execute("SELECT COUNT(*) FROM exp_grants").fetchone()
