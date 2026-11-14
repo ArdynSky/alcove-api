@@ -1,0 +1,9 @@
+# Daily Check-In Archive
+
+Approved in conversation: a third Daily Check-In section beside Pulse and Spotlight, reusing their actual tabs, filter buttons, chip shapes, dimensions, spacing and selected state. All verified members may browse everyone’s past entries. Keep all existing history without automatic expiry; default to last 30 days, newest first. Exclude the current London calendar day so today's participation gate cannot be bypassed. Preserve post customisation snapshots and existing replies; no new historical replies or EXP. Members can delete their own past posts with confirmation.
+
+Filters combine: Your Check-Ins toggle; Feeling All/good/between/hard (labels Good/Okay/Low); Date 7 days/30 days/This year/custom/All time; Newest/Oldest or A–Z/Z–A order; Name text search; Replies All/With/Without/You replied. Date headings use each post's London community_date. Search is bounded/debounced; navigation and changes discard stale responses. Requests page 20 posts, replies fetched and paginated only on expansion. Apply filters and sorting in SQL, with indexes and deterministic pagination. Reuse records rather than copying archives; no media duplication, new video, preload of entire history, in-memory archive cache or auto-polling. Preserve access checks, current check-in behavior, deleted-content exclusion, and other archive sections.
+
+Approaches: duplicate daily exports add storage and synchronization failures; a new database/service adds operations and cost. Selected approach queries existing date-keyed SQLite records with indexes, bounded pages and shared archive styles.
+
+Limits: disk usage/free space has not been measured; no unsupported retention capacity guarantee. Backups or infrastructure migration are separate operational work. No new cloud resources or changes to existing media/retention are required.

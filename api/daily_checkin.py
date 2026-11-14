@@ -19,7 +19,7 @@ import uuid
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from fastapi import APIRouter, Header, HTTPException
+from fastapi import APIRouter, Header, HTTPException, Query
 from pydantic import BaseModel, Field
 
 router = APIRouter(prefix="/api/daily-checkin", tags=["daily-checkin"])
@@ -160,6 +160,15 @@ def _connect() -> sqlite3.Connection:
         conn.execute("ALTER TABLE daily_checkins ADD COLUMN username TEXT NOT NULL DEFAULT ''")
     if "feed_style_json" not in columns:
         conn.execute("ALTER TABLE daily_checkins ADD COLUMN feed_style_json TEXT NOT NULL DEFAULT ''")
+    # Run indexes after the additive legacy-column migrations above.
+    conn.executescript("""
+        CREATE INDEX IF NOT EXISTS idx_daily_archive_date ON daily_checkins(community_date, created_at, id) WHERE deleted_at IS NULL;
+        CREATE INDEX IF NOT EXISTS idx_daily_archive_user ON daily_checkins(user_id, community_date, created_at, id) WHERE deleted_at IS NULL;
+        CREATE INDEX IF NOT EXISTS idx_daily_archive_feeling ON daily_checkins(feeling, community_date, created_at, id) WHERE deleted_at IS NULL;
+        CREATE INDEX IF NOT EXISTS idx_daily_archive_name ON daily_checkins(display_name COLLATE NOCASE, community_date, created_at, id) WHERE deleted_at IS NULL;
+        CREATE INDEX IF NOT EXISTS idx_daily_archive_replies ON daily_checkin_replies(checkin_id, created_at, id) WHERE deleted_at IS NULL;
+        CREATE INDEX IF NOT EXISTS idx_daily_archive_reply_user ON daily_checkin_replies(user_id, checkin_id) WHERE deleted_at IS NULL;
+    """)
     return conn
 
 
@@ -1105,3 +1114,54 @@ def route_report(
 ):
     user = _user_from_init(_init_data(payload.init_data, x_telegram_init_data))
     return file_report(user, payload.target_type, payload.target_id, payload.reason)
+
+
+@router.get("/archive")
+def route_archive(
+    mine: bool = False,
+    feeling: str = "all",
+    period: str = "30d",
+    date_from: str | None = None,
+    date_to: str | None = None,
+    name: str = "",
+    replies: str = "all",
+    sort: str = "newest",
+    cursor: str | None = None,
+    limit: int = Query(default=20, ge=1, le=50),
+    init_data: str | None = None,
+    x_telegram_init_data: str | None = Header(default=None, alias="X-Telegram-Init-Data"),
+):
+    from .daily_checkin_archive import list_archive
+
+    user = _user_from_init(_init_data(init_data, x_telegram_init_data))
+    return list_archive(
+        user, mine=mine, feeling=feeling, period=period, date_from=date_from,
+        date_to=date_to, name=name, replies=replies, sort=sort, cursor=cursor, limit=limit,
+    )
+
+
+@router.get("/archive/{checkin_id}/replies")
+def route_archive_replies(
+    checkin_id: str,
+    cursor: str | None = None,
+    limit: int = Query(default=20, ge=1, le=50),
+    init_data: str | None = None,
+    x_telegram_init_data: str | None = Header(default=None, alias="X-Telegram-Init-Data"),
+):
+    from .daily_checkin_archive import list_archive_replies
+
+    user = _user_from_init(_init_data(init_data, x_telegram_init_data))
+    return list_archive_replies(user, checkin_id, cursor, limit)
+
+
+@router.delete("/archive/{checkin_id}")
+def route_archive_delete(
+    checkin_id: str,
+    payload: DeletePayload | None = None,
+    x_telegram_init_data: str | None = Header(default=None, alias="X-Telegram-Init-Data"),
+):
+    from .daily_checkin_archive import delete_archive_post
+
+    payload = payload or DeletePayload()
+    user = _user_from_init(_init_data(payload.init_data, x_telegram_init_data))
+    return delete_archive_post(user, checkin_id)
