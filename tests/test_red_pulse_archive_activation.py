@@ -170,6 +170,95 @@ class RedPulseArchiveActivationTests(unittest.TestCase):
         self.assertEqual(len(questions), 1)
         self.assertEqual(questions[0]["question"], "Activated red?")
 
+    def test_reconcile_keeps_historical_red_when_only_archive_answers_remain(self):
+        old_day = "2026-10-01"
+        historical = self.add_red_suggestion(old_day, 21, "Old unlocked red?")
+        with main.closing(main.sqlite3.connect(main.STATE_DB_PATH)) as conn, conn:
+            conn.execute(
+                """
+                INSERT INTO pulse_archive_questions (
+                    suggestion_id, pool, question, category, status, active_from_day_key,
+                    submitted_at, reviewed_at, user_id, username, display_name, source,
+                    archived_at, activated_at
+                ) VALUES (?, 'red', ?, 'General', 'approved', ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+                """,
+                (
+                    historical["id"],
+                    historical["question"],
+                    old_day,
+                    historical["submitted_at"],
+                    historical["reviewed_at"],
+                    historical["user_id"],
+                    historical["username"],
+                    historical["display_name"],
+                    historical["source"],
+                    "2026-10-01T20:00:00Z",
+                ),
+            )
+            conn.execute(
+                """
+                INSERT INTO pulse_archive_answers (
+                    pulse_id, suggestion_id, day_key, pool, category, question, answer,
+                    responded_at, sent_at, sender_user_id, sender_username, sender_display_name,
+                    question_owner_user_id, question_owner_username, question_owner_display_name,
+                    archived_at
+                ) VALUES (9001, ?, ?, 'red', 'General', ?, 'I answered', ?, ?, 5, 'member', 'Member',
+                          NULL, NULL, NULL, ?)
+                """,
+                (
+                    historical["id"],
+                    old_day,
+                    historical["question"],
+                    "2026-10-01T18:00:00Z",
+                    "2026-10-01T18:00:00Z",
+                    "2026-10-01T20:00:00Z",
+                ),
+            )
+            conn.commit()
+        # Runtime retention already pruned live evidence for that day.
+        main.pulse_entries[:] = []
+        main.pulse_red_activations[:] = []
+        with main.closing(main.sqlite3.connect(main.STATE_DB_PATH)) as conn, conn:
+            conn.execute("DELETE FROM pulse_archive_meta WHERE meta_key = ?", ("red_activation_v1",))
+            conn.commit()
+        result = main.reconcile_red_pulse_archive_activation()
+        self.assertFalse(result.get("skipped"))
+        self.assertEqual(result.get("activated"), 1)
+        questions = self.member_questions()
+        self.assertEqual(len(questions), 1)
+        self.assertEqual(questions[0]["question"], "Old unlocked red?")
+
+    def test_scheduling_red_after_unlock_archives_immediately(self):
+        day = main.pulse_day_key()
+        main.pulse_entries.extend([
+            {
+                "id": 31,
+                "day_key": day,
+                "pulse_type": "green",
+                "question": "Green A?",
+                "status": "completed",
+                "sender_user_id": 1,
+                "response_answer": "one",
+                "sent_at": "2026-11-14T12:00:00+00:00",
+            },
+            {
+                "id": 32,
+                "day_key": day,
+                "pulse_type": "green",
+                "question": "Green B?",
+                "status": "completed",
+                "sender_user_id": 2,
+                "response_answer": "two",
+                "sent_at": "2026-11-14T12:01:00+00:00",
+            },
+        ])
+        self.assertEqual(main.pulse_red_unlocked_cycles(day), 1)
+        entry = self.add_red_suggestion(day, 33, "Late scheduled red?")
+        main.archive_pulse_question_from_suggestion(entry)
+        questions = self.member_questions()
+        self.assertEqual(len(questions), 1)
+        self.assertEqual(questions[0]["question"], "Late scheduled red?")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -855,19 +855,47 @@ def pulse_suggestion_id_for_question(question: str, pool: str) -> int | None:
 MEMBER_PULSE_ARCHIVE_QUESTION_STATUSES = ("approved", "reserved")
 
 
-def pulse_red_day_was_activated(day_key: str | None) -> bool:
+def pulse_archive_has_red_evidence(day_key: str | None, question: str | None = None) -> bool:
+    """Durable Red answers survive runtime retention pruning of live pulse rows."""
+    day = (day_key or "").strip()
+    if not day:
+        return False
+    ensure_pulse_archive_store()
+    query = "SELECT 1 FROM pulse_archive_answers WHERE day_key = ? AND LOWER(COALESCE(pool, '')) = 'red'"
+    params: list = [day]
+    cleaned = (question or "").strip()
+    if cleaned:
+        query += " AND question = ?"
+        params.append(cleaned)
+    query += " LIMIT 1"
+    with closing(sqlite3.connect(STATE_DB_PATH)) as conn, conn:
+        return bool(conn.execute(query, params).fetchone())
+
+
+def pulse_red_day_was_activated(day_key: str | None, question: str | None = None) -> bool:
     """True once the community heat target unlocked Red for that Pulse day."""
     day = (day_key or "").strip()
     if not day:
         return False
-    if pulse_red_unlocked_cycles(day) > 0:
+    if pulse_archive_has_red_evidence(day, question):
         return True
-    for entry in pulse_entries_for_day(day):
-        if (entry.get("pulse_type") or "").strip().lower() != "red":
-            continue
-        if entry.get("status") == "completed":
-            return True
-    return any((entry.get("day_key") or "").strip() == day for entry in pulse_red_activations)
+    # Unlock helpers are defined later in this module; stay safe during early import.
+    unlock_fn = globals().get("pulse_red_unlocked_cycles")
+    if callable(unlock_fn):
+        try:
+            if unlock_fn(day) > 0:
+                return True
+        except Exception:
+            pass
+    entries_fn = globals().get("pulse_entries_for_day")
+    if callable(entries_fn):
+        for entry in entries_fn(day) or []:
+            if (entry.get("pulse_type") or "").strip().lower() != "red":
+                continue
+            if entry.get("status") == "completed":
+                return True
+    activations = globals().get("pulse_red_activations") or []
+    return any((entry.get("day_key") or "").strip() == day for entry in activations)
 
 
 def pulse_approved_red_suggestion_for_day(day_key: str | None) -> dict | None:
@@ -896,15 +924,20 @@ def archive_pulse_question_from_suggestion(entry: dict, *, activated: bool = Fal
     if (entry.get("status") or "").strip().lower() not in MEMBER_PULSE_ARCHIVE_QUESTION_STATUSES:
         return
     pool = (entry.get("pool") or "green").strip().lower()
+    day = (entry.get("active_from_day_key") or "").strip()
     # Red questions stay out of the member Archive until the heat target unlocks them.
+    # If an admin schedules today's Red after unlock, archive it immediately.
     if pool == "red" and not activated:
-        return
+        if day and pulse_red_day_was_activated(day):
+            activated = True
+        else:
+            return
     question = pulse_suggestion_question(entry)
     if not question:
         return
     ensure_pulse_archive_store()
     archived_at = now_iso()
-    activated_at = archived_at if pool == "red" else None
+    activated_at = archived_at if (pool == "red" and activated) else None
     with closing(sqlite3.connect(STATE_DB_PATH)) as conn, conn:
         conn.execute(
             """
@@ -970,17 +1003,18 @@ def reconcile_red_pulse_archive_activation() -> dict:
     with closing(sqlite3.connect(STATE_DB_PATH)) as conn, conn:
         rows = conn.execute(
             """
-            SELECT id, suggestion_id, active_from_day_key, activated_at
+            SELECT id, suggestion_id, active_from_day_key, activated_at, question
             FROM pulse_archive_questions
             WHERE LOWER(COALESCE(pool, '')) = 'red'
             """
         ).fetchall()
         for row in rows:
-            archive_id, suggestion_id, day_key, activated_at = row
+            archive_id, suggestion_id, day_key, activated_at, question = row
             day = (day_key or "").strip()
             if activated_at:
                 continue
-            if day and pulse_red_day_was_activated(day):
+            # Prefer durable archive answers over pruned runtime unlock evidence.
+            if day and pulse_red_day_was_activated(day, question):
                 conn.execute(
                     """
                     UPDATE pulse_archive_questions
@@ -1012,7 +1046,12 @@ def archive_completed_pulse_entry(entry: dict) -> None:
         return
     pool = (entry.get("pulse_type") or "green").strip().lower()
     if pool == "red":
-        archive_activated_red_pulse_for_day(entry.get("day_key") or pulse_day_key())
+        # A completed Red answer proves activation without needing unlock helpers
+        # (startup answer backfill can run before those helpers are defined).
+        day = entry.get("day_key") or pulse_day_key()
+        red_entry = pulse_approved_red_suggestion_for_day(day)
+        if red_entry:
+            archive_pulse_question_from_suggestion(red_entry, activated=True)
     suggestion_id = pulse_suggestion_id_for_question(question, pool)
     ensure_pulse_archive_store()
     archived_at = now_iso()
