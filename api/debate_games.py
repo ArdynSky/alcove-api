@@ -522,13 +522,34 @@ def begin():
     return _start_turn("FOR")
 
 
+@router.post("/intro/skip")
+def skip_intro():
+    """Finish the intro animation and start the current speaker's timer.
+
+    Distinct from /holding, which ends the speaking turn entirely.
+    """
+    state = _load()
+    status = str(state.get("status") or "")
+    now = _now()
+    if status == "intro_for":
+        _begin_actual_turn(state, "FOR", now)
+    elif status == "intro_against":
+        _begin_actual_turn(state, "AGAINST", now)
+    else:
+        raise HTTPException(status_code=409, detail="No intro animation is playing")
+    _save(state)
+    return _public(state)
+
+
 @router.post("/holding")
 def holding():
     state = _load()
     now = _now()
-    if state.get("status") in {"speaker_for", "intro_for"}:
+    # Holding ends a live speaking turn. Intro skip belongs on /intro/skip so
+    # hosts do not accidentally jump past the speaker when recovering a stall.
+    if state.get("status") == "speaker_for":
         _mark_time_up(state, "FOR", "holding_against", now)
-    elif state.get("status") in {"speaker_against", "intro_against"}:
+    elif state.get("status") == "speaker_against":
         _mark_time_up(state, "AGAINST", "holding_vote", now)
     elif state.get("status") in {"holding_against", "holding_vote"}:
         pass
