@@ -2562,6 +2562,8 @@ class WheelReaction(BaseModel):
 class RoomDiscussionStart(BaseModel):
     title: str
     duration_minutes: int
+    description: str = ""
+    background_url: str = ""
 
 
 class RoomQASubmit(BaseModel):
@@ -7387,6 +7389,8 @@ def reset_wheel_session_state() -> None:
     state["room_discussion"] = {
         "discussion_id": None,
         "title": "",
+        "description": "",
+        "background_url": "",
         "duration_minutes": None,
         "started_at": None,
         "ends_at": None,
@@ -10359,13 +10363,17 @@ def _next_media_id() -> int:
 
 
 def room_discussion_payload() -> dict:
-    return state.get("room_discussion") or {
-        "discussion_id": None,
-        "title": "",
-        "duration_minutes": None,
-        "started_at": None,
-        "ends_at": None,
-        "status": "idle",
+    discussion = state.get("room_discussion") or {}
+    return {
+        "discussion_id": discussion.get("discussion_id"),
+        "title": discussion.get("title") or "",
+        "description": discussion.get("description") or "",
+        "background_url": discussion.get("background_url") or "",
+        "duration_minutes": discussion.get("duration_minutes"),
+        "started_at": discussion.get("started_at"),
+        "ends_at": discussion.get("ends_at"),
+        "status": discussion.get("status") or "idle",
+        "ended_at": discussion.get("ended_at"),
     }
 
 
@@ -10407,9 +10415,13 @@ def start_room_discussion(payload: RoomDiscussionStart):
     started = datetime.datetime.utcnow()
     ends = started + datetime.timedelta(minutes=duration)
     discussion_id = f"disc_{uuid.uuid4().hex[:12]}"
+    description = (payload.description or "").strip()[:600]
+    background_url = (payload.background_url or "").strip()[:500]
     state["room_discussion"] = {
         "discussion_id": discussion_id,
         "title": title,
+        "description": description,
+        "background_url": background_url,
         "duration_minutes": duration,
         "started_at": started.isoformat() + "Z",
         "ends_at": ends.isoformat() + "Z",
