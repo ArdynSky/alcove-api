@@ -523,6 +523,21 @@ def begin():
     return _start_turn("FOR")
 
 
+@router.post("/intro/skip")
+def skip_intro():
+    """Host Control SKIP INTRO — jump from intro_* into the live speaking turn."""
+    state = _load()
+    now = _now()
+    if state.get("status") == "intro_for":
+        _begin_actual_turn(state, "FOR", now)
+    elif state.get("status") == "intro_against":
+        _begin_actual_turn(state, "AGAINST", now)
+    else:
+        raise HTTPException(status_code=409, detail="No intro animation to skip")
+    _save(state)
+    return _public(state)
+
+
 @router.post("/holding")
 def holding():
     state = _load()
