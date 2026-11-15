@@ -229,8 +229,10 @@ class SafetyEnforcementTests(unittest.TestCase):
 
     def test_group_activity_violations_use_synced_events_without_fox_db(self):
         """Tone / link tabs must show the same synced rows Command Center uses."""
+        import datetime
+
         main.FOX_LOGS_DB_PATH = os.path.join(self.tmp.name, "missing-fox.db")
-        older = "2026-11-13T20:48:39.496013"
+        older = (datetime.datetime.utcnow() - datetime.timedelta(days=1)).isoformat()
         pushed = self.client.post(
             "/api/bot-sync/safety-events",
             headers=BOT_HEADERS,

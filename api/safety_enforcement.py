@@ -39,6 +39,8 @@ MAX_REASON_LEN = 1000
 MAX_NOTE_LEN = 2000
 MAX_ERROR_LEN = 1000
 ROW_LIMIT_PER_KIND = 80
+# Aggregations (counts / top users) may scan farther than the inbox card limit.
+AGGREGATE_SCAN_LIMIT = 10000
 
 SAFETY_ACTIONS = {
     "mute",
@@ -999,6 +1001,9 @@ def _synced_event_rows(kind: str, since: str | None, limit: int = ROW_LIMIT_PER_
         clauses.append("logged_at >= ?")
         params.append(since)
     where = " WHERE " + " AND ".join(clauses)
+    requested = max(1, int(limit or ROW_LIMIT_PER_KIND))
+    # Inbox/UI lists stay near ROW_LIMIT_PER_KIND; aggregations may request more.
+    effective = min(requested, AGGREGATE_SCAN_LIMIT)
     conn = _db()
     try:
         rows = conn.execute(
@@ -1008,7 +1013,7 @@ def _synced_event_rows(kind: str, since: str | None, limit: int = ROW_LIMIT_PER_
             ORDER BY logged_at DESC
             LIMIT ?
             """,
-            tuple(params) + (max(1, min(int(limit), ROW_LIMIT_PER_KIND)),),
+            tuple(params) + (effective,),
         ).fetchall()
     finally:
         conn.close()
@@ -1050,7 +1055,7 @@ def _count_synced_events(kind: str, since: str | None) -> int:
 def _synced_tone_alert_count(since: str | None) -> int:
     """Count synced tone rows that Feature Admin treats as alerts (medium/high)."""
     count = 0
-    for row in _synced_event_rows("tone", since, limit=ROW_LIMIT_PER_KIND):
+    for row in _synced_event_rows("tone", since, limit=AGGREGATE_SCAN_LIMIT):
         detail = row.get("detail") or {}
         severity = str(detail.get("severity") or "").strip().lower()
         if severity in {"medium", "high"}:
@@ -1112,7 +1117,7 @@ def synced_top_user_counts(kind: str, since: str | None, limit: int = 8) -> list
     """Aggregate synced link/tone rows into top-user counts for Group Activity."""
     event_kind = "link" if kind == "links" else kind
     tallies: dict[Any, dict] = {}
-    for row in _synced_event_rows(event_kind, since, limit=ROW_LIMIT_PER_KIND):
+    for row in _synced_event_rows(event_kind, since, limit=AGGREGATE_SCAN_LIMIT):
         user_id = row.get("user_id")
         if user_id is None:
             continue
