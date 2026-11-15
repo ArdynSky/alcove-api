@@ -46,6 +46,7 @@ from .custom_rewards import router as custom_rewards_router
 from .debate_games import router as debate_games_router
 from . import debate_audience  # noqa: F401 — registers audience/archive routes on the debate router
 from .agendas import router as agendas_router
+from .live_entry_code import router as live_entry_code_router
 from .live_room_test import apply_authorization_identity, router as live_room_test_router
 from .member_progress import router as member_progress_router
 from .progress_reset import router as progress_reset_router, approval_metadata, serialized_change, reset_checkpoint
@@ -96,6 +97,7 @@ app.include_router(question_game_router)
 app.include_router(custom_rewards_router)
 app.include_router(debate_games_router)
 app.include_router(agendas_router)
+app.include_router(live_entry_code_router)
 app.include_router(live_room_test_router)
 app.include_router(member_progress_router)
 app.include_router(progress_reset_router)
@@ -2566,6 +2568,8 @@ class WheelReaction(BaseModel):
 class RoomDiscussionStart(BaseModel):
     title: str
     duration_minutes: int
+    description: str = ""
+    background_url: str = ""
 
 
 class RoomQASubmit(BaseModel):
@@ -7434,6 +7438,8 @@ def reset_wheel_session_state() -> None:
     state["room_discussion"] = {
         "discussion_id": None,
         "title": "",
+        "description": "",
+        "background_url": "",
         "duration_minutes": None,
         "started_at": None,
         "ends_at": None,
@@ -10406,13 +10412,17 @@ def _next_media_id() -> int:
 
 
 def room_discussion_payload() -> dict:
-    return state.get("room_discussion") or {
-        "discussion_id": None,
-        "title": "",
-        "duration_minutes": None,
-        "started_at": None,
-        "ends_at": None,
-        "status": "idle",
+    discussion = state.get("room_discussion") or {}
+    return {
+        "discussion_id": discussion.get("discussion_id"),
+        "title": discussion.get("title") or "",
+        "description": discussion.get("description") or "",
+        "background_url": discussion.get("background_url") or "",
+        "duration_minutes": discussion.get("duration_minutes"),
+        "started_at": discussion.get("started_at"),
+        "ends_at": discussion.get("ends_at"),
+        "status": discussion.get("status") or "idle",
+        "ended_at": discussion.get("ended_at"),
     }
 
 
@@ -10454,9 +10464,13 @@ def start_room_discussion(payload: RoomDiscussionStart):
     started = datetime.datetime.utcnow()
     ends = started + datetime.timedelta(minutes=duration)
     discussion_id = f"disc_{uuid.uuid4().hex[:12]}"
+    description = (payload.description or "").strip()[:600]
+    background_url = (payload.background_url or "").strip()[:500]
     state["room_discussion"] = {
         "discussion_id": discussion_id,
         "title": title,
+        "description": description,
+        "background_url": background_url,
         "duration_minutes": duration,
         "started_at": started.isoformat() + "Z",
         "ends_at": ends.isoformat() + "Z",

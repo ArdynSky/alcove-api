@@ -48,6 +48,24 @@ class RoomQATests(unittest.TestCase):
         self.assertEqual(started.status_code, 200)
         self.assertEqual(started.json()["status"], "ok")
 
+    def test_discussion_start_persists_active_stage_text(self):
+        started = self.client.post(
+            "/api/room-discussion/start",
+            json={
+                "title": "Telegram Tips",
+                "duration_minutes": 10,
+                "description": "Join in on the call, or send a question or comment.",
+                "background_url": "https://example.com/bg.mp4",
+            },
+        )
+        self.assertEqual(started.status_code, 200)
+        discussion = started.json()["room_discussion"]
+        self.assertEqual(discussion["description"], "Join in on the call, or send a question or comment.")
+        self.assertEqual(discussion["background_url"], "https://example.com/bg.mp4")
+        payload = main.room_discussion_payload()
+        self.assertEqual(payload["description"], "Join in on the call, or send a question or comment.")
+        self.assertEqual(payload["background_url"], "https://example.com/bg.mp4")
+
     def test_question_answer_stays_on_item(self):
         self._start_discussion()
         created = self.client.post(

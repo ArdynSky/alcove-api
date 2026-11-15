@@ -23,8 +23,9 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 BACKGROUND_DIR.mkdir(parents=True, exist_ok=True)
 _LOCK = threading.RLock()
 PRESENCE_TTL_SECONDS = 22
+# Keep these longer than the BEGIN callout delay+duration so BEGIN is visible and clears.
 FOR_INTRO_SECONDS = 4.4
-AGAINST_INTRO_SECONDS = 1.6
+AGAINST_INTRO_SECONDS = 2.0
 TIME_UP_SECONDS = 2.6
 
 
