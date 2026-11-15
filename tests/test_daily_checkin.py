@@ -75,7 +75,8 @@ class DailyCheckInTests(unittest.TestCase):
         )
 
     def _grant_count(self, user_id=None):
-        # Use the module connector so schema exists even before a successful check-in.
+        # Use _connect() so schema exists even when prior posts only failed
+        # validation and never opened the DB (setUp deletes the file).
         conn = daily_checkin._connect()
         try:
             if user_id is None:
