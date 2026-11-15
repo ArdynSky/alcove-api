@@ -574,8 +574,9 @@ def _load_care_report(conn: sqlite3.Connection, report_id: str) -> dict | None:
     return dict(row) if row else None
 
 
-def _public_care_report(row: dict) -> dict:
+def _public_care_report(row: dict, *, learned_phrase: str | None = None) -> dict:
     excerpt = row.get("message_excerpt") or row.get("note") or row.get("reason")
+    phrase = learned_phrase if learned_phrase is not None else row.get("learned_phrase")
     return {
         "id": row.get("id"),
         "reporter_id": row.get("reporter_id"),
@@ -586,6 +587,7 @@ def _public_care_report(row: dict) -> dict:
         "note": row.get("note"),
         "message_excerpt": row.get("message_excerpt"),
         "excerpt": excerpt,
+        "learned_phrase": phrase or None,
         "created_at": row.get("created_at"),
         "status": row.get("status"),
         "resolved_at": row.get("resolved_at"),
@@ -595,6 +597,30 @@ def _public_care_report(row: dict) -> dict:
         "followup": row.get("followup"),
         "resolution_key": _care_resolution_key(row) if row.get("resolved_at") else None,
     }
+
+
+def _learned_phrase_for_report(conn: sqlite3.Connection, report_id: str, decision: str | None) -> str | None:
+    """Return the phrase an admin taught when resolving this care report."""
+    if not report_id:
+        return None
+    clauses = ["source = 'care_report'", "source_id = ?"]
+    params: list[Any] = [str(report_id)]
+    if decision in TERMINOLOGY_DECISIONS:
+        clauses.append("decision = ?")
+        params.append(decision)
+    row = conn.execute(
+        f"""
+        SELECT phrase FROM moderation_terminology
+        WHERE {' AND '.join(clauses)}
+        ORDER BY updated_at DESC
+        LIMIT 1
+        """,
+        tuple(params),
+    ).fetchone()
+    if not row:
+        return None
+    phrase = str(row["phrase"] if isinstance(row, sqlite3.Row) else row[0] or "").strip()
+    return phrase or None
 
 
 def _care_resolution_key(row: dict) -> str:
@@ -614,7 +640,14 @@ def pending_care_followups(limit: int = 40) -> list[dict]:
                 AND (r.report_id IS NULL OR (r.outcome='retry' AND r.next_attempt_at <= ?))
             ORDER BY c.resolved_at ASC, c.id ASC LIMIT ?
         """, (_now(), max(1, min(int(limit), 100)))).fetchall()
-        return [dict(_public_care_report(dict(row)), resolution_key=_care_resolution_key(dict(row))) for row in rows]
+        out = []
+        for row in rows:
+            item = dict(row)
+            learned = _learned_phrase_for_report(conn, item.get("id"), item.get("decision"))
+            payload = _public_care_report(item, learned_phrase=learned)
+            payload["resolution_key"] = _care_resolution_key(item)
+            out.append(payload)
+        return out
     finally:
         conn.close()
 

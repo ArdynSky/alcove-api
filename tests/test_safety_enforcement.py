@@ -588,16 +588,32 @@ class SafetyEnforcementTests(unittest.TestCase):
 
         removed = self.client.post(
             f"/api/admin/safety/care-reports/{report_id}/resolve",
-            json={"admin_secret": SECRET, "decision": "remove", "admin_user_id": 7},
+            json={
+                "admin_secret": SECRET,
+                "decision": "remove",
+                "admin_user_id": 7,
+                "phrase": "looking for a top tonight",
+            },
         )
         self.assertEqual(removed.status_code, 200, removed.text)
         self.assertEqual(removed.json()["report"]["status"], "removed")
+        self.assertEqual(removed.json()["terminology"]["phrase"], "looking for a top tonight")
+        self.assertEqual(removed.json()["terminology"]["decision"], "remove")
         grant = removed.json()["exp_grant"]
         self.assertEqual(grant["user_id"], 900)
         self.assertEqual(grant["amount"], 30)
         self.assertEqual(grant["status"], "pending")
         self.assertEqual(grant["reason"], "care_report_remove")
         self.assertEqual(grant["dedupe_key"], f"care_report:{report_id}")
+
+        followups = self.client.get("/api/bot-sync/care-followups", headers=BOT_HEADERS)
+        self.assertEqual(followups.status_code, 200, followups.text)
+        matched = [
+            row for row in followups.json()["care_followups"]
+            if row["id"] == report_id
+        ]
+        self.assertTrue(matched)
+        self.assertEqual(matched[0]["learned_phrase"], "looking for a top tonight")
 
         again = self.client.post(
             f"/api/admin/safety/care-reports/{report_id}/resolve",
