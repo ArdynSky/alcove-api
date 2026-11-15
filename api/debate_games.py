@@ -23,8 +23,9 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 BACKGROUND_DIR.mkdir(parents=True, exist_ok=True)
 _LOCK = threading.RLock()
 PRESENCE_TTL_SECONDS = 22
+# Keep these longer than the BEGIN callout delay+duration so BEGIN is visible and clears.
 FOR_INTRO_SECONDS = 4.4
-AGAINST_INTRO_SECONDS = 1.6
+AGAINST_INTRO_SECONDS = 2.0
 TIME_UP_SECONDS = 2.6
 
 
@@ -520,6 +521,21 @@ def start_against_turn():
 @router.post("/begin")
 def begin():
     return _start_turn("FOR")
+
+
+@router.post("/intro/skip")
+def skip_intro():
+    """Host Control SKIP INTRO — jump from intro_* into the live speaking turn."""
+    state = _load()
+    now = _now()
+    if state.get("status") == "intro_for":
+        _begin_actual_turn(state, "FOR", now)
+    elif state.get("status") == "intro_against":
+        _begin_actual_turn(state, "AGAINST", now)
+    else:
+        raise HTTPException(status_code=409, detail="No intro animation to skip")
+    _save(state)
+    return _public(state)
 
 
 @router.post("/holding")
