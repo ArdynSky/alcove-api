@@ -57,10 +57,14 @@ from .safety_enforcement import (
     ACTION_QUEUE_ROW_GAPS,
     _count_synced_events,
     _synced_event_rows,
+    _synced_tone_alert_count,
     build_action_queue_rows,
+    inbox_since_for_period,
     pending_bot_action_jobs,
     router as safety_enforcement_router,
     safety_events_source_meta,
+    synced_top_user_counts,
+    synced_violation_items,
 )
 
 try:
@@ -6421,69 +6425,91 @@ def build_group_activity_summary(period: str):
         action_params,
     )
 
+    overview = {
+        "newResidents": fox_db_value(f"SELECT COUNT(*) FROM verified_users{verified_where}", verified_params),
+        "totalResidents": len(get_verified_alcove_users()),
+        "messages": fox_db_value(f"SELECT COUNT(*) FROM messages{message_where}", message_params),
+        "activeUsers": fox_db_value(
+            f"SELECT COUNT(DISTINCT user_id) FROM messages{message_where}"
+            + (" AND" if message_where else " WHERE")
+            + " user_id IS NOT NULL",
+            message_params,
+        ),
+        "linkAttempts": fox_db_value(f"SELECT COUNT(*) FROM link_violations{link_where}", link_params),
+        "toneFlags": fox_db_value(f"SELECT COUNT(*) FROM tone_flags{tone_where}", tone_params),
+        "toneAlerts": fox_db_value(tone_alert_where, tone_params),
+        "failedCaptcha": fox_db_value(failed_captcha_where, captcha_params),
+        "floodAlerts": fox_db_value(f"SELECT COUNT(*) FROM flood_flags{link_where}", link_params),
+        "memberEvents": fox_db_value(f"SELECT COUNT(*) FROM member_events{link_where}", link_params),
+        "warnings": fox_db_value(
+            f"SELECT COUNT(*) FROM admin_actions{action_where}"
+            + (" AND" if action_where else " WHERE")
+            + " action_type = 'warning'",
+            action_params,
+        ),
+        "mutes": fox_db_value(
+            f"SELECT COUNT(*) FROM admin_actions{action_where}"
+            + (" AND" if action_where else " WHERE")
+            + " action_type = 'mute'",
+            action_params,
+        ),
+        "strikesAdded": fox_db_value(
+            f"SELECT COUNT(*) FROM admin_actions{action_where}"
+            + (" AND" if action_where else " WHERE")
+            + " action_type = 'strike_add'",
+            action_params,
+        ),
+        "strikesRemoved": fox_db_value(
+            f"SELECT COUNT(*) FROM admin_actions{action_where}"
+            + (" AND" if action_where else " WHERE")
+            + " action_type = 'strike_remove'",
+            action_params,
+        ),
+        "bansApproved": fox_db_value(
+            f"SELECT COUNT(*) FROM admin_actions{action_where}"
+            + (" AND" if action_where else " WHERE")
+            + " action_type = 'ban_approved'",
+            action_params,
+        ),
+        "bansRejected": fox_db_value(
+            f"SELECT COUNT(*) FROM admin_actions{action_where}"
+            + (" AND" if action_where else " WHERE")
+            + " action_type = 'ban_rejected'",
+            action_params,
+        ),
+    }
+
+    # Render keeps fox_logs on the F.O.X disk. When the API cannot read that DB,
+    # fall back to bot-synced safety events so Group Activity matches Command Center.
+    events_meta = safety_events_source_meta(since)
+    if not overview["linkAttempts"]:
+        overview["linkAttempts"] = _count_synced_events("link", since)
+    if not overview["toneFlags"]:
+        overview["toneFlags"] = _count_synced_events("tone", since)
+    if not overview["toneAlerts"]:
+        overview["toneAlerts"] = _synced_tone_alert_count(since)
+    if not overview["floodAlerts"]:
+        overview["floodAlerts"] = _count_synced_events("flood", since)
+    if not overview["memberEvents"]:
+        overview["memberEvents"] = _count_synced_events("member", since)
+
+    top_tone_rows = top_tone or synced_top_user_counts("tone", since, limit=8)
+    top_link_rows = top_links or synced_top_user_counts("links", since, limit=8)
+    source = events_meta.get("events_source") or ("bot_sync" if synced_alcove_analytics else "fox_logs")
+
     return {
         "period": group_activity_period(period),
         "since": since,
         "generated_at": now_iso(),
-        "source": "bot_sync" if synced_alcove_analytics else "fox_logs",
-        "db_available": os.path.exists(FOX_LOGS_DB_PATH),
+        "source": source,
+        "db_available": bool(events_meta.get("fox_logs_available")),
+        "events_source": events_meta.get("events_source"),
+        "synced_event_count": events_meta.get("synced_event_count"),
         "last_bot_sync_at": last_bot_sync_at,
-        "overview": {
-            "newResidents": fox_db_value(f"SELECT COUNT(*) FROM verified_users{verified_where}", verified_params),
-            "totalResidents": len(get_verified_alcove_users()),
-            "messages": fox_db_value(f"SELECT COUNT(*) FROM messages{message_where}", message_params),
-            "activeUsers": fox_db_value(
-                f"SELECT COUNT(DISTINCT user_id) FROM messages{message_where}"
-                + (" AND" if message_where else " WHERE")
-                + " user_id IS NOT NULL",
-                message_params,
-            ),
-            "linkAttempts": fox_db_value(f"SELECT COUNT(*) FROM link_violations{link_where}", link_params),
-            "toneFlags": fox_db_value(f"SELECT COUNT(*) FROM tone_flags{tone_where}", tone_params),
-            "toneAlerts": fox_db_value(tone_alert_where, tone_params),
-            "failedCaptcha": fox_db_value(failed_captcha_where, captcha_params),
-            "floodAlerts": fox_db_value(f"SELECT COUNT(*) FROM flood_flags{link_where}", link_params),
-            "memberEvents": fox_db_value(f"SELECT COUNT(*) FROM member_events{link_where}", link_params),
-            "warnings": fox_db_value(
-                f"SELECT COUNT(*) FROM admin_actions{action_where}"
-                + (" AND" if action_where else " WHERE")
-                + " action_type = 'warning'",
-                action_params,
-            ),
-            "mutes": fox_db_value(
-                f"SELECT COUNT(*) FROM admin_actions{action_where}"
-                + (" AND" if action_where else " WHERE")
-                + " action_type = 'mute'",
-                action_params,
-            ),
-            "strikesAdded": fox_db_value(
-                f"SELECT COUNT(*) FROM admin_actions{action_where}"
-                + (" AND" if action_where else " WHERE")
-                + " action_type = 'strike_add'",
-                action_params,
-            ),
-            "strikesRemoved": fox_db_value(
-                f"SELECT COUNT(*) FROM admin_actions{action_where}"
-                + (" AND" if action_where else " WHERE")
-                + " action_type = 'strike_remove'",
-                action_params,
-            ),
-            "bansApproved": fox_db_value(
-                f"SELECT COUNT(*) FROM admin_actions{action_where}"
-                + (" AND" if action_where else " WHERE")
-                + " action_type = 'ban_approved'",
-                action_params,
-            ),
-            "bansRejected": fox_db_value(
-                f"SELECT COUNT(*) FROM admin_actions{action_where}"
-                + (" AND" if action_where else " WHERE")
-                + " action_type = 'ban_rejected'",
-                action_params,
-            ),
-        },
+        "overview": overview,
         "topPosters": group_activity_count_rows(top_posters),
-        "topToneFlags": group_activity_count_rows(top_tone),
-        "topLinkAttempts": group_activity_count_rows(top_links),
+        "topToneFlags": group_activity_count_rows(top_tone_rows),
+        "topLinkAttempts": group_activity_count_rows(top_link_rows),
         "usersNeedingAttention": group_activity_count_rows(users_needing_attention),
         "actionBreakdown": [
             {"action_type": row.get("action_type") or "unknown", "count": row.get("count") or 0}
@@ -6574,6 +6600,7 @@ def build_group_activity_violations(violation_type: str, period: str, limit: int
     since = group_activity_since(period)
     limit = max(1, min(int(limit or 40), 200))
     where, params = since_clause("logged_at", since)
+    source = "fox_logs"
 
     if violation_type == "links":
         rows = fox_db_rows(
@@ -6601,14 +6628,25 @@ def build_group_activity_violations(violation_type: str, period: str, limit: int
     else:
         raise HTTPException(status_code=400, detail="type must be links or tone")
 
+    if not rows:
+        rows = synced_violation_items(violation_type, since, limit=limit)
+        if rows:
+            source = "bot_sync"
+
     for row in rows:
         user = format_group_user_ref(row.get("user_id"), row.get("username"), row.get("display_name"))
         row.update(user)
+    events_meta = safety_events_source_meta(since)
     return {
         "period": group_activity_period(period),
         "since": since,
         "type": violation_type,
         "items": rows,
+        "source": source,
+        "db_available": bool(events_meta.get("fox_logs_available")),
+        "events_source": events_meta.get("events_source"),
+        "synced_event_count": events_meta.get("synced_event_count"),
+        "last_bot_sync_at": last_bot_sync_at,
     }
 
 
@@ -6927,6 +6965,8 @@ def build_safety_action_queue(period: str = "today"):
 
     flood_count = overview.get("floodAlerts", 0) or 0
     link_count = overview.get("linkAttempts", 0) or 0
+    # Prefer medium/high for the digest card; still include any synced tone if
+    # alert-severity rows are empty so low-severity open items are not invisible.
     tone_count = overview.get("toneAlerts", 0) or 0
     # Separate Render disks: when fox_logs.db is empty on the API, use synced counts.
     if not flood_count:
@@ -6934,15 +6974,20 @@ def build_safety_action_queue(period: str = "today"):
     if not link_count:
         link_count = _count_synced_events("link", since)
     if not tone_count:
-        tone_count = _count_synced_events("tone", since)
+        tone_count = _synced_tone_alert_count(since) or _count_synced_events("tone", since)
 
-    add_item("flood", "Flood alerts", flood_count, "high", "Users posting too fast")
-    add_item("links", "Link violations", link_count, "high", "Review link alerts tab")
-    add_item("tone", "Tone alerts", tone_count, "medium", "Review tone flags tab")
+    add_item("flood", "Flood alerts", flood_count, "high", "Open Moderation inbox → Flood")
+    add_item("links", "Link violations", link_count, "high", "Open Moderation inbox → Links")
+    add_item("tone", "Tone alerts", tone_count, "medium", "Open Moderation inbox → Tone")
     add_item("strikes", "Users at 2+ strikes", len(summary.get("usersNeedingAttention") or []), "high", "Review user profiles")
     add_item("captcha", "Failed verifications", overview.get("failedCaptcha", 0), "medium", "Check join verification flow")
 
-    link_where, link_params = since_clause("logged_at", since)
+    # Inbox must outlive the "today" digest window so overnight open flags stay visible.
+    week_since = group_activity_since("week")
+    inbox_since = inbox_since_for_period(since, week_since)
+    inbox_meta = safety_events_source_meta(inbox_since)
+
+    link_where, link_params = since_clause("logged_at", inbox_since)
     recent_flood = fox_db_rows(
         f"""
         SELECT user_id, username, display_name, message_count, window_seconds, message_excerpt, logged_at
@@ -6955,7 +7000,7 @@ def build_safety_action_queue(period: str = "today"):
     )
     if not recent_flood:
         recent_flood = []
-        for row in _synced_event_rows("flood", since, limit=5):
+        for row in _synced_event_rows("flood", inbox_since, limit=5):
             detail = row.get("detail") or {}
             recent_flood.append(
                 {
@@ -6968,7 +7013,7 @@ def build_safety_action_queue(period: str = "today"):
                     "logged_at": row.get("logged_at"),
                 }
             )
-    member_where, member_params = since_clause("logged_at", since)
+    member_where, member_params = since_clause("logged_at", inbox_since)
     recent_joins = fox_db_rows(
         f"""
         SELECT user_id, username, display_name, event_type, detail, logged_at
@@ -6981,7 +7026,7 @@ def build_safety_action_queue(period: str = "today"):
     )
     if not recent_joins:
         recent_joins = []
-        for row in _synced_event_rows("member", since, limit=8):
+        for row in _synced_event_rows("member", inbox_since, limit=8):
             detail = row.get("detail") or {}
             recent_joins.append(
                 {
@@ -7009,16 +7054,18 @@ def build_safety_action_queue(period: str = "today"):
     return {
         "period": group_activity_period(period),
         "since": since,
+        "inbox_period": "week" if inbox_since == week_since and since != week_since else group_activity_period(period),
+        "inbox_since": inbox_since,
         "generated_at": now_iso(),
         "items": items,
         "recent_flood": recent_flood,
         "recent_member_events": recent_joins,
         "settings": load_safety_settings(),
-        "rows": build_action_queue_rows(since),
+        "rows": build_action_queue_rows(inbox_since),
         "row_gaps": ACTION_QUEUE_ROW_GAPS,
         "db_available": events_meta.get("fox_logs_available"),
         "events_source": events_meta.get("events_source"),
-        "synced_event_count": events_meta.get("synced_event_count"),
+        "synced_event_count": inbox_meta.get("synced_event_count"),
         "last_bot_sync_at": last_bot_sync_at,
         "source": events_meta.get("events_source"),
     }

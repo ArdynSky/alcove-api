@@ -227,6 +227,78 @@ class SafetyEnforcementTests(unittest.TestCase):
         self.assertTrue(any(item["kind"] == "flood" for item in queue["items"]))
         self.assertTrue(any(item["kind"] == "tone" for item in queue["items"]))
 
+    def test_group_activity_violations_use_synced_events_without_fox_db(self):
+        """Tone / link tabs must show the same synced rows Command Center uses."""
+        main.FOX_LOGS_DB_PATH = os.path.join(self.tmp.name, "missing-fox.db")
+        older = "2026-11-13T20:48:39.496013"
+        pushed = self.client.post(
+            "/api/bot-sync/safety-events",
+            headers=BOT_HEADERS,
+            json={
+                "events": [
+                    {
+                        "kind": "tone",
+                        "external_key": "tone:top-priority",
+                        "user_id": 7917361976,
+                        "username": "ChsinDatNeeoNRainbeaux",
+                        "display_name": "Pup",
+                        "chat_id": -1003361161883,
+                        "message_id": 2766,
+                        "excerpt": "It should always be a top priority",
+                        "logged_at": older,
+                        "detail": {
+                            "categories": "sexual",
+                            "severity": "low",
+                            "score": 1,
+                            "matched_terms": "sexual: top",
+                        },
+                    },
+                    {
+                        "kind": "link",
+                        "external_key": "link:google",
+                        "user_id": 6097746496,
+                        "username": "ArTyAms",
+                        "display_name": "Arty",
+                        "chat_id": -1003361161883,
+                        "message_id": 2702,
+                        "excerpt": "Google.com",
+                        "logged_at": older,
+                        "detail": {"link_samples": "Google.com"},
+                    },
+                ]
+            },
+        )
+        self.assertEqual(pushed.status_code, 200, pushed.text)
+
+        tone = self.client.get(
+            "/api/admin/group-activity/violations",
+            params={"admin_secret": SECRET, "type": "tone", "period": "week", "limit": 20},
+        )
+        self.assertEqual(tone.status_code, 200, tone.text)
+        tone_body = tone.json()
+        self.assertEqual(tone_body["source"], "bot_sync")
+        self.assertTrue(tone_body["items"])
+        self.assertEqual(tone_body["items"][0]["message_id"], 2766)
+        self.assertIn("top priority", tone_body["items"][0]["message_excerpt"])
+
+        summary = self.client.get(
+            "/api/admin/group-activity/summary",
+            params={"admin_secret": SECRET, "period": "week"},
+        )
+        self.assertEqual(summary.status_code, 200, summary.text)
+        overview = summary.json()["overview"]
+        self.assertGreaterEqual(overview["toneFlags"], 1)
+        self.assertGreaterEqual(overview["linkAttempts"], 1)
+
+        today_queue = self.client.get(
+            "/api/admin/safety/action-queue",
+            params={"admin_secret": SECRET, "period": "today"},
+        )
+        self.assertEqual(today_queue.status_code, 200, today_queue.text)
+        queue = today_queue.json()
+        self.assertEqual(queue["inbox_period"], "week")
+        self.assertTrue(any(row["kind"] == "tone" and row["message_id"] == 2766 for row in queue["rows"]))
+
     def test_enqueue_claim_complete_and_keep_bulk_job(self):
         muted = self.client.post(
             "/api/admin/safety/actions",

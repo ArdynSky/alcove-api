@@ -1047,6 +1047,102 @@ def _count_synced_events(kind: str, since: str | None) -> int:
     return int((row["count"] if row else 0) or 0)
 
 
+def _synced_tone_alert_count(since: str | None) -> int:
+    """Count synced tone rows that Feature Admin treats as alerts (medium/high)."""
+    count = 0
+    for row in _synced_event_rows("tone", since, limit=ROW_LIMIT_PER_KIND):
+        detail = row.get("detail") or {}
+        severity = str(detail.get("severity") or "").strip().lower()
+        if severity in {"medium", "high"}:
+            count += 1
+        elif not severity:
+            # Older sync payloads may omit severity; still surface them.
+            count += 1
+    return count
+
+
+def synced_violation_items(kind: str, since: str | None, limit: int = 40) -> list[dict]:
+    """Shape bot-synced safety rows like fox_logs link/tone violation items."""
+    limit = max(1, min(int(limit or 40), 200))
+    if kind == "links":
+        out = []
+        for row in _synced_event_rows("link", since, limit=limit):
+            detail = row.get("detail") or {}
+            out.append(
+                {
+                    "id": row.get("external_key") or row.get("id"),
+                    "message_id": row.get("message_id"),
+                    "user_id": row.get("user_id"),
+                    "username": row.get("username") or "",
+                    "display_name": row.get("display_name") or "",
+                    "message_excerpt": row.get("excerpt") or "",
+                    "link_samples": detail.get("link_samples"),
+                    "logged_at": row.get("logged_at"),
+                    "chat_id": row.get("chat_id"),
+                    "source": "bot_sync",
+                }
+            )
+        return out
+    if kind == "tone":
+        out = []
+        for row in _synced_event_rows("tone", since, limit=limit):
+            detail = row.get("detail") or {}
+            out.append(
+                {
+                    "id": row.get("external_key") or row.get("id"),
+                    "message_id": row.get("message_id"),
+                    "user_id": row.get("user_id"),
+                    "username": row.get("username") or "",
+                    "display_name": row.get("display_name") or "",
+                    "categories": detail.get("categories"),
+                    "severity": detail.get("severity"),
+                    "score": detail.get("score"),
+                    "matched_terms": detail.get("matched_terms"),
+                    "message_excerpt": row.get("excerpt") or "",
+                    "logged_at": row.get("logged_at"),
+                    "chat_id": row.get("chat_id"),
+                    "source": "bot_sync",
+                }
+            )
+        return out
+    raise ValueError("kind must be links or tone")
+
+
+def synced_top_user_counts(kind: str, since: str | None, limit: int = 8) -> list[dict]:
+    """Aggregate synced link/tone rows into top-user counts for Group Activity."""
+    event_kind = "link" if kind == "links" else kind
+    tallies: dict[Any, dict] = {}
+    for row in _synced_event_rows(event_kind, since, limit=ROW_LIMIT_PER_KIND):
+        user_id = row.get("user_id")
+        if user_id is None:
+            continue
+        bucket = tallies.setdefault(
+            user_id,
+            {
+                "user_id": user_id,
+                "username": row.get("username") or "",
+                "display_name": row.get("display_name") or "",
+                "count": 0,
+            },
+        )
+        if not bucket.get("username") and row.get("username"):
+            bucket["username"] = row.get("username") or ""
+        if not bucket.get("display_name") and row.get("display_name"):
+            bucket["display_name"] = row.get("display_name") or ""
+        bucket["count"] += 1
+    ranked = sorted(tallies.values(), key=lambda item: item["count"], reverse=True)
+    return ranked[: max(1, min(int(limit or 8), 20))]
+
+
+def inbox_since_for_period(period_since: str | None, week_since: str | None) -> str | None:
+    """Keep the moderation inbox from dropping overnight when period is 'today'."""
+    if period_since is None:
+        return None
+    if week_since is None:
+        return period_since
+    return min(period_since, week_since)
+
+
 def _coerce_optional_int(value: Any, *, allow_negative: bool = False) -> int | None:
     if value is None or value == "":
         return None
