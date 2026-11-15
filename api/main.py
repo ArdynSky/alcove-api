@@ -4005,6 +4005,17 @@ def verify_admin_secret(admin_secret: str | None):
     verify_bot_sync_secret(admin_secret)
 
 
+class AdminUnlockPayload(BaseModel):
+    admin_secret: str = ""
+
+
+@app.post("/api/admin/unlock")
+def admin_unlock(payload: AdminUnlockPayload):
+    """Page gate for Host Control / Feature Admin — same secret as other admin tools."""
+    verify_admin_secret(payload.admin_secret)
+    return {"ok": True}
+
+
 def load_reward_assets_manifest() -> dict:
     try:
         if os.path.exists(REWARD_ASSETS_MANIFEST_PATH):
