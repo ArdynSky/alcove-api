@@ -46,6 +46,7 @@ from .custom_rewards import router as custom_rewards_router
 from .debate_games import router as debate_games_router
 from . import debate_audience  # noqa: F401 — registers audience/archive routes on the debate router
 from .agendas import router as agendas_router
+from .live_entry_code import router as live_entry_code_router
 from .live_room_test import apply_authorization_identity, router as live_room_test_router
 from .member_progress import router as member_progress_router
 from .progress_reset import router as progress_reset_router, approval_metadata, serialized_change, reset_checkpoint
@@ -92,6 +93,7 @@ app.include_router(question_game_router)
 app.include_router(custom_rewards_router)
 app.include_router(debate_games_router)
 app.include_router(agendas_router)
+app.include_router(live_entry_code_router)
 app.include_router(live_room_test_router)
 app.include_router(member_progress_router)
 app.include_router(progress_reset_router)

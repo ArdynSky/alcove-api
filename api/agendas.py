@@ -246,7 +246,9 @@ def create_agenda(payload: AgendaPayload):
         )
         con.commit()
         con.close()
-    return _public(_get(agenda_id))
+    result = _public(_get(agenda_id))
+    _sync_live_entry_code()
+    return result
 
 
 @router.put("/{agenda_id}")
@@ -276,7 +278,9 @@ def update_agenda(agenda_id: str, payload: AgendaPayload):
         )
         con.commit()
         con.close()
-    return _public(_get(agenda_id))
+    result = _public(_get(agenda_id))
+    _sync_live_entry_code()
+    return result
 
 
 def _deactivate_all(except_id: Optional[str] = None):
@@ -290,6 +294,16 @@ def _deactivate_all(except_id: Optional[str] = None):
         con.close()
 
 
+def _sync_live_entry_code():
+    """Mint or clear the 4-digit OBS entry code when Live Room open/closed changes."""
+    try:
+        from . import live_entry_code
+
+        live_entry_code.sync_with_active_agenda(active_agenda().get("agenda"))
+    except Exception:
+        pass
+
+
 @router.post("/{agenda_id}/status")
 def set_status(agenda_id: str, payload: AgendaStatusPayload):
     _get(agenda_id)
@@ -300,7 +314,9 @@ def set_status(agenda_id: str, payload: AgendaStatusPayload):
         con.execute("UPDATE agendas SET status=?,updated_at=? WHERE id=?", (payload.status, _now(), agenda_id))
         con.commit()
         con.close()
-    return _public(_get(agenda_id))
+    result = _public(_get(agenda_id))
+    _sync_live_entry_code()
+    return result
 
 
 @router.post("/{agenda_id}/progress")
