@@ -13,6 +13,7 @@ os.environ.setdefault("VERIFY_FLOW_LOG_PATH", os.path.join(_temp_dir.name, "veri
 os.environ.setdefault("BOT_SYNC_SECRET", "test-admin-secret")
 os.environ.setdefault("TELEGRAM_BOT_TOKEN", "test-bot-token")
 os.environ.setdefault("LIVE_ENTRY_SECRET", "test-live-entry-secret")
+ADMIN_SECRET = os.environ["BOT_SYNC_SECRET"]
 
 from fastapi.testclient import TestClient
 
@@ -25,18 +26,18 @@ class LiveEntryCodeTests(unittest.TestCase):
         agendas.DB_PATH = self.root / "agendas.sqlite3"
         live_entry_code.DB_PATH = self.root / "live_entry.sqlite3"
         self.client = TestClient(main.app)
+        self.admin = {"admin_secret": ADMIN_SECRET}
 
-    def _activate(self):
-        created = agendas.create_agenda(
+    def _activate(self, title="Friday Live VC", event_date="2026-11-20"):
+        return agendas.create_agenda(
             agendas.AgendaPayload(
-                title="Friday Live VC",
-                event_date="2026-11-20",
+                title=title,
+                event_date=event_date,
                 start_time="19:00",
                 timezone="Europe/London",
                 status="active",
             )
         )
-        return created
 
     def test_going_live_mints_four_digit_code(self):
         created = self._activate()
@@ -58,16 +59,34 @@ class LiveEntryCodeTests(unittest.TestCase):
         self.assertEqual(session.status_code, 200)
         self.assertTrue(session.json()["ok"])
 
-    def test_rotate_changes_code_and_ending_live_clears_it(self):
+    def test_rotate_requires_host_auth_and_ending_live_clears_code(self):
         created = self._activate()
         first = self.client.get("/api/live-entry/code").json()["code"]
-        rotated = self.client.post("/api/live-entry/rotate").json()["code"]
+        denied = self.client.post("/api/live-entry/rotate")
+        self.assertEqual(denied.status_code, 403)
+        rotated = self.client.post("/api/live-entry/rotate", json=self.admin).json()["code"]
         self.assertRegex(rotated, r"^\d{4}$")
         self.assertNotEqual(first, rotated)
         agendas.set_status(created["id"], agendas.AgendaStatusPayload(status="finished"))
         offline = self.client.get("/api/live-entry/code").json()
         self.assertFalse(offline["is_live"])
         self.assertIsNone(offline["code"])
+
+    def test_session_does_not_carry_across_agendas(self):
+        first = self._activate(title="First", event_date="2026-11-20")
+        code = self.client.get("/api/live-entry/code").json()["code"]
+        token = self.client.post("/api/live-entry/verify", json={"code": code}).json()["token"]
+        agendas.set_status(first["id"], agendas.AgendaStatusPayload(status="finished"))
+        self._activate(title="Second", event_date="2026-11-21")
+        stale = self.client.get("/api/live-entry/session", params={"token": token})
+        self.assertEqual(stale.status_code, 401)
+
+    def test_ensure_for_agenda_is_stable_under_lock(self):
+        created = self._activate()
+        a = live_entry_code.ensure_for_agenda(created["id"])
+        b = live_entry_code.ensure_for_agenda(created["id"])
+        self.assertEqual(a, b)
+        self.assertRegex(a, r"^\d{4}$")
 
 
 if __name__ == "__main__":
