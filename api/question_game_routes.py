@@ -159,7 +159,7 @@ def submit(payload: Submission, user=Depends(identity)):
 
 
 def finish(state):
-    if state["stage"] != "all_answers" or state["round"] != len(state["questions"]):
+    if state["stage"] not in {"all_answers", "leaderboard"} or state["round"] != len(state["questions"]):
         q.fail("Complete all questions before final results.")
     qualified = set(state.get("qualified", []))
     eligible = [e for e in state["entries"] if any(m["user_id"] in qualified for m in e["members"])]
@@ -272,6 +272,8 @@ def action(payload: Action, _=Depends(host)):
             return q.review_answers(s, p.get("corrections", {}), p.get("merges", {}))
         if kind == "reveal":
             return q.reveal_next(s)
+        if kind == "standings":
+            return q.show_standings(s)
         if kind == "finish":
             return finish(s)
         if kind == "send_packs":
