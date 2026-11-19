@@ -206,6 +206,8 @@ def begin_round(state):
     if not state["participants"]:
         fail("Wait for players to join.")
     make_entries(state)
+    if "shown_standings" in state:
+        state["standings"] = state.pop("shown_standings")
     state["round"] += 1
     state.update(stage="answering", submissions={}, round_points={}, reveal_groups=[],
                  reveal_index=-1, revealed=[], active_ids=[], active_kind="",
@@ -289,6 +291,7 @@ def show_standings(state, now=None):
     now = time.time() if now is None else now
     state.update(stage="leaderboard", active_ids=[], active_kind="",
                  leaderboard_at=now + leaderboard_delay(len(state["submissions"])))
+    state["shown_standings"] = [row["id"] for row in leaderboard(state)]
     return state
 
 
@@ -363,12 +366,23 @@ def reveal_next(state):
 
 
 def leaderboard(state):
-    """Totals plus this round's revealed points, so overlays can replay the round's movement."""
-    rows = []
-    for e in sorted(state["entries"], key=lambda e: -e["score"]):
-        gained = state.get("round_points", {}).get(e["id"], 0) if e["id"] in state.get("revealed", []) else 0
-        rows.append({"id": e["id"], "name": e["name"], "score": e["score"], "gained": gained,
-                     "previous_score": e["score"] - gained})
+    """Totals plus this round's revealed points, so overlays can replay the round's movement.
+
+    Herd Mentality ties keep the order last shown on the round leaderboard, so rows that
+    gain points move up past tied rows and the next board opens exactly as the last one ended.
+    """
+    entries = state["entries"]
+    revealed = set(state.get("revealed", []))
+    points = state.get("round_points", {})
+    gained = {e["id"]: points.get(e["id"], 0) if e["id"] in revealed else 0 for e in entries}
+    joined = {e["id"]: i for i, e in enumerate(entries)}
+    shown = {eid: i for i, eid in enumerate(state.get("standings", []))}
+    before = sorted(entries, key=lambda e: (gained[e["id"]] - e["score"], shown.get(e["id"], len(shown) + joined[e["id"]])))
+    previous_position = {e["id"]: i for i, e in enumerate(before)}
+    tie = previous_position if state["mode"] == "crowd" else joined
+    rows = [{"id": e["id"], "name": e["name"], "score": e["score"], "gained": gained[e["id"]],
+             "previous_score": e["score"] - gained[e["id"]], "previous_position": previous_position[e["id"]]}
+            for e in sorted(entries, key=lambda e: (-e["score"], tie[e["id"]]))]
     for row in rows:
         row["rank"] = 1 + sum(other["score"] > row["score"] for other in rows)
         row["previous_rank"] = 1 + sum(other["previous_score"] > row["previous_score"] for other in rows)

@@ -201,7 +201,7 @@ def test_crowd_leaderboard_after_every_question_reports_round_movement(game):
     assert public["leaderboard_at"] == 100+game.leaderboard_delay(4)
     assert public["overlay_cards"][0]["answer"] == "A"
     rows={r["id"]:r for r in public["leaderboard"]}
-    assert rows["1"] == {"id":"1","name":"Player 1","score":2,"gained":2,"previous_score":0,"rank":1,"previous_rank":1}
+    assert rows["1"] == {"id":"1","name":"Player 1","score":2,"gained":2,"previous_score":0,"previous_position":0,"rank":1,"previous_rank":1}
     assert rows["3"]["gained"] == 0 and rows["3"]["rank"] == 3
     with pytest.raises(Exception): game.show_standings(s)
     s=game.begin_round(s)
@@ -215,6 +215,23 @@ def test_crowd_leaderboard_after_every_question_reports_round_movement(game):
     rows={r["id"]:r for r in game.public_state(game.show_standings(s))["leaderboard"]}
     assert rows["3"]["score"] == 2 and rows["3"]["previous_rank"] == 3 and rows["3"]["rank"] == 1
     assert rows["1"]["rank"] == 1 and rows["2"]["rank"] == 1
+
+def test_crowd_leaderboard_ties_keep_the_order_last_shown(game):
+    def play(s, answers):
+        s=game.close_round(answer(game,s,answers))
+        while s["stage"] != "all_answers":
+            s=game.reveal_next(s)
+        return game.show_standings(s)
+    s=play(start(game,players=4),["A","B","C","C"])
+    board=game.public_state(s)["leaderboard"]
+    assert [r["id"] for r in board] == ["3","4","1","2"]
+    assert [r["previous_position"] for r in board] == [2,3,0,1]
+    assert s["shown_standings"] == ["3","4","1","2"]
+    s=game.begin_round(s)
+    assert [r["previous_position"] for r in game.public_state(s)["leaderboard"]] == [0,1,2,3]
+    s=play(s,["X","X","Y","Z"])
+    board=game.public_state(s)["leaderboard"]
+    assert [(r["id"],r["score"],r["previous_position"]) for r in board] == [("3",2,0),("4",2,1),("1",2,2),("2",2,3)]
 
 def test_quiz_has_no_crowd_leaderboard_stage(game):
     s=answer(game,start(game,"quiz",count=1,players=2),["Paris","No"])
