@@ -16,6 +16,7 @@ ROOT = Path(__file__).resolve().parents[1]
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('--frontend', type=Path, required=True)
 parser.add_argument('--port', type=int, default=8000)
+parser.add_argument('--stagger', type=float, default=0, help='Seconds between sample-player answers (0 = all at once)')
 args = parser.parse_args()
 FRONTEND = args.frontend.resolve()
 DATA = ROOT / '.local-question-preview'
@@ -52,6 +53,15 @@ PERSONAS = {
     'ardyn': {'id': 9001, 'display_name': 'Ardyn · Test', 'first_name': 'Ardyn · Test'},
     'alex': {'id': 9002, 'display_name': 'Alex · Test', 'first_name': 'Alex · Test'},
 }
+from api import member_access
+_authorize_member = member_access.authorize_identity
+def _authorize_local(user):
+    # Local personas stand in for verified members; everyone else uses the real check.
+    if str(user.get('id') or user.get('user_id') or '') in {str(p['id']) for p in PERSONAS.values()}:
+        return user, 'verified'
+    return _authorize_member(user)
+member_access.authorize_identity = _authorize_local
+
 BOTS = [(1001, 'Sam'), (1002, 'Jamie'), (1003, 'Riley'), (1004, 'Morgan'), (1005, 'Taylor'), (1006, 'Charlie')]
 CROWD = ['Name a pizza topping.', 'Name a colour.', 'Name a breakfast food.', 'Name a household chore.', 'Name a fruit.', 'Name a hot drink.', 'Name a holiday destination.', 'Name a pet animal.']
 SAMPLE = [
@@ -102,20 +112,29 @@ async def demo_answers(request: Request, call_next):
             pass
     response = await call_next(request)
     if action == 'begin' and response.status_code == 200:
-        def fill(s):
+        def captains(s):
             # Make the main tester a captain, so every team preset is easy to try.
             for entry in s['entries']:
                 if any(m['user_id'] == '9001' for m in entry['members']):
                     entry['captain_id'] = '9001'
-            for entry in s['entries']:
-                uid = entry['captain_id']
-                if uid not in {str(uid) for uid, _ in BOTS}:
-                    continue
+            return s
+        state = q.mutate(None, captains)
+        bots = [e['captain_id'] for e in state['entries'] if e['captain_id'] in {str(uid) for uid, _ in BOTS}]
+        def answer(uid, game_id, number):
+            def fill(s):
+                if s['game_id'] != game_id or s['round'] != number or s['stage'] != 'answering':
+                    return s
                 index = int(uid) - 1001
                 text = (s['questions'][s['round']-1]['answers'][0] if index % 2 == 0 else 'No idea') if s['mode'] == 'quiz' else SAMPLE[(s['round']-1) % len(SAMPLE)][index]
-                q.submit_answer(s, uid, text)
-            return s
-        q.mutate(None, fill)
+                return q.submit_answer(s, uid, text)
+            q.mutate(None, fill)
+        if args.stagger > 0:
+            import threading
+            for i, uid in enumerate(bots):
+                threading.Timer(args.stagger * (i + 1), answer, (uid, state['game_id'], state['round'])).start()
+        else:
+            for uid in bots:
+                answer(uid, state['game_id'], state['round'])
     return response
 
 @app.get('/local/start/{mode}')
@@ -174,6 +193,11 @@ def home():
 <div class="buttons"><a class="primary" href="/host-control.html" target="_blank" rel="noopener">Open Host Control</a><a href="/player.html?persona=ardyn" target="_blank" rel="noopener">Play as Ardyn</a><a href="/player.html?persona=alex" target="_blank" rel="noopener">Play as Alex</a></div>
 <div class="card"><h2>Ready-made games</h2><p>Choose a preset, then click OPEN QUESTION 1 in Host Control. Six sample players answer automatically; close answers whenever you are ready, then reveal each group.</p><div class="buttons"><a href="/local/start/crowd" target="_blank" rel="noopener">Load Match the Crowd</a><a href="/local/start/quiz" target="_blank" rel="noopener">Load Quiz</a><a href="/local/start/teams" target="_blank" rel="noopener">Load teams of three</a></div><p><small>Loading a preset resets only this local game. In team mode Ardyn becomes a captain so you can test submitting and team chat.</small></p></div>
 <h2>OBS views</h2><div class="buttons"><a href="/question-game-overlay.html?view=answers" target="_blank" rel="noopener">Answer cards</a><a href="/question-game-overlay.html?view=leaderboard" target="_blank" rel="noopener">Leaderboard</a><a href="/activity-timer-overlay.html" target="_blank" rel="noopener">Timer</a></div><p>To build your own game: Host Control → Builder → Question Game. Other activities and Telegram integration are outside this local harness.</p></main></body></html>''')
+
+@app.get('/api/live-room/connection')
+def live_room_connection():
+    # The shared live-room transport only reads activity state while the room is live.
+    return {'data': {'is_live': True, 'available': True, 'revision': 'local-preview', 'changed': []}}
 
 @app.api_route('/api/{path:path}', methods=['GET', 'POST', 'PUT', 'DELETE'])
 def unrelated_api(path: str):
