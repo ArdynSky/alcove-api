@@ -3,3 +3,4 @@ __pycache__/
 .env
 .local-question-preview/
 .venv/
+live_entry_code.sqlite3
