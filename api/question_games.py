@@ -400,18 +400,18 @@ def public_state(state, user_id=None):
         "id": e["id"], "name": e["name"], "members": [m["display_name"] for m in e["members"]],
         "answer": state["submissions"][e["id"]]["text"], "style": e["style"],
     } for e in state["entries"] if e["id"] in ids and e["id"] in state["revealed"]]
-    # OBS keeps a stable board in submission order; unrevealed text never leaves the server.
-    # Herd Mentality flips every answer once the host starts revealing matches.
+    # OBS keeps a stable board in submission order; answer text stays on the server
+    # until that entry's match group is revealed so the audience still has to guess.
     entries = {e["id"]: e for e in state["entries"]}
     winning_ids = {eid for group in state["reveal_groups"] if group["kind"] == "winner" for eid in group["ids"]}
-    crowd_open = state["mode"] == "crowd" and state["stage"] in {"revealing", "all_answers", "leaderboard"}
+    revealed_ids = set(state.get("revealed") or [])
     overlay_cards = [{
         "id": eid, "name": entries[eid]["name"], "style": entries[eid]["style"],
         "members": [m["display_name"] for m in entries[eid]["members"]],
-        "answer": item["text"] if crowd_open or eid in state["revealed"] else "",
-        "revealed": crowd_open or eid in state["revealed"],
-        "winning": eid in winning_ids and eid in state["revealed"],
-        "points": state["round_points"].get(eid, 0) if eid in state["revealed"] else None,
+        "answer": item["text"] if eid in revealed_ids else "",
+        "revealed": eid in revealed_ids,
+        "winning": eid in winning_ids and eid in revealed_ids,
+        "points": state["round_points"].get(eid, 0) if eid in revealed_ids else None,
     } for eid, item in state["submissions"].items() if eid in entries]
     return {
         "stage": state["stage"], "revision": state["revision"], "game_id": state["game_id"],

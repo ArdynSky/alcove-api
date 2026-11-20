@@ -160,7 +160,7 @@ def test_overlay_names_follow_submissions_but_answers_stay_private(game):
     s=game.begin_round(s)
     assert game.public_state(s)["overlay_cards"] == []
 
-def test_crowd_overlay_flips_every_answer_then_scores_groups_in_turn(game):
+def test_crowd_overlay_only_shows_answers_for_revealed_match_groups(game):
     s=answer(game,start(game),["A","A","A","B","B","C"])
     s=game.close_round(s)
     public=game.public_state(s)
@@ -168,18 +168,21 @@ def test_crowd_overlay_flips_every_answer_then_scores_groups_in_turn(game):
     assert all(c["answer"] == "" and c["points"] is None for c in public["overlay_cards"])
     s=game.reveal_next(s)
     public=game.public_state(s)
-    assert [c["answer"] for c in public["overlay_cards"]] == ["A","A","A","B","B","C"]
-    assert all(c["revealed"] for c in public["overlay_cards"])
+    # First match (B): only those two show text; AAA and singleton stay blank.
+    assert [c["answer"] for c in public["overlay_cards"]] == ["","","","B","B",""]
+    assert [c["revealed"] for c in public["overlay_cards"]] == [False,False,False,True,True,False]
     assert [c["id"] for c in public["overlay_cards"] if c["points"] is not None] == ["4","5"]
     assert public["active_ids"] == ["4","5"] and public["active_kind"] == "match"
     assert not any(c["winning"] for c in public["overlay_cards"])
     s=game.reveal_next(s)
     public=game.public_state(s)
+    assert [c["answer"] for c in public["overlay_cards"]] == ["A","A","A","B","B",""]
     assert [c["id"] for c in public["overlay_cards"] if c["winning"]] == ["1","2","3"]
     assert public["overlay_cards"][-1]["points"] is None
     s=game.reveal_next(s)
     public=game.public_state(s)
     assert s["stage"] == "all_answers"
+    assert [c["answer"] for c in public["overlay_cards"]] == ["A","A","A","B","B","C"]
     assert [c["points"] for c in public["overlay_cards"]] == [2,2,2,1,1,0]
 
 def test_quiz_overlay_keeps_unrevealed_answers_hidden(game):

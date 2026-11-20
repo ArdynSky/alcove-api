@@ -148,8 +148,10 @@ def test_crowd_http_flow_shows_leaderboard_after_every_question(api):
         s=action(client,s,"close")
         assert "Coffee" not in str(client.get("/api/question-game/state").json())
         s=action(client,s,"reveal")
-        assert [c["answer"] for c in client.get("/api/question-game/state").json()["overlay_cards"]]==["Tea","tea","Coffee"]
+        # Matched tea pair reveals first; unmatched Coffee stays blank until all_answers.
+        assert [c["answer"] for c in client.get("/api/question-game/state").json()["overlay_cards"]]==["Tea","tea",""]
         s=action(client,s,"reveal")
+        assert [c["answer"] for c in client.get("/api/question-game/state").json()["overlay_cards"]]==["Tea","tea","Coffee"]
         s=action(client,s,"standings")
         public=client.get("/api/question-game/state").json()
         assert public["stage"]=="leaderboard" and public["leaderboard_at"]>0
