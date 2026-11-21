@@ -134,6 +134,31 @@ def test_agenda_question_snapshot_never_contains_quiz_answers(api):
     assert "Paris" not in str(public)
     assert public["items"][0]["content_snapshot"]["question_game_template_id"]=="private-template"
 
+def test_crowd_http_flow_shows_leaderboard_after_every_question(api):
+    client,q,*_=api
+    s=client.post("/api/question-game/start",headers=ADMIN,json=config(mode="crowd",count=2)).json()
+    for uid in [1,2,3]:
+        assert client.post("/api/question-game/join",headers=member(uid),json={"game_id":s["game_id"]}).status_code==200
+    s=client.get("/api/question-game/host-state",headers=ADMIN).json()
+    for number in [1,2]:
+        s=action(client,s,"begin")
+        for uid,text in [(1,"Tea"),(2,"tea"),(3,"Coffee")]:
+            assert client.post("/api/question-game/submit",headers=member(uid),json={"game_id":s["game_id"],"round":number,"text":text}).status_code==200
+        s=client.get("/api/question-game/host-state",headers=ADMIN).json()
+        s=action(client,s,"close")
+        assert "Coffee" not in str(client.get("/api/question-game/state").json())
+        s=action(client,s,"reveal")
+        # Matched tea pair reveals first; unmatched Coffee stays blank until all_answers.
+        assert [c["answer"] for c in client.get("/api/question-game/state").json()["overlay_cards"]]==["Tea","tea",""]
+        s=action(client,s,"reveal")
+        assert [c["answer"] for c in client.get("/api/question-game/state").json()["overlay_cards"]]==["Tea","tea","Coffee"]
+        s=action(client,s,"standings")
+        public=client.get("/api/question-game/state").json()
+        assert public["stage"]=="leaderboard" and public["leaderboard_at"]>0
+        assert [(r["id"],r["gained"],r["score"]) for r in public["leaderboard"]]==[("1",2,2*number),("2",2,2*number),("3",0,0)]
+    s=action(client,s,"finish")
+    assert s["stage"]=="finished" and s["winners"]==["1","2"]
+
 def test_quiz_http_flow_collects_then_reveals_each_question_and_final_winner_cards(api):
     client,q,*_=api
     s=client.post("/api/question-game/start",headers=ADMIN,json=config(count=2)).json()

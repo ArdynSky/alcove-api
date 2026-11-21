@@ -205,6 +205,10 @@ STATE_DB_PATH = os.getenv(
 )
 
 ROOM_MEDIA_DIR = os.path.join(_PERSISTENT_DATA_DIR, "room-media")
+COMPOSE_POPUP_BG_DIR = os.path.join(_PERSISTENT_DATA_DIR, "compose-popup-backgrounds")
+COMPOSE_POPUP_BG_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp"}
+COMPOSE_POPUP_BG_MAX_BYTES = 5 * 1024 * 1024
+os.makedirs(COMPOSE_POPUP_BG_DIR, exist_ok=True)
 REWARD_ASSETS_DIR = os.getenv(
     "REWARD_ASSETS_DIR",
     os.path.join(_PERSISTENT_DATA_DIR, "reward-assets"),
@@ -2264,9 +2268,21 @@ def load_runtime_state() -> None:
 load_runtime_state()
 
 
+def compose_popup_background_url() -> str:
+    filename = str(state.get("compose_popup_background_filename") or "").strip()
+    if not filename:
+        return ""
+    safe = Path(filename).name
+    path = os.path.join(COMPOSE_POPUP_BG_DIR, safe)
+    if not os.path.isfile(path):
+        return ""
+    return f"/api/live-room/compose-background/file/{safe}"
+
+
 def live_room_state_payload() -> dict:
     return {
         "room_discussion": state.get("room_discussion"),
+        "compose_popup_background_filename": state.get("compose_popup_background_filename") or None,
         "active_poll": active_poll,
         "room_qa_items": room_qa_items,
         "room_qa_archive": room_qa_archive,
@@ -2292,6 +2308,11 @@ def apply_live_room_payload(payload: dict) -> None:
     discussion = payload.get("room_discussion")
     if isinstance(discussion, dict):
         state["room_discussion"] = discussion
+    if "compose_popup_background_filename" in payload:
+        filename = payload.get("compose_popup_background_filename")
+        state["compose_popup_background_filename"] = (
+            Path(str(filename)).name if filename else None
+        )
     if "active_poll" in payload:
         active_poll = payload.get("active_poll")
     if isinstance(payload.get("room_qa_items"), list):
@@ -8154,6 +8175,7 @@ def compact_live_app_state(full: dict) -> dict:
         "active_wheel_reactions": full.get("active_wheel_reactions"),
         "active_review_overlay": full.get("active_review_overlay"),
         "room_discussion": full.get("room_discussion"),
+        "compose_popup_background_url": full.get("compose_popup_background_url") or "",
         "active_poll": full.get("active_poll"),
         "room_qa_items": full.get("room_qa_items") or [],
         "room_qa_archive": [],
@@ -8225,6 +8247,7 @@ def build_app_state() -> dict:
             "ends_at": None,
             "status": "idle",
         },
+        "compose_popup_background_url": compose_popup_background_url(),
         "active_poll": active_poll,
         "room_qa_items": [item for item in room_qa_items if item.get("status") != "archived"],
         "room_qa_archive": room_qa_archive,
@@ -10509,6 +10532,96 @@ def end_room_discussion():
     add_notification("system", "Discussion ended", True)
     persist_live_room()
     return {"status": "ok", "room_discussion": state["room_discussion"]}
+
+
+@app.get("/api/live-room/compose-background")
+def get_compose_popup_background():
+    url = compose_popup_background_url()
+    return {
+        "status": "ok",
+        "compose_popup_background_url": url,
+        "has_background": bool(url),
+    }
+
+
+@app.post("/api/live-room/compose-background")
+async def upload_compose_popup_background(file: UploadFile = File(...)):
+    content_type = (file.content_type or "").lower()
+    ext = Path(file.filename or "compose-bg.png").suffix.lower()
+    type_map = {
+        "image/png": ".png",
+        "image/jpeg": ".jpg",
+        "image/webp": ".webp",
+    }
+    if content_type not in type_map and ext not in COMPOSE_POPUP_BG_EXTENSIONS:
+        raise HTTPException(status_code=400, detail="Please upload a PNG, JPEG, or WebP image")
+    if ext not in COMPOSE_POPUP_BG_EXTENSIONS:
+        ext = type_map[content_type]
+    data = await file.read(COMPOSE_POPUP_BG_MAX_BYTES + 1)
+    if len(data) > COMPOSE_POPUP_BG_MAX_BYTES:
+        raise HTTPException(status_code=413, detail="Background image must be under 5 MB")
+    previous = str(state.get("compose_popup_background_filename") or "").strip()
+    filename = f"compose-{uuid.uuid4().hex[:12]}{ext}"
+    path = os.path.join(COMPOSE_POPUP_BG_DIR, filename)
+    try:
+        with open(path, "wb") as handle:
+            handle.write(data)
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail="Could not save background image") from exc
+    state["compose_popup_background_filename"] = filename
+    if previous and previous != filename:
+        old_path = os.path.join(COMPOSE_POPUP_BG_DIR, Path(previous).name)
+        try:
+            if os.path.isfile(old_path):
+                os.remove(old_path)
+        except OSError:
+            pass
+    persist_live_room(immediate=True)
+    url = compose_popup_background_url()
+    return {
+        "status": "ok",
+        "compose_popup_background_url": url,
+        "has_background": bool(url),
+    }
+
+
+@app.delete("/api/live-room/compose-background")
+def remove_compose_popup_background():
+    previous = str(state.get("compose_popup_background_filename") or "").strip()
+    state["compose_popup_background_filename"] = None
+    if previous:
+        old_path = os.path.join(COMPOSE_POPUP_BG_DIR, Path(previous).name)
+        try:
+            if os.path.isfile(old_path):
+                os.remove(old_path)
+        except OSError:
+            pass
+    persist_live_room(immediate=True)
+    return {
+        "status": "ok",
+        "compose_popup_background_url": "",
+        "has_background": False,
+    }
+
+
+@app.get("/api/live-room/compose-background/file/{filename}")
+def compose_popup_background_file(filename: str):
+    safe = Path(filename).name
+    path = os.path.join(COMPOSE_POPUP_BG_DIR, safe)
+    if not os.path.isfile(path):
+        raise HTTPException(status_code=404, detail="Background image not found")
+    ext = Path(safe).suffix.lower()
+    media_types = {
+        ".png": "image/png",
+        ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg",
+        ".webp": "image/webp",
+    }
+    return FileResponse(
+        path,
+        media_type=media_types.get(ext, "application/octet-stream"),
+        headers={"Cache-Control": "public, max-age=2592000"},
+    )
 
 
 @app.get("/api/room-qa")

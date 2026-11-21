@@ -199,13 +199,15 @@ def make_entries(state):
 def begin_round(state):
     if state.get("quiz_phase") == "results":
         fail("Advance to the next question's results.")
-    if state["stage"] not in {"lobby", "all_answers", "quiz_wait"}:
+    if state["stage"] not in {"lobby", "all_answers", "quiz_wait", "leaderboard"}:
         fail("Show all answers before the next question.")
     if state["round"] >= len(state["questions"]):
         fail("Reveal the final results.")
     if not state["participants"]:
         fail("Wait for players to join.")
     make_entries(state)
+    if "shown_standings" in state:
+        state["standings"] = state.pop("shown_standings")
     state["round"] += 1
     state.update(stage="answering", submissions={}, round_points={}, reveal_groups=[],
                  reveal_index=-1, revealed=[], active_ids=[], active_kind="",
@@ -274,6 +276,22 @@ def calculate(state):
         if winners:
             reveals.append({"ids": winners, "kind": "winner"})
     state.update(round_points=points, reveal_groups=reveals)
+    return state
+
+
+def leaderboard_delay(card_count):
+    """Seconds the OBS answer board needs to fade its cards out one by one."""
+    return round(min(6.0, 0.9 + 0.22 * max(0, card_count)), 2)
+
+
+def show_standings(state, now=None):
+    """Herd Mentality: after every question the answers clear and the leaderboard holds."""
+    if state["mode"] != "crowd" or state["stage"] != "all_answers":
+        fail("Show all matches before the leaderboard.")
+    now = time.time() if now is None else now
+    state.update(stage="leaderboard", active_ids=[], active_kind="",
+                 leaderboard_at=now + leaderboard_delay(len(state["submissions"])))
+    state["shown_standings"] = [row["id"] for row in leaderboard(state)]
     return state
 
 
@@ -347,6 +365,30 @@ def reveal_next(state):
     return state
 
 
+def leaderboard(state):
+    """Totals plus this round's revealed points, so overlays can replay the round's movement.
+
+    Herd Mentality ties keep the order last shown on the round leaderboard, so rows that
+    gain points move up past tied rows and the next board opens exactly as the last one ended.
+    """
+    entries = state["entries"]
+    revealed = set(state.get("revealed", []))
+    points = state.get("round_points", {})
+    gained = {e["id"]: points.get(e["id"], 0) if e["id"] in revealed else 0 for e in entries}
+    joined = {e["id"]: i for i, e in enumerate(entries)}
+    shown = {eid: i for i, eid in enumerate(state.get("standings", []))}
+    before = sorted(entries, key=lambda e: (gained[e["id"]] - e["score"], shown.get(e["id"], len(shown) + joined[e["id"]])))
+    previous_position = {e["id"]: i for i, e in enumerate(before)}
+    tie = previous_position if state["mode"] == "crowd" else joined
+    rows = [{"id": e["id"], "name": e["name"], "score": e["score"], "gained": gained[e["id"]],
+             "previous_score": e["score"] - gained[e["id"]], "previous_position": previous_position[e["id"]]}
+            for e in sorted(entries, key=lambda e: (-e["score"], tie[e["id"]]))]
+    for row in rows:
+        row["rank"] = 1 + sum(other["score"] > row["score"] for other in rows)
+        row["previous_rank"] = 1 + sum(other["previous_score"] > row["previous_score"] for other in rows)
+    return rows
+
+
 def public_state(state, user_id=None):
     if state.get("stage") == "idle":
         return {"stage": "idle", "revision": state["revision"]}
@@ -358,15 +400,18 @@ def public_state(state, user_id=None):
         "id": e["id"], "name": e["name"], "members": [m["display_name"] for m in e["members"]],
         "answer": state["submissions"][e["id"]]["text"], "style": e["style"],
     } for e in state["entries"] if e["id"] in ids and e["id"] in state["revealed"]]
-    # OBS keeps a stable board in submission order; unrevealed text never leaves the server.
+    # OBS keeps a stable board in submission order; answer text stays on the server
+    # until that entry's match group is revealed so the audience still has to guess.
     entries = {e["id"]: e for e in state["entries"]}
     winning_ids = {eid for group in state["reveal_groups"] if group["kind"] == "winner" for eid in group["ids"]}
+    revealed_ids = set(state.get("revealed") or [])
     overlay_cards = [{
         "id": eid, "name": entries[eid]["name"], "style": entries[eid]["style"],
         "members": [m["display_name"] for m in entries[eid]["members"]],
-        "answer": item["text"] if eid in state["revealed"] else "",
-        "revealed": eid in state["revealed"],
-        "winning": eid in winning_ids and eid in state["revealed"],
+        "answer": item["text"] if eid in revealed_ids else "",
+        "revealed": eid in revealed_ids,
+        "winning": eid in winning_ids and eid in revealed_ids,
+        "points": state["round_points"].get(eid, 0) if eid in revealed_ids else None,
     } for eid, item in state["submissions"].items() if eid in entries]
     return {
         "stage": state["stage"], "revision": state["revision"], "game_id": state["game_id"],
@@ -385,7 +430,9 @@ def public_state(state, user_id=None):
         "submitted": bool(mine and mine["id"] in state["submissions"]),
         "eligible_this_round": bool(mine and mine["id"] in state["round_members"]),
         "overlay_cards": overlay_cards, "cards": cards, "active_ids": state["active_ids"], "active_kind": state["active_kind"],
-        "leaderboard": [{"id": e["id"], "name": e["name"], "score": e["score"]} for e in sorted(state["entries"], key=lambda e: -e["score"])],
+        "expected_answers": len(state.get("round_members", [])),
+        "leaderboard_at": state.get("leaderboard_at") if state["stage"] == "leaderboard" else None,
+        "leaderboard": leaderboard(state),
         "winner_cards": [{"id": e["id"], "name": e["name"], "style": e["style"],
                           "members": [m["display_name"] for m in e["members"]],
                           "answer": str(e["score"]) + (" point" if e["score"] == 1 else " points")}
