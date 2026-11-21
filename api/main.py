@@ -102,6 +102,8 @@ app.include_router(live_room_test_router)
 app.include_router(member_progress_router)
 app.include_router(progress_reset_router)
 app.include_router(homepage_settings_router)
+from .host_content import router as host_content_router
+app.include_router(host_content_router)
 app.include_router(help_cms_router)
 app.include_router(safety_enforcement_router)
 app.include_router(daily_checkin_router)
