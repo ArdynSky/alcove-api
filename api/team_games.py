@@ -67,6 +67,9 @@ def _apply_vote_close_if_expired(state: dict) -> dict:
         voting["closed_at"] = _iso()
         state["voting"] = voting
         state["status"] = "results_ready"
+        if state.get("obs_mode") in {"gallery", "single"}:
+            state["obs_mode"] = "hidden"
+            state["reveal"] = {"visible": False, "submission_id": None}
         _save_state(state)
     return state
 
@@ -590,6 +593,10 @@ def team_game_voting_close():
     voting.update({"open": False, "closed_at": _iso()})
     state["voting"] = voting
     state["status"] = "results_ready"
+    # Clear picture gallery so Show Entries can take the OBS stage cleanly.
+    if state.get("obs_mode") in {"gallery", "single"}:
+        state["obs_mode"] = "hidden"
+        state["reveal"] = {"visible": False, "submission_id": None}
     _save_state(state)
     return _public_state(state)
 
@@ -629,6 +636,8 @@ def team_game_results(payload: ResultsPayload):
         state["voting"] = voting
     if payload.visible:
         state["status"] = "results"
+        state["obs_mode"] = "entries"
+        state["reveal"] = {"visible": False, "submission_id": None}
         state["results"] = {
             "visible": True,
             "reveal_started_at": _iso(),
@@ -637,6 +646,8 @@ def team_game_results(payload: ResultsPayload):
     else:
         state["status"] = "results_ready"
         state["results"] = {"visible": False, "reveal_started_at": None, "animation_seconds": 7}
+        if state.get("obs_mode") not in {"entries", "gallery", "single"}:
+            state["obs_mode"] = "entries"
     _save_state(state)
     return _public_state(state)
 
@@ -646,8 +657,8 @@ def team_game_obs_focus(payload: ObsFocusPayload):
     state = _load_state()
     mode = str(payload.mode or "").strip().lower()
     sid = str(payload.submission_id or "").strip()
-    if mode not in {"", "hidden", "gallery", "single"}:
-        raise HTTPException(status_code=400, detail="mode must be gallery, single, or hidden")
+    if mode not in {"", "hidden", "gallery", "single", "entries"}:
+        raise HTTPException(status_code=400, detail="mode must be gallery, single, entries, or hidden")
     if mode == "single" or (not mode and sid):
         if not sid:
             raise HTTPException(status_code=400, detail="submission_id is required")
@@ -655,9 +666,27 @@ def team_game_obs_focus(payload: ObsFocusPayload):
             raise HTTPException(status_code=404, detail="Drawing not found")
         state["obs_mode"] = "single"
         state["reveal"] = {"visible": True, "submission_id": sid}
+        # Focusing art should not keep a previous results reveal playing.
+        if state.get("status") == "results":
+            state["results"] = dict(state.get("results") or {})
+            state["results"]["visible"] = False
     elif mode == "gallery":
         state["obs_mode"] = "gallery"
         state["reveal"] = {"visible": False, "submission_id": None}
+    elif mode == "entries":
+        if state.get("status") not in {"results_ready", "results", "voting"}:
+            raise HTTPException(status_code=409, detail="Close votes before showing entry cards")
+        if state.get("status") == "voting" and (state.get("voting") or {}).get("open"):
+            raise HTTPException(status_code=409, detail="Close votes before showing entry cards")
+        state["status"] = "results_ready" if state.get("status") == "voting" else state.get("status")
+        state["obs_mode"] = "entries"
+        state["reveal"] = {"visible": False, "submission_id": None}
+        state["results"] = {
+            "visible": False,
+            "reveal_started_at": None,
+            "animation_seconds": int((state.get("results") or {}).get("animation_seconds") or 7),
+            "entries_shown_at": _iso(),
+        }
     else:
         state["obs_mode"] = "hidden"
         state["reveal"] = {"visible": False, "submission_id": None}
@@ -671,7 +700,11 @@ def team_game_obs_state():
     submissions = [_decorate_submission(item, state) for item in _session_submissions(state)]
     reveal = state.get("reveal") or {}
     mode = str(state.get("obs_mode") or "hidden")
-    if mode == "gallery":
+    results = dict(state.get("results") or {})
+    if mode == "entries" or (results.get("visible") and state.get("status") == "results"):
+        mode = "entries"
+        focused = None
+    elif mode == "gallery":
         focused = None
     elif reveal.get("visible") and reveal.get("submission_id"):
         mode = "single"
@@ -681,12 +714,16 @@ def team_game_obs_state():
         focused = None
     else:
         focused = next((item for item in submissions if str(item.get("id")) == str(reveal.get("submission_id") or "")), None)
-    visible = bool(submissions) and mode in {"gallery", "single"}
+    # Picture gallery/single stay hidden once entry cards or results own the stage.
+    picture = bool(submissions) and mode in {"gallery", "single"}
     return {
-        "visible": visible,
-        "mode": mode if visible else "hidden",
+        "visible": picture or mode == "entries",
+        "mode": mode if (picture or mode == "entries") else "hidden",
         "game": {"title": state.get("title"), "prompt": state.get("prompt")},
+        "status": state.get("status"),
         "voting": dict(state.get("voting") or {}),
+        "results": results,
+        "vote_percentages": dict(_public_state(state).get("vote_percentages") or {}),
         "submissions": submissions,
         "submission": focused if mode == "single" else None,
     }
