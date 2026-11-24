@@ -39,11 +39,15 @@ class LiveRoomEventsTests(unittest.TestCase):
         self.module.install_live_room_events(self.app)
         return TestClient(self.app)
 
-    def assert_frame(self, frame, live, changed):
+    def assert_frame(self, frame, live, changed, *, show_active=None, mode=None):
         self.assertEqual(set(frame), {'event', 'data'})
         self.assertEqual(frame['event'], 'live_room')
-        self.assertEqual(set(frame['data']), {'is_live', 'revision', 'changed'})
+        self.assertEqual(set(frame['data']), {'is_live', 'show_active', 'mode', 'revision', 'changed'})
         self.assertIs(frame['data']['is_live'], live)
+        expected_show = live if show_active is None else show_active
+        expected_mode = ('live' if live else 'off') if mode is None else mode
+        self.assertIs(frame['data']['show_active'], expected_show)
+        self.assertEqual(frame['data']['mode'], expected_mode)
         self.assertEqual(frame['data']['changed'], changed)
         self.assertIsInstance(frame['data']['revision'], str)
         self.assertTrue(frame['data']['revision'])
@@ -101,6 +105,15 @@ class LiveRoomEventsTests(unittest.TestCase):
         with self.install() as client:
             with client.websocket_connect('/ws/live-room') as socket:
                 self.assert_frame(socket.receive_json(), True, [])
+
+    def test_rehearsal_is_show_active_but_not_audience_live(self):
+        agendas.create_agenda(agendas.AgendaPayload(
+            title='Dry run', event_date='2026-10-21', start_time='19:00', status='rehearsal'))
+        with self.install() as client:
+            frame = client.get('/api/live-room/connection').json()
+            self.assert_frame(frame, False, [], show_active=True, mode='rehearsal')
+            with client.websocket_connect('/ws/live-room') as socket:
+                self.assert_frame(socket.receive_json(), False, [], show_active=True, mode='rehearsal')
 
     def test_main_activity_mutations_invalidate_room_metadata(self):
         paths = ['/api/stream-comment', '/api/comments/approve/example', '/api/wheel-reaction',

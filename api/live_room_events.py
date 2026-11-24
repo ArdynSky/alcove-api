@@ -44,19 +44,33 @@ class LiveRoomEvents:
         self.boot_id = uuid4().hex
         self.revision = 0
         self.is_live = None
+        self.show_active = None
+        self.mode = None
         self.lock = asyncio.Lock()
         self.subscribers = set()
 
     def _frame(self, changed=()):
         return {'event': 'live_room', 'data': {
-            'is_live': self.is_live,
+            # Audience-facing Live Room (holding page JOIN / entry code).
+            'is_live': bool(self.is_live),
+            # Host Control + OBS overlays may run while the audience stays closed.
+            'show_active': bool(self.show_active),
+            'mode': self.mode or 'off',
             'revision': f'{self.boot_id}:{self.revision}',
             'changed': list(changed),
         }}
 
     async def _read_live(self):
-        result = await run_in_threadpool(agendas.active_agenda)
-        self.is_live = bool(result.get('agenda'))
+        active = await run_in_threadpool(agendas.active_agenda)
+        running = await run_in_threadpool(agendas.running_agenda)
+        self.is_live = bool(active.get('agenda'))
+        self.show_active = bool(running.get('agenda'))
+        if self.is_live:
+            self.mode = 'live'
+        elif self.show_active:
+            self.mode = 'rehearsal'
+        else:
+            self.mode = 'off'
 
     async def snapshot(self):
         async with self.lock:

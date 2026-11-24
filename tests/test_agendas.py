@@ -49,6 +49,44 @@ class AgendaTests(unittest.TestCase):
         self.assertEqual(agendas.get_agenda(first["id"])["status"], "finished")
         self.assertEqual(agendas.active_agenda()["agenda"]["id"], second["id"])
 
+    def test_rehearsal_runs_without_audience_live(self):
+        created = agendas.create_agenda(agendas.AgendaPayload(
+            title="Dry run",
+            event_date="2026-08-22",
+            start_time="19:00",
+            status="rehearsal",
+            show_in_app=True,
+            items=[agendas.AgendaItem(title="Discussion"), agendas.AgendaItem(title="Debate")],
+        ))
+        self.assertEqual(created["status"], "rehearsal")
+        self.assertFalse(created["show_in_app"])
+        self.assertIsNone(agendas.active_agenda()["agenda"])
+        self.assertEqual(agendas.running_agenda()["agenda"]["id"], created["id"])
+        first = created["items"][0]
+        progressed = agendas.set_progress(
+            created["id"], agendas.AgendaProgressPayload(action="activate", item_id=first["id"])
+        )
+        self.assertEqual(progressed["current_item_id"], first["id"])
+        live = agendas.create_agenda(agendas.AgendaPayload(
+            title="Real show", event_date="2026-08-23", start_time="19:00", status="active"
+        ))
+        self.assertEqual(agendas.get_agenda(created["id"])["status"], "finished")
+        self.assertEqual(agendas.active_agenda()["agenda"]["id"], live["id"])
+        self.assertEqual(agendas.running_agenda()["agenda"]["id"], live["id"])
+
+    def test_rehearsal_and_live_are_mutually_exclusive(self):
+        live = agendas.create_agenda(agendas.AgendaPayload(
+            title="Live", event_date="2026-08-21", start_time="19:00", status="active"
+        ))
+        rehearse = agendas.set_status(live["id"], agendas.AgendaStatusPayload(status="rehearsal"))
+        self.assertEqual(rehearse["status"], "rehearsal")
+        self.assertFalse(rehearse["show_in_app"])
+        self.assertIsNone(agendas.active_agenda()["agenda"])
+        self.assertEqual(agendas.running_agenda()["agenda"]["id"], live["id"])
+        opened = agendas.set_status(live["id"], agendas.AgendaStatusPayload(status="active"))
+        self.assertEqual(opened["status"], "active")
+        self.assertTrue(opened["show_in_app"])
+
     def test_agenda_progress_tracks_current_and_completed_items(self):
         created = agendas.create_agenda(agendas.AgendaPayload(
             title="Live", event_date="2026-08-22", start_time="19:00", status="active",
