@@ -1,12 +1,18 @@
-"""HTTP adapter for question games; identity is never accepted from request bodies."""
+"""HTTP adapter for question games.
+
+Mini App members authenticate with Telegram init data / live-room Bearer.
+F.O.X DMs authenticate with X-Bot-Sync-Secret and may send user_id in the body
+(same pattern as /team-game and /debate).
+"""
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 import os
 import time
 import uuid
 from typing import Any
-import hashlib
 
 from fastapi import APIRouter, Body, Depends, Header
 from pydantic import BaseModel, Field
@@ -14,6 +20,30 @@ from pydantic import BaseModel, Field
 from . import question_games as q
 
 router = APIRouter(prefix="/api/question-game", tags=["question-game"])
+
+
+def _bot_secret_ok(secret: str | None) -> bool:
+    expected = os.getenv("BOT_SYNC_SECRET", "")
+    return bool(secret and expected and hmac.compare_digest(secret, expected))
+
+
+def bot_member(
+    user_id: str | None,
+    display_name: str | None = None,
+    username: str | None = None,
+    x_bot_sync_secret: str | None = None,
+):
+    if not _bot_secret_ok(x_bot_sync_secret):
+        return None
+    uid = str(user_id or "").strip()
+    if not uid:
+        q.fail("user_id is required.", 400)
+    return {
+        "user_id": uid[:80],
+        "display_name": (str(display_name or "").strip() or "Member")[:80],
+        "username": str(username or "").strip()[:80],
+        "role": "participant",
+    }
 
 
 def identity(authorization: str | None = Header(default=None), x_telegram_init_data: str | None = Header(default=None)):
@@ -72,22 +102,41 @@ class Submission(BaseModel):
     game_id: str
     round: int
     text: str = Field(max_length=80)
+    user_id: str | None = None
+    display_name: str | None = None
+    username: str | None = None
 
 
 class Join(BaseModel):
     game_id: str
     style: dict[str, Any] = Field(default_factory=dict)
+    user_id: str | None = None
+    display_name: str | None = None
+    username: str | None = None
 
 
 class Chat(BaseModel):
     game_id: str
     round: int
     body: str = Field(min_length=1, max_length=300)
+    user_id: str | None = None
+    display_name: str | None = None
+    username: str | None = None
 
 
 @router.get("/state")
-def state(after_revision: str | None = None, authorization: str | None = Header(default=None), x_telegram_init_data: str | None = Header(default=None)):
-    user = optional_identity(authorization, x_telegram_init_data)
+def state(
+    after_revision: str | None = None,
+    user_id: str | None = None,
+    authorization: str | None = Header(default=None),
+    x_telegram_init_data: str | None = Header(default=None),
+    x_bot_sync_secret: str | None = Header(default=None),
+):
+    user = None
+    if _bot_secret_ok(x_bot_sync_secret) and str(user_id or "").strip():
+        user = {"user_id": str(user_id).strip()}
+    else:
+        user = optional_identity(authorization, x_telegram_init_data)
     current = current_state()
     public = q.public_state(current, user["user_id"] if user else None)
     public.pop("revision", None)
@@ -142,14 +191,31 @@ def start(config: dict = Body(...), _=Depends(host)):
 
 
 @router.post("/join")
-def join(payload: Join, user=Depends(identity)):
+def join(
+    payload: Join,
+    authorization: str | None = Header(default=None),
+    x_telegram_init_data: str | None = Header(default=None),
+    x_bot_sync_secret: str | None = Header(default=None),
+):
+    user = bot_member(payload.user_id, payload.display_name, payload.username, x_bot_sync_secret)
+    if not user:
+        user = identity(authorization, x_telegram_init_data)
     user = {**user, "style": payload.style}
     current = q.mutate(None, lambda s: q.join_game(s, user), payload.game_id)
     return q.public_state(current, user["user_id"])
 
 
 @router.post("/submit")
-def submit(payload: Submission, user=Depends(identity)):
+def submit(
+    payload: Submission,
+    authorization: str | None = Header(default=None),
+    x_telegram_init_data: str | None = Header(default=None),
+    x_bot_sync_secret: str | None = Header(default=None),
+):
+    user = bot_member(payload.user_id, payload.display_name, payload.username, x_bot_sync_secret)
+    if not user:
+        user = identity(authorization, x_telegram_init_data)
+
     def operation(s):
         if s.get("round") != payload.round:
             q.fail("The question has changed.")
