@@ -303,9 +303,8 @@ MEMBER_ROUTES = {
     "/api/room-game/team-media", "/api/asmr-entry", "/api/story-entry", "/api/members/profile",
     "/api/custom-packs/pending", "/api/custom-packs/claim", "/api/home-alerts", "/api/home-alerts/consume",
     "/api/exp-grants", "/api/debate/join", "/api/debate/leave", "/api/debate/vote", "/api/debate/audience/submit",
-    "/api/debate/presence/heartbeat", "/api/debate/presence/leave",     "/api/team-game/join", "/api/team-game/leave",
+    "/api/debate/presence/heartbeat", "/api/debate/presence/leave", "/api/team-game/join", "/api/team-game/leave",
     "/api/team-game/chat", "/api/team-game/submit", "/api/team-game/vote",
-    "/api/question-game/join", "/api/question-game/submit", "/api/question-game/chat",
 }
 MEMBER_PREFIXES = ("/api/daily-checkin", "/api/archive/", "/api/pulse-assignments/", "/api/pulse-receipts/", "/api/exp-grants/")
 

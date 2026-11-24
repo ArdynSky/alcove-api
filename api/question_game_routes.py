@@ -33,17 +33,25 @@ def bot_member(
     username: str | None = None,
     x_bot_sync_secret: str | None = None,
 ):
+    """Authenticate the bot transport, then authorize the supplied participant."""
     if not _bot_secret_ok(x_bot_sync_secret):
         return None
     uid = str(user_id or "").strip()
     if not uid:
         q.fail("user_id is required.", 400)
-    return {
+    user = {
         "user_id": uid[:80],
+        "id": uid[:80],
         "display_name": (str(display_name or "").strip() or "Member")[:80],
         "username": str(username or "").strip()[:80],
         "role": "participant",
     }
+    # Same membership gate as Mini App identity(), including configured-host exemption.
+    from .live_room_test import _is_host
+    if not _is_host(user["user_id"]):
+        from .member_access import authorize_identity
+        authorize_identity(user)
+    return user
 
 
 def identity(authorization: str | None = Header(default=None), x_telegram_init_data: str | None = Header(default=None)):
