@@ -107,7 +107,7 @@ class AgendaPayload(BaseModel):
     event_date: str
     start_time: str
     timezone: str = "Europe/London"
-    status: Literal["draft", "future", "active", "finished"] = "draft"
+    status: Literal["draft", "future", "active", "rehearsal", "finished"] = "draft"
     show_in_app: bool = False
     schedule_image_url: str = ""
     holding_video_url: str = ""
@@ -139,7 +139,9 @@ class AgendaPayload(BaseModel):
 
 
 class AgendaStatusPayload(BaseModel):
-    status: Literal["draft", "future", "active", "finished"]
+    status: Literal["draft", "future", "active", "rehearsal", "finished"]
+
+_RUNNING_STATUSES = ("active", "rehearsal")
 
 
 class AgendaProgressPayload(BaseModel):
@@ -215,10 +217,24 @@ def list_agendas():
 
 @router.get("/active")
 def active_agenda():
+    """Audience-open Live Room agenda only (`status=active`)."""
     with _LOCK:
         con = _conn()
         row = con.execute(
             "SELECT * FROM agendas WHERE status='active' ORDER BY updated_at DESC LIMIT 1"
+        ).fetchone()
+        con.close()
+    return {"agenda": _public(row) if row else None}
+
+
+@router.get("/running")
+def running_agenda():
+    """Host/OBS show runner: live (`active`) or closed-room rehearsal."""
+    with _LOCK:
+        con = _conn()
+        row = con.execute(
+            "SELECT * FROM agendas WHERE status IN ('active','rehearsal') "
+            "ORDER BY CASE status WHEN 'active' THEN 0 ELSE 1 END, updated_at DESC LIMIT 1"
         ).fetchone()
         con.close()
     return {"agenda": _public(row) if row else None}
@@ -233,14 +249,17 @@ def get_agenda(agenda_id: str):
 def create_agenda(payload: AgendaPayload):
     _validate(payload)
     agenda_id, now = str(uuid.uuid4()), _now()
-    if payload.status == "active":
+    if payload.status in _RUNNING_STATUSES:
         _deactivate_all()
     with _LOCK:
         con = _conn()
+        show_in_app = False if payload.status == "rehearsal" else payload.show_in_app
+        if payload.status == "active":
+            show_in_app = True
         con.execute(
             "INSERT INTO agendas(id,title,session_name,event_date,start_time,timezone,status,show_in_app,schedule_image_url,holding_video_url,items_json,created_at,updated_at,current_item_id,completed_item_ids_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,NULL,'[]')",
             (agenda_id, payload.title.strip()[:160], (payload.session_name or payload.title).strip()[:160],
-             payload.event_date, payload.start_time, payload.timezone, payload.status, int(payload.show_in_app),
+             payload.event_date, payload.start_time, payload.timezone, payload.status, int(show_in_app),
              _clean_url(payload.schedule_image_url), _clean_url(payload.holding_video_url),
              json.dumps([x.model_dump(exclude={"starts_at"}) for x in payload.items]), now, now),
         )
@@ -255,7 +274,7 @@ def create_agenda(payload: AgendaPayload):
 def update_agenda(agenda_id: str, payload: AgendaPayload):
     existing = _public(_get(agenda_id))
     _validate(payload)
-    if payload.status == "active":
+    if payload.status in _RUNNING_STATUSES:
         _deactivate_all(except_id=agenda_id)
     fields_set = payload.model_fields_set
     current_item_id = existing.get("current_item_id")
@@ -264,6 +283,9 @@ def update_agenda(agenda_id: str, payload: AgendaPayload):
         current_item_id = str(payload.current_item_id or "").strip() or None
     if "completed_item_ids" in fields_set:
         completed_item_ids = [str(item_id) for item_id in (payload.completed_item_ids or []) if str(item_id).strip()]
+    show_in_app = False if payload.status == "rehearsal" else payload.show_in_app
+    if payload.status == "active":
+        show_in_app = True
     with _LOCK:
         con = _conn()
         con.execute(
@@ -271,7 +293,7 @@ def update_agenda(agenda_id: str, payload: AgendaPayload):
             "show_in_app=?,schedule_image_url=?,holding_video_url=?,items_json=?,"
             "current_item_id=?,completed_item_ids_json=?,updated_at=? WHERE id=?",
             (payload.title.strip()[:160], (payload.session_name or payload.title).strip()[:160],
-             payload.event_date, payload.start_time, payload.timezone, payload.status, int(payload.show_in_app),
+             payload.event_date, payload.start_time, payload.timezone, payload.status, int(show_in_app),
              _clean_url(payload.schedule_image_url), _clean_url(payload.holding_video_url),
              json.dumps([x.model_dump(exclude={"starts_at"}) for x in payload.items]),
              current_item_id, json.dumps(completed_item_ids), _now(), agenda_id),
@@ -287,9 +309,16 @@ def _deactivate_all(except_id: Optional[str] = None):
     with _LOCK:
         con = _conn()
         if except_id:
-            con.execute("UPDATE agendas SET status='finished',updated_at=? WHERE status='active' AND id<>?", (_now(), except_id))
+            con.execute(
+                "UPDATE agendas SET status='finished',updated_at=? "
+                "WHERE status IN ('active','rehearsal') AND id<>?",
+                (_now(), except_id),
+            )
         else:
-            con.execute("UPDATE agendas SET status='finished',updated_at=? WHERE status='active'", (_now(),))
+            con.execute(
+                "UPDATE agendas SET status='finished',updated_at=? WHERE status IN ('active','rehearsal')",
+                (_now(),),
+            )
         con.commit()
         con.close()
 
@@ -307,11 +336,25 @@ def _sync_live_entry_code():
 @router.post("/{agenda_id}/status")
 def set_status(agenda_id: str, payload: AgendaStatusPayload):
     _get(agenda_id)
-    if payload.status == "active":
+    if payload.status in _RUNNING_STATUSES:
         _deactivate_all(except_id=agenda_id)
     with _LOCK:
         con = _conn()
-        con.execute("UPDATE agendas SET status=?,updated_at=? WHERE id=?", (payload.status, _now(), agenda_id))
+        if payload.status == "rehearsal":
+            con.execute(
+                "UPDATE agendas SET status=?,show_in_app=0,updated_at=? WHERE id=?",
+                (payload.status, _now(), agenda_id),
+            )
+        elif payload.status == "active":
+            con.execute(
+                "UPDATE agendas SET status=?,show_in_app=1,updated_at=? WHERE id=?",
+                (payload.status, _now(), agenda_id),
+            )
+        else:
+            con.execute(
+                "UPDATE agendas SET status=?,updated_at=? WHERE id=?",
+                (payload.status, _now(), agenda_id),
+            )
         con.commit()
         con.close()
     result = _public(_get(agenda_id))
@@ -322,8 +365,8 @@ def set_status(agenda_id: str, payload: AgendaStatusPayload):
 @router.post("/{agenda_id}/progress")
 def set_progress(agenda_id: str, payload: AgendaProgressPayload):
     agenda = _public(_get(agenda_id))
-    if agenda["status"] != "active":
-        raise HTTPException(status_code=409, detail="Activate the agenda before running it")
+    if agenda["status"] not in _RUNNING_STATUSES:
+        raise HTTPException(status_code=409, detail="Activate or rehearse the agenda before running it")
     item_ids = [str(item.get("id")) for item in agenda["items"]]
     item_id = str(payload.item_id or "").strip() or None
     if item_id and item_id not in item_ids:
