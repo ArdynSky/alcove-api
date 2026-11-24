@@ -52,6 +52,43 @@ def test_host_endpoints_reject_unverified_and_nonhost(api):
     assert client.get("/api/question-game/templates").status_code==401
     assert client.get("/api/question-game/host-state").status_code==401
 
+
+def test_fox_bot_can_join_and_submit_with_sync_secret(api):
+    client, q, *_ = api
+    started = client.post("/api/question-game/start", headers=ADMIN, json=config(1, "crowd")).json()
+    bot = {"X-Bot-Sync-Secret": "test-admin"}
+    # user 1 is verified via the fixture monkeypatch; unverified 99 must be rejected.
+    denied = client.post(
+        "/api/question-game/join",
+        headers=bot,
+        json={"game_id": started["game_id"], "user_id": "99", "display_name": "Stranger"},
+    )
+    assert denied.status_code == 403, denied.text
+    join = client.post(
+        "/api/question-game/join",
+        headers=bot,
+        json={"game_id": started["game_id"], "user_id": "1", "display_name": "Fox Player", "username": "foxplayer"},
+    )
+    assert join.status_code == 200, join.text
+    assert join.json()["joined"] is True
+    host = client.get("/api/question-game/host-state", headers=ADMIN).json()
+    host = action(client, host, "begin")
+    submit = client.post(
+        "/api/question-game/submit",
+        headers=bot,
+        json={"game_id": host["game_id"], "round": 1, "text": "Pineapple", "user_id": "1", "display_name": "Fox Player"},
+    )
+    assert submit.status_code == 200, submit.text
+    assert submit.json()["submitted"] is True
+    personalized = client.get("/api/question-game/state", headers=bot, params={"user_id": "1"}).json()
+    assert personalized["joined"] is True
+    assert personalized["submitted"] is True
+    # Without bot secret, body identity is ignored and Telegram auth is required.
+    assert client.post(
+        "/api/question-game/join",
+        json={"game_id": started["game_id"], "user_id": "1", "display_name": "Nope"},
+    ).status_code == 401
+
 def test_hidden_answers_and_public_submission_names(api):
     client,q,*_=api;s=setup(client)
     before=client.get("/api/question-game/state",headers=member(2)).json()
