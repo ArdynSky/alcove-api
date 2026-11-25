@@ -185,10 +185,13 @@ def _question_game(client: Client) -> None:
         client._joined_games.discard(game_id)
         return
 
-    if game_id not in client._joined_games:
+    already = {str(p.get("user_id")) for p in (state.get("participants") or [])}
+    missing = [p for p in ROSTER if str(p["user_id"]) not in already]
+    if missing:
         joined = 0
-        for person in ROSTER:
-            code, _ = client.post(
+        denied = 0
+        for person in missing:
+            code, body = client.post(
                 "/question-game/join",
                 {
                     "game_id": game_id,
@@ -200,9 +203,22 @@ def _question_game(client: Client) -> None:
             )
             if code == 200:
                 joined += 1
+            elif code == 403:
+                denied += 1
+            else:
+                log(f"QG join {person['display_name']} failed ({code}): {body}")
         if joined:
-            log(f"Question game joined {joined}/{len(ROSTER)} dummies")
+            log(f"Question game joined {joined}/{len(missing)} missing dummies")
             client._joined_games.add(game_id)
+        elif denied:
+            log("Question game join blocked (membership). Re-registering dummies…")
+            try:
+                register_members(client)
+                client._joined_games.discard(game_id)
+            except Exception as exc:
+                log(f"Re-register failed: {exc}")
+    else:
+        client._joined_games.add(game_id)
 
     if stage != "answering":
         return
@@ -213,6 +229,7 @@ def _question_game(client: Client) -> None:
     mode = state.get("mode") or "crowd"
     questions = state.get("questions") or []
     qrow = questions[round_no - 1] if 0 < round_no <= len(questions) else {}
+    ok = 0
     for index, person in enumerate(ROSTER):
         if mode == "quiz":
             answers = qrow.get("answers") or ["Paris"]
@@ -220,7 +237,7 @@ def _question_game(client: Client) -> None:
         else:
             bank = HERD_ANSWERS[(round_no - 1) % len(HERD_ANSWERS)]
             text = bank[index % len(bank)]
-        code, _ = client.post(
+        code, body = client.post(
             "/question-game/submit",
             {
                 "game_id": game_id,
@@ -231,9 +248,21 @@ def _question_game(client: Client) -> None:
                 "username": person["username"],
             },
         )
+        detail = ""
+        if isinstance(body, dict):
+            detail = str(body.get("detail") or "")
         if code == 200:
+            ok += 1
             log(f"QG round {round_no} answer {person['display_name']}: {text}")
-    client._answered_rounds.add(key)
+        elif code == 409 and "already been submitted" in detail.lower():
+            ok += 1
+        else:
+            log(f"QG submit {person['display_name']} failed ({code}): {body}")
+    if ok == len(ROSTER):
+        client._answered_rounds.add(key)
+    elif ok:
+        # Partial success — retry remaining next tick.
+        log(f"QG round {round_no} partial answers {ok}/{len(ROSTER)}")
 
 
 def _drawing(client: Client) -> None:
@@ -332,33 +361,46 @@ def _poll(client: Client) -> None:
 
 
 def register_members(client: Client) -> None:
-    """Append rehearsal dummies to the live membership roster (no complete snapshot).
+    """Upsert rehearsal dummies on the live membership roster (no complete snapshot).
 
     Needed for Herd Mentality / Quiz until the API rehearsal-dummy bypass is deployed.
-    A later authoritative FOX sync may remove them — re-run with --register-members.
+    Always refreshes verified_at so a prior FOX revocation does not keep blocking joins.
     """
-    from datetime import datetime, timezone
+    from datetime import datetime, timezone, timedelta
 
     st, payload = client.get("/alcove-users", headers=client.bot)
     if st != 200 or not isinstance(payload, dict):
         raise RuntimeError(f"Could not load alcove-users ({st})")
     users = list(payload.get("users") or [])
-    existing = {int(u.get("user_id")) for u in users if str(u.get("user_id") or "").isdigit()}
-    now = datetime.now(timezone.utc).isoformat()
-    added = 0
+    by_id = {
+        int(u.get("user_id")): u
+        for u in users
+        if str(u.get("user_id") or "").isdigit()
+    }
+    now = datetime.now(timezone.utc)
+    # Beat any revocation timestamp written moments ago by an authoritative FOX sync.
+    fresh = (now + timedelta(seconds=5)).isoformat()
+    updated = 0
     for person in ROSTER:
         uid = int(person["user_id"])
-        if uid in existing:
+        row = by_id.get(uid)
+        if row:
+            row["verified_at"] = fresh
+            row["display_name"] = person["display_name"]
+            row["username"] = person["username"]
+            row["source"] = "rehearsal_dummy"
+            row["last_seen"] = fresh
+            updated += 1
             continue
         users.append(
             {
                 "user_id": uid,
                 "username": person["username"],
                 "display_name": person["display_name"],
-                "verified_at": now,
-                "joined_at": now,
-                "first_seen": now,
-                "last_seen": now,
+                "verified_at": fresh,
+                "joined_at": fresh,
+                "first_seen": fresh,
+                "last_seen": fresh,
                 "source": "rehearsal_dummy",
                 "label": person["display_name"],
                 "message_count": 0,
@@ -368,15 +410,15 @@ def register_members(client: Client) -> None:
                 "fox_form": None,
             }
         )
-        added += 1
+        updated += 1
     code, result = client.post(
         "/bot-sync/alcove",
-        {"complete_membership_snapshot": False, "users": users, "synced_at": now},
+        {"complete_membership_snapshot": False, "users": users, "synced_at": now.isoformat()},
         headers=client.bot,
     )
     if code != 200:
         raise RuntimeError(f"bot-sync failed ({code}): {result}")
-    log(f"Registered rehearsal members (added {added}; roster size {result.get('users')})")
+    log(f"Registered rehearsal members (refreshed {updated}; roster size {result.get('users')})")
 
 
 def main() -> int:
@@ -401,8 +443,14 @@ def main() -> int:
     if args.once:
         tick(client)
         return 0
+    last_register = time.time()
     while True:
         try:
+            # FOX complete snapshots can revoke dummies; refresh membership every 90s.
+            if args.register_members and time.time() - last_register >= 90:
+                register_members(client)
+                client._joined_games.clear()
+                last_register = time.time()
             tick(client)
         except Exception as exc:
             log(f"Tick error: {exc}")
