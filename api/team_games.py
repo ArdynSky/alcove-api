@@ -194,12 +194,31 @@ def _session_votes(state):
     return {str(row["user_id"]): str(row["submission_id"]) for row in rows}
 
 
+def _clean_style(value):
+    if not isinstance(value, dict):
+        return {}
+    try:
+        if len(json.dumps(value)) > 16000:
+            return {}
+    except (TypeError, ValueError):
+        return {}
+    return value
+
+
+def _participant_style(state, user_id):
+    person = _find_participant(state, str(user_id or ""))
+    if not person:
+        return {}
+    return _clean_style(person.get("style"))
+
+
 def _decorate_submission(item, state):
     out = dict(item)
     out["media_url"] = f"/api/team-game/media/{out['filename']}" if out.get("filename") else None
     team = next((t for t in state.get("teams", []) if t.get("id") == out.get("team_id")), None)
     out["team_label"] = team.get("label") if team else ""
     out["team_members"] = [m.get("display_name") for m in (team or {}).get("members", [])]
+    out["style"] = _participant_style(state, out.get("user_id"))
     return out
 
 
@@ -219,7 +238,7 @@ def _public_state(state, user_id: Optional[str] = None):
     counts = {}
     for submission_id in votes.values():
         counts[submission_id] = counts.get(submission_id, 0) + 1
-    out["submissions"] = submissions
+    out["submissions"] = [_decorate_submission(item, state) for item in submissions]
     out["voting"] = dict(state.get("voting") or {"open": False, "opened_at": None, "closed_at": None})
     out["my_vote"] = votes.get(uid)
     out["vote_counts"] = counts
@@ -247,6 +266,7 @@ class JoinPayload(BaseModel):
     user_id: str
     display_name: str
     username: Optional[str] = None
+    style: Optional[dict] = None
 
 
 class UserPayload(BaseModel):
@@ -355,15 +375,21 @@ def team_game_join(payload: JoinPayload):
     if state.get("status") != "pooling":
         raise HTTPException(status_code=409, detail="Registration is not open")
     uid = _clean_user_id(payload.user_id)
-    if not _find_participant(state, uid):
+    existing = _find_participant(state, uid)
+    style = _clean_style(payload.style)
+    if not existing:
         state.setdefault("participants", []).append(
             {
                 "user_id": uid,
                 "display_name": (payload.display_name or "Member")[:80],
                 "username": (payload.username or "")[:80],
+                "style": style,
                 "joined_at": _iso(),
             }
         )
+        _save_state(state)
+    elif style and not existing.get("style"):
+        existing["style"] = style
         _save_state(state)
     return _public_state(state, uid)
 
