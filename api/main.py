@@ -368,6 +368,7 @@ approved_comments = []
 
 room_qa_items = []
 room_qa_archive = []
+room_qa_overlay_id = None  # Host Control "Show on OBS" discussion thought
 poll_history = []
 active_poll = None
 room_media_submissions = []
@@ -2288,6 +2289,7 @@ def live_room_state_payload() -> dict:
         "active_poll": active_poll,
         "room_qa_items": room_qa_items,
         "room_qa_archive": room_qa_archive,
+        "room_qa_overlay_id": room_qa_overlay_id,
         "poll_history": poll_history,
         "room_media_submissions": room_media_submissions,
         "now_showing_media": now_showing_media,
@@ -2301,7 +2303,7 @@ def live_room_state_payload() -> dict:
 
 
 def apply_live_room_payload(payload: dict) -> None:
-    global active_poll, room_qa_items, room_qa_archive, poll_history, room_media_submissions, now_showing_media
+    global active_poll, room_qa_items, room_qa_archive, room_qa_overlay_id, poll_history, room_media_submissions, now_showing_media
     global room_game, team_feeds
     global _next_room_qa_id_seq, _next_poll_id_seq, _next_media_id_seq, _next_team_msg_id_seq
 
@@ -2321,6 +2323,8 @@ def apply_live_room_payload(payload: dict) -> None:
         room_qa_items = payload["room_qa_items"]
     if isinstance(payload.get("room_qa_archive"), list):
         room_qa_archive = payload["room_qa_archive"]
+    if "room_qa_overlay_id" in payload:
+        room_qa_overlay_id = payload.get("room_qa_overlay_id")
     if isinstance(payload.get("poll_history"), list):
         poll_history = payload["poll_history"]
     if isinstance(payload.get("room_media_submissions"), list):
@@ -7440,7 +7444,7 @@ def get_ready_unplayed_entries(round_number: int):
 
 def reset_wheel_session_state() -> None:
     global current_winner, current_now_playing, current_wheel_reaction, latest_review_overlay
-    global active_poll, room_media_submissions, now_showing_media, room_qa_items, room_qa_archive, poll_history
+    global active_poll, room_media_submissions, now_showing_media, room_qa_items, room_qa_archive, room_qa_overlay_id, poll_history
     global room_game, team_feeds
 
     wheel_entries.clear()
@@ -7481,6 +7485,7 @@ def reset_wheel_session_state() -> None:
     }
     room_qa_items.clear()
     room_qa_archive.clear()
+    room_qa_overlay_id = None
     poll_history.clear()
     active_poll = None
     room_media_submissions.clear()
@@ -8252,6 +8257,7 @@ def build_app_state() -> dict:
         "compose_popup_background_url": compose_popup_background_url(),
         "active_poll": active_poll,
         "room_qa_items": [item for item in room_qa_items if item.get("status") != "archived"],
+        "room_qa_overlay": room_qa_overlay_payload(),
         "room_qa_archive": room_qa_archive,
         "poll_history": poll_history[-20:],
         "media_submissions": room_media_submissions,
@@ -10626,6 +10632,48 @@ def compose_popup_background_file(filename: str):
     )
 
 
+def room_qa_overlay_payload():
+    """Public OBS thought card for a host-selected discussion question/comment."""
+    if room_qa_overlay_id is None:
+        return None
+    want = str(room_qa_overlay_id)
+    for item in room_qa_items:
+        if str(item.get("id") or "") == want and item.get("status") != "archived":
+            return {
+                "id": item.get("id"),
+                "kind": item.get("kind") or "comment",
+                "display_name": item.get("display_name") or "Member",
+                "username": item.get("username") or "",
+                "reason": item.get("question") or "",
+                "side": "",
+                "updated_at": item.get("answered_at") or item.get("created_at") or "",
+                "source": "discussion",
+            }
+    return None
+
+
+@app.get("/api/room-qa/overlay")
+def get_room_qa_overlay():
+    return {"overlay": room_qa_overlay_payload()}
+
+
+@app.post("/api/room-qa/overlay")
+def set_room_qa_overlay(payload: dict | None = None):
+    global room_qa_overlay_id
+    raw = (payload or {}).get("item_id", (payload or {}).get("submission_id"))
+    if raw is None or raw == "" or raw is False:
+        room_qa_overlay_id = None
+        persist_live_room()
+        return {"status": "ok", "overlay": None}
+    want = str(raw)
+    match = next((item for item in room_qa_items if str(item.get("id") or "") == want and item.get("status") != "archived"), None)
+    if not match:
+        return {"status": "error", "message": "Discussion item not found."}
+    room_qa_overlay_id = match.get("id")
+    persist_live_room()
+    return {"status": "ok", "overlay": room_qa_overlay_payload()}
+
+
 @app.get("/api/room-qa")
 def list_room_qa(archived: bool = False):
     if archived:
@@ -10671,7 +10719,7 @@ def submit_room_qa(payload: RoomQASubmit):
 
 @app.post("/api/room-qa/{item_id}/archive")
 def archive_room_qa(item_id: int):
-    global room_qa_items, room_qa_archive
+    global room_qa_items, room_qa_archive, room_qa_overlay_id
     for index, item in enumerate(room_qa_items):
         if int(item.get("id") or 0) == int(item_id):
             archived = dict(item)
@@ -10680,6 +10728,8 @@ def archive_room_qa(item_id: int):
             room_qa_archive.insert(0, archived)
             room_qa_archive[:] = room_qa_archive[:200]
             del room_qa_items[index]
+            if str(room_qa_overlay_id or "") == str(item_id):
+                room_qa_overlay_id = None
             persist_live_room()
             return {"status": "ok", "item": archived}
     return {"status": "error", "message": "Question not found."}
