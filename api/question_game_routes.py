@@ -47,8 +47,10 @@ def bot_member(
         "role": "participant",
     }
     # Same membership gate as Mini App identity(), including configured-host exemption.
+    # Rehearsal dummies (91001–91006) may join while a closed-room rehearsal is running.
     from .live_room_test import _is_host
-    if not _is_host(user["user_id"]):
+    from .rehearsal_dummies import allow_bot_rehearsal_dummy
+    if not _is_host(user["user_id"]) and not allow_bot_rehearsal_dummy(user["user_id"]):
         from .member_access import authorize_identity
         authorize_identity(user)
     return user
@@ -271,10 +273,11 @@ def grant_rewards(state):
                 winner_row = con.execute("SELECT * FROM custom_pack_templates WHERE id=?", (state["winner_template_id"],)).fetchone()
                 if not winner_row or len(cr._pack(winner_row)["items"]) != 2:
                     q.fail("Restore the selected two-item winner pack before sending packs.", 422)
+            from .rehearsal_dummies import is_rehearsal_dummy
             con.execute("BEGIN IMMEDIATE")
             for person in state["participants"]:
                 uid = person["user_id"]
-                if uid not in qualified:
+                if uid not in qualified or is_rehearsal_dummy(uid):
                     continue
                 for kind, row in [("participation", participation_row), ("winner", winner_row if uid in winners else None)]:
                     if row is None:
