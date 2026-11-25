@@ -2,7 +2,7 @@
 """Drive a fake audience against a closed-room rehearsal.
 
 Uses BOT_SYNC_SECRET (same value as Feature Admin) to join/answer as the
-91001–91006 rehearsal dummies while agendas/running is status=rehearsal.
+91001–91012 rehearsal dummies while agendas/running is status=rehearsal.
 
 Usage:
   BOT_SYNC_SECRET=… python tools/rehearsal_audience.py
@@ -32,19 +32,25 @@ ROSTER = [
     {"user_id": "91004", "display_name": "Morgan · Rehearsal", "username": "rehearse_morgan"},
     {"user_id": "91005", "display_name": "Taylor · Rehearsal", "username": "rehearse_taylor"},
     {"user_id": "91006", "display_name": "Charlie · Rehearsal", "username": "rehearse_charlie"},
+    {"user_id": "91007", "display_name": "Avery · Rehearsal", "username": "rehearse_avery"},
+    {"user_id": "91008", "display_name": "Quinn · Rehearsal", "username": "rehearse_quinn"},
+    {"user_id": "91009", "display_name": "Jordan · Rehearsal", "username": "rehearse_jordan"},
+    {"user_id": "91010", "display_name": "Casey · Rehearsal", "username": "rehearse_casey"},
+    {"user_id": "91011", "display_name": "Harper · Rehearsal", "username": "rehearse_harper"},
+    {"user_id": "91012", "display_name": "Rowan · Rehearsal", "username": "rehearse_rowan"},
 ]
 
 DEFAULT_API = "https://alcove-api.onrender.com/api"
 
 HERD_ANSWERS = [
-    ["Pepperoni", "Pepperoni", "Mushroom", "Pineapple", "Pepperoni", "Olive"],
-    ["Blue", "Green", "Blue", "Red", "Blue", "Yellow"],
-    ["Toast", "Eggs", "Toast", "Cereal", "Toast", "Porridge"],
-    ["Dog", "Cat", "Dog", "Rabbit", "Dog", "Hamster"],
-    ["Tea", "Coffee", "Tea", "Tea", "Chocolate", "Coffee"],
-    ["Spain", "Italy", "Spain", "Greece", "Spain", "France"],
-    ["Football", "Tennis", "Football", "Rugby", "Football", "Cricket"],
-    ["Keys", "Phone", "Keys", "Wallet", "Keys", "Glasses"],
+    ["Pepperoni", "Pepperoni", "Mushroom", "Pineapple", "Pepperoni", "Olive", "Pepperoni", "Ham", "Pepperoni", "Onion", "Mushroom", "Pepperoni"],
+    ["Blue", "Green", "Blue", "Red", "Blue", "Yellow", "Blue", "Purple", "Blue", "Orange", "Green", "Blue"],
+    ["Toast", "Eggs", "Toast", "Cereal", "Toast", "Porridge", "Toast", "Yoghurt", "Toast", "Fruit", "Eggs", "Toast"],
+    ["Dog", "Cat", "Dog", "Rabbit", "Dog", "Hamster", "Dog", "Fish", "Dog", "Bird", "Cat", "Dog"],
+    ["Tea", "Coffee", "Tea", "Tea", "Chocolate", "Coffee", "Tea", "Water", "Tea", "Juice", "Coffee", "Tea"],
+    ["Spain", "Italy", "Spain", "Greece", "Spain", "France", "Spain", "Portugal", "Spain", "Malta", "Italy", "Spain"],
+    ["Football", "Tennis", "Football", "Rugby", "Football", "Cricket", "Football", "Golf", "Football", "Hockey", "Tennis", "Football"],
+    ["Keys", "Phone", "Keys", "Wallet", "Keys", "Glasses", "Keys", "Watch", "Keys", "Badge", "Phone", "Keys"],
 ]
 
 DEBATE_THOUGHTS = {
@@ -252,7 +258,13 @@ def _question_game(client: Client) -> None:
     if missing:
         joined = 0
         denied = 0
+        palette = [
+            "#176B67", "#2F6FED", "#C45C26", "#1F8A5B",
+            "#7A3EB1", "#B53A4A", "#2A6F7A", "#8A6B1F",
+            "#3D4F8F", "#E94B78", "#28A4E7", "#71C49D",
+        ]
         for person in missing:
+            color = palette[int(person["user_id"]) % len(palette)]
             code, body = client.post(
                 "/question-game/join",
                 {
@@ -260,7 +272,7 @@ def _question_game(client: Client) -> None:
                     "user_id": person["user_id"],
                     "display_name": person["display_name"],
                     "username": person["username"],
-                    "style": {"color": "rehearsal", "color_swatch": "#176B67"},
+                    "style": {"color": "rehearsal", "color_swatch": color},
                 },
             )
             if code == 200:

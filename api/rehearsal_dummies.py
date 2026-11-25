@@ -1,6 +1,6 @@
 """Rehearsal-only fake audience identities for closed-room dry runs.
 
-Reserved Telegram-style numeric IDs in 91001–91006 act as Host Control stand-ins
+Reserved Telegram-style numeric IDs in 91001–91012 act as Host Control stand-ins
 while an agenda is in `rehearsal`. They must never receive packs or affect the
 real verified-member roster after a complete bot sync.
 """
@@ -10,7 +10,7 @@ from typing import Any
 
 # Fixed range so Host Control / ops scripts can recognise rehearsal players.
 REHEARSAL_UID_MIN = 91001
-REHEARSAL_UID_MAX = 91006
+REHEARSAL_UID_MAX = 91012
 
 ROSTER: list[dict[str, str]] = [
     {"user_id": "91001", "display_name": "Sam · Rehearsal", "username": "rehearse_sam"},
@@ -19,6 +19,12 @@ ROSTER: list[dict[str, str]] = [
     {"user_id": "91004", "display_name": "Morgan · Rehearsal", "username": "rehearse_morgan"},
     {"user_id": "91005", "display_name": "Taylor · Rehearsal", "username": "rehearse_taylor"},
     {"user_id": "91006", "display_name": "Charlie · Rehearsal", "username": "rehearse_charlie"},
+    {"user_id": "91007", "display_name": "Avery · Rehearsal", "username": "rehearse_avery"},
+    {"user_id": "91008", "display_name": "Quinn · Rehearsal", "username": "rehearse_quinn"},
+    {"user_id": "91009", "display_name": "Jordan · Rehearsal", "username": "rehearse_jordan"},
+    {"user_id": "91010", "display_name": "Casey · Rehearsal", "username": "rehearse_casey"},
+    {"user_id": "91011", "display_name": "Harper · Rehearsal", "username": "rehearse_harper"},
+    {"user_id": "91012", "display_name": "Rowan · Rehearsal", "username": "rehearse_rowan"},
 ]
 
 

@@ -11,7 +11,7 @@ python3 tools/rehearsal_audience.py --register-members
 
 That script:
 
-1. Optionally registers IDs `91001–91006` on the membership roster (needed for Herd Mentality / Quiz until the API bypass ships).
+1. Optionally registers IDs `91001–91012` on the membership roster (needed for Herd Mentality / Quiz until the API bypass ships).
 2. Watches the rehearsal agenda and auto-joins / answers:
    - Debate volunteers + audience thoughts
    - Herd Mentality / Quiz answers when a question is open
