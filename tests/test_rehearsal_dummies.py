@@ -111,6 +111,8 @@ def test_is_rehearsal_dummy_range():
 
     assert is_rehearsal_dummy("91001")
     assert is_rehearsal_dummy(91006)
+    assert is_rehearsal_dummy(91012)
+    assert is_rehearsal_dummy("91007")
+    assert not is_rehearsal_dummy(91013)
     assert not is_rehearsal_dummy("91000")
-    assert not is_rehearsal_dummy("91007")
     assert not is_rehearsal_dummy("sam")

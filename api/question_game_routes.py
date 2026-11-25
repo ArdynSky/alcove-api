@@ -47,7 +47,7 @@ def bot_member(
         "role": "participant",
     }
     # Same membership gate as Mini App identity(), including configured-host exemption.
-    # Rehearsal dummies (91001–91006) may join while a closed-room rehearsal is running.
+    # Rehearsal dummies (91001–91012) may join while a closed-room rehearsal is running.
     from .live_room_test import _is_host
     from .rehearsal_dummies import allow_bot_rehearsal_dummy
     if not _is_host(user["user_id"]) and not allow_bot_rehearsal_dummy(user["user_id"]):
