@@ -236,11 +236,18 @@ def test_crowd_leaderboard_ties_keep_the_order_last_shown(game):
     board=game.public_state(s)["leaderboard"]
     assert [(r["id"],r["score"],r["previous_position"]) for r in board] == [("3",2,0),("4",2,1),("1",2,2),("2",2,3)]
 
-def test_quiz_has_no_crowd_leaderboard_stage(game):
+def test_quiz_leaderboard_after_answers_reports_round_movement(game):
     s=answer(game,start(game,"quiz",count=1,players=2),["Paris","No"])
     s=quiz_results(game,s)
     while s["stage"] != "all_answers":
         s=game.reveal_next(s)
+    s=game.show_standings(s,now=100)
+    public=game.public_state(s)
+    assert public["stage"] == "leaderboard"
+    assert public["leaderboard_at"] == 100+game.leaderboard_delay(2)
+    rows={r["id"]:r for r in public["leaderboard"]}
+    assert rows["1"]["score"] == 1 and rows["1"]["gained"] == 1
+    assert rows["2"]["score"] == 0 and rows["2"]["gained"] == 0
     with pytest.raises(Exception): game.show_standings(s)
 
 def test_leaderboard_delay_is_bounded(game):

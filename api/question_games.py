@@ -285,9 +285,9 @@ def leaderboard_delay(card_count):
 
 
 def show_standings(state, now=None):
-    """Herd Mentality: after every question the answers clear and the leaderboard holds."""
-    if state["mode"] != "crowd" or state["stage"] != "all_answers":
-        fail("Show all matches before the leaderboard.")
+    """After every question the answers clear and the leaderboard holds (Herd + Quiz)."""
+    if state["mode"] not in {"crowd", "quiz"} or state["stage"] != "all_answers":
+        fail("Show all answers before the leaderboard.")
     now = time.time() if now is None else now
     state.update(stage="leaderboard", active_ids=[], active_kind="",
                  leaderboard_at=now + leaderboard_delay(len(state["submissions"])))
@@ -421,7 +421,9 @@ def public_state(state, user_id=None):
         "round": state["round"], "total_rounds": len(state["questions"]),
         "question": state["questions"][state["round"]-1]["text"] if state["round"] else "",
         "correct_answer": state["questions"][state["round"]-1]["answers"][0]
-                          if state["mode"] == "quiz" and state["stage"] in {"revealing", "all_answers", "finished"} else "",
+                          if state["mode"] == "quiz"
+                          and state["stage"] in {"review", "revealing", "all_answers", "finished", "leaderboard"}
+                          and state["questions"][state["round"]-1].get("answers") else "",
         "ends_at": state["ends_at"], "background_url": state["background_url"],
         "participant_count": len(state["participants"]),
         "joined": any(p["user_id"] == str(user_id) for p in state["participants"]),
