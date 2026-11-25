@@ -78,13 +78,15 @@ class Client:
         self.secret = secret
         self.bot = {"Content-Type": "application/json", "X-Bot-Sync-Secret": secret}
         self.admin = {"Content-Type": "application/json", "X-Alcove-Admin": secret}
-        self._seen_qa = False
+        self._seen_qa_ids: set[str] = set()
         self._answered_rounds: set[tuple[str, int]] = set()
         self._joined_games: set[str] = set()
-        self._debate_joined = False
-        self._thoughts_sent = False
-        self._drawing_joined = False
+        self._debate_session = ""
+        self._thoughts_session = ""
+        self._drawing_session = ""
+        self._drawing_submitted: set[str] = set()
         self._poll_voted: set[str] = set()
+        self._agenda_id = ""
 
     def request(self, method: str, path: str, *, body=None, headers=None):
         url = self.api + path
@@ -108,6 +110,42 @@ class Client:
     def post(self, path: str, body=None, headers=None):
         return self.request("POST", path, body=body or {}, headers=headers or self.bot)
 
+    def post_multipart(self, path: str, fields: dict, files: dict):
+        """POST multipart/form-data (drawing uploads). files: name -> (filename, bytes, content_type)."""
+        boundary = f"----AlcoveRehearsal{int(time.time() * 1000)}"
+        chunks: list[bytes] = []
+        for key, value in fields.items():
+            chunks.append(f"--{boundary}\r\n".encode())
+            chunks.append(f'Content-Disposition: form-data; name="{key}"\r\n\r\n'.encode())
+            chunks.append(str(value).encode())
+            chunks.append(b"\r\n")
+        for key, (filename, blob, content_type) in files.items():
+            chunks.append(f"--{boundary}\r\n".encode())
+            chunks.append(
+                f'Content-Disposition: form-data; name="{key}"; filename="{filename}"\r\n'.encode()
+            )
+            chunks.append(f"Content-Type: {content_type}\r\n\r\n".encode())
+            chunks.append(blob)
+            chunks.append(b"\r\n")
+        chunks.append(f"--{boundary}--\r\n".encode())
+        body = b"".join(chunks)
+        headers = {
+            "Content-Type": f"multipart/form-data; boundary={boundary}",
+            "X-Bot-Sync-Secret": self.secret,
+        }
+        req = urllib.request.Request(self.api + path, data=body, headers=headers, method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=45) as resp:
+                raw = resp.read().decode()
+                return resp.status, json.loads(raw) if raw else {}
+        except urllib.error.HTTPError as exc:
+            raw = exc.read().decode()
+            try:
+                parsed = json.loads(raw)
+            except Exception:
+                parsed = {"detail": raw[:300]}
+            return exc.code, parsed
+
 
 def log(message: str) -> None:
     print(message, flush=True)
@@ -119,6 +157,19 @@ def tick(client: Client) -> None:
     if not agenda or agenda.get("status") != "rehearsal":
         log("Waiting for a rehearsal agenda…")
         return
+    agenda_id = str(agenda.get("id") or "")
+    if agenda_id and agenda_id != client._agenda_id:
+        # New rehearsal run — clear session-scoped caches so dummies rejoin.
+        client._agenda_id = agenda_id
+        client._debate_session = ""
+        client._thoughts_session = ""
+        client._drawing_session = ""
+        client._drawing_submitted.clear()
+        client._joined_games.clear()
+        client._answered_rounds.clear()
+        client._seen_qa_ids.clear()
+        client._poll_voted.clear()
+        log(f"Rehearsal agenda active ({agenda_id[:8]}…) — dummy audience armed")
 
     _debate(client)
     _question_game(client)
@@ -132,10 +183,21 @@ def _debate(client: Client) -> None:
     if st != 200 or not isinstance(state, dict):
         return
     status = state.get("status")
-    if status == "pooling" and not client._debate_joined:
+    session = str(state.get("session_id") or "")
+    if status in {"idle", "ended"}:
+        return
+
+    already = {str(p.get("user_id")) for p in (state.get("participants") or [])}
+    need_join = status in {"pooling", "registration_closed"} and (
+        session != client._debate_session or any(p["user_id"] not in already for p in ROSTER)
+    )
+    if need_join:
+        joined = 0
         for i, person in enumerate(ROSTER):
+            if person["user_id"] in already:
+                continue
             side = "FOR" if i % 2 == 0 else "AGAINST"
-            code, _ = client.post(
+            code, body = client.post(
                 "/debate/join",
                 {
                     "user_id": person["user_id"],
@@ -145,11 +207,15 @@ def _debate(client: Client) -> None:
                 },
             )
             if code == 200:
+                joined += 1
                 log(f"Debate join {person['display_name']} ({side})")
-        client._debate_joined = True
+            else:
+                log(f"Debate join {person['display_name']} failed ({code}): {body}")
+        if joined or len(already) >= len(ROSTER):
+            client._debate_session = session
 
     st, audience = client.get("/debate/audience/submissions")
-    if st == 200 and audience.get("submissions_open") and not client._thoughts_sent:
+    if st == 200 and audience.get("submissions_open") and session != client._thoughts_session:
         contestants = {str(c.get("user_id")) for c in state.get("contestants") or []}
         for i, person in enumerate(ROSTER):
             if person["user_id"] in contestants:
@@ -168,11 +234,7 @@ def _debate(client: Client) -> None:
             )
             if code == 200:
                 log(f"Debate thought {person['display_name']}")
-        client._thoughts_sent = True
-
-    if status in {"idle", "ended"}:
-        client._debate_joined = False
-        client._thoughts_sent = False
+        client._thoughts_session = session
 
 
 def _question_game(client: Client) -> None:
@@ -265,32 +327,93 @@ def _question_game(client: Client) -> None:
         log(f"QG round {round_no} partial answers {ok}/{len(ROSTER)}")
 
 
+def _png_drawing(seed: int, label: str) -> bytes:
+    """Tiny unique PNG so each dummy has a distinct rehearsal drawing."""
+    try:
+        from PIL import Image, ImageDraw
+    except ImportError:
+        Image = None  # type: ignore
+    if Image is None:
+        # Minimal 1x1 PNG fallback (still accepted as image/png).
+        import base64
+
+        return base64.b64decode(
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
+        )
+    hue = (seed * 47) % 360
+    # Approximate HSL → RGB for a saturated wash.
+    import colorsys
+
+    r, g, b = colorsys.hls_to_rgb(hue / 360.0, 0.42, 0.65)
+    color = (int(r * 255), int(g * 255), int(b * 255))
+    img = Image.new("RGB", (640, 480), (12, 18, 28))
+    draw = ImageDraw.Draw(img)
+    draw.rounded_rectangle((40, 40, 600, 440), radius=36, fill=color)
+    draw.ellipse((180, 120, 460, 360), fill=(255, 255, 255, 40) if False else (250, 245, 235))
+    draw.text((70, 60), label[:18], fill=(255, 255, 255))
+    import io
+
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
+
+
 def _drawing(client: Client) -> None:
     st, state = client.get("/team-game/state")
     if st != 200 or not isinstance(state, dict):
         return
     status = state.get("status")
-    if status != "pooling":
-        if status in {"idle", "ended"}:
-            client._drawing_joined = False
+    session = str(state.get("session_id") or "")
+    if status in {"idle", "ended"}:
         return
-    if client._drawing_joined:
+    if session and session != client._drawing_session:
+        client._drawing_session = session
+        client._drawing_submitted.clear()
+
+    if status == "pooling":
+        already = {str(p.get("user_id")) for p in (state.get("participants") or [])}
+        missing = [p for p in ROSTER if p["user_id"] not in already]
+        joined = 0
+        for person in missing:
+            code, body = client.post(
+                "/team-game/join",
+                {
+                    "user_id": person["user_id"],
+                    "display_name": person["display_name"],
+                    "username": person["username"],
+                },
+            )
+            if code == 200:
+                joined += 1
+            else:
+                log(f"Drawing join {person['display_name']} failed ({code}): {body}")
+        if joined:
+            log(f"Drawing join {joined}/{len(missing)} missing dummies")
         return
-    joined = 0
-    for person in ROSTER:
-        code, _ = client.post(
-            "/team-game/join",
+
+    if status != "running":
+        return
+    for index, person in enumerate(ROSTER):
+        uid = person["user_id"]
+        if uid in client._drawing_submitted:
+            continue
+        png = _png_drawing(index + 1, person["display_name"])
+        code, body = client.post_multipart(
+            "/team-game/submit",
             {
-                "user_id": person["user_id"],
+                "user_id": uid,
                 "display_name": person["display_name"],
-                "username": person["username"],
+                "caption": f"Rehearsal sketch by {person['display_name']}",
             },
+            {"file": (f"{person['username']}.png", png, "image/png")},
         )
         if code == 200:
-            joined += 1
-    if joined:
-        log(f"Drawing join {joined}/{len(ROSTER)}")
-        client._drawing_joined = True
+            client._drawing_submitted.add(uid)
+            log(f"Drawing submit {person['display_name']}")
+        elif code == 409 and "already" in str(body).lower():
+            client._drawing_submitted.add(uid)
+        else:
+            log(f"Drawing submit {person['display_name']} failed ({code}): {body}")
 
 
 def _discussion(client: Client) -> None:
@@ -298,9 +421,9 @@ def _discussion(client: Client) -> None:
     discussion = (live or {}).get("room_discussion") if st == 200 and isinstance(live, dict) else {}
     discussion_open = str((discussion or {}).get("status") or "") == "active"
     if not discussion_open:
-        client._seen_qa = False
         return
-    if client._seen_qa:
+    disc_id = str((discussion or {}).get("discussion_id") or (discussion or {}).get("id") or "active")
+    if disc_id in client._seen_qa_ids:
         return
 
     seeded = 0
@@ -327,8 +450,10 @@ def _discussion(client: Client) -> None:
             log(f"Discussion {kind} from {person['display_name']}")
         elif code == 200 and isinstance(body, dict) and "No active discussion" in str(body.get("message") or ""):
             return
+        else:
+            log(f"Discussion {kind} {person['display_name']} failed ({code}): {body}")
     if seeded:
-        client._seen_qa = True
+        client._seen_qa_ids.add(disc_id)
 
 
 def _poll(client: Client) -> None:
