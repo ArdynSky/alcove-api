@@ -4,3 +4,6 @@ __pycache__/
 .local-question-preview/
 .venv/
 live_entry_code.sqlite3
+
+alcove_state.db
+agendas.sqlite3
