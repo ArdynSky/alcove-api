@@ -196,7 +196,7 @@ def make_entries(state):
     } for i, members in enumerate(groups)]
 
 
-def begin_round(state):
+def _start_round_common(state):
     if state.get("quiz_phase") == "results":
         fail("Advance to the next question's results.")
     if state["stage"] not in {"lobby", "all_answers", "quiz_wait", "leaderboard"}:
@@ -209,11 +209,32 @@ def begin_round(state):
     if "shown_standings" in state:
         state["standings"] = state.pop("shown_standings")
     state["round"] += 1
-    state.update(stage="answering", submissions={}, round_points={}, reveal_groups=[],
+    state.update(submissions={}, round_points={}, reveal_groups=[],
                  reveal_index=-1, revealed=[], active_ids=[], active_kind="",
-                 opened_at=time.time(), round_members=[e["id"] for e in state["entries"]])
-    state["ends_at"] = state["opened_at"] + state["seconds"]
+                 round_members=[e["id"] for e in state["entries"]], ends_at=None)
     return state
+
+
+def show_prompt(state):
+    """Publish the question on OBS / host before submissions open."""
+    _start_round_common(state)
+    state.update(stage="prompt", opened_at=None)
+    return state
+
+
+def open_answers(state):
+    """Start the answer timer after the host has read the question aloud."""
+    if state["stage"] != "prompt":
+        fail("Show the question before opening answers.")
+    now = time.time()
+    state.update(stage="answering", opened_at=now, ends_at=now + state["seconds"])
+    return state
+
+
+def begin_round(state):
+    """Legacy one-shot: show the question and open answers immediately."""
+    show_prompt(state)
+    return open_answers(state)
 
 
 def entry_for(state, user_id):

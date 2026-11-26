@@ -24,7 +24,11 @@ def start(game, mode="crowd", size=1, count=2, players=6):
     state = game.create_game(configuration(mode, size, count))
     for n in range(1,players+1):
         state = game.join_game(state, player(n))
-    state = game.begin_round(state)
+    state = game.show_prompt(state)
+    assert state["stage"] == "prompt"
+    assert state["ends_at"] is None
+    state = game.open_answers(state)
+    assert state["stage"] == "answering"
     return state
 
 def answer(game, state, values):
@@ -296,3 +300,23 @@ def test_quiz_no_correct_answers_goes_straight_to_incorrect_answers(game):
     assert public["active_kind"]=="incorrect" and len(public["cards"])==6
     assert all(e["score"]==0 for e in s["entries"])
 
+
+
+def test_prompt_then_open_answers(tmp_path, monkeypatch):
+    monkeypatch.setenv("ALCOVE_QUESTION_GAME_DIR", str(tmp_path))
+    import importlib
+    import api.question_games as game
+    importlib.reload(game)
+    state = game.create_game({
+        "title": "Herd", "mode": "crowd", "team_size": 1, "seconds": 30,
+        "questions": [{"text": "Tea or coffee?", "answers": []}],
+    })
+    state["participants"] = [{"user_id": "1", "display_name": "Sam", "username": "sam", "style": {}}]
+    prompted = game.show_prompt(state)
+    assert prompted["stage"] == "prompt"
+    assert prompted["round"] == 1
+    assert prompted["ends_at"] is None
+    assert game.public_state(prompted)["question"] == "Tea or coffee?"
+    opened = game.open_answers(prompted)
+    assert opened["stage"] == "answering"
+    assert opened["ends_at"]

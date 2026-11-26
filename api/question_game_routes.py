@@ -339,6 +339,10 @@ def action(payload: Action, _=Depends(host)):
         p = payload.payload
         if kind == "begin":
             return q.begin_round(s)
+        if kind == "prompt":
+            return q.show_prompt(s)
+        if kind == "open_answers":
+            return q.open_answers(s)
         if kind == "close":
             return q.close_round(s)
         if kind == "quiz_results":

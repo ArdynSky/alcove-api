@@ -383,16 +383,37 @@ def _drawing(client: Client) -> None:
         client._drawing_submitted.clear()
 
     if status == "pooling":
-        already = {str(p.get("user_id")) for p in (state.get("participants") or [])}
-        missing = [p for p in ROSTER if p["user_id"] not in already]
+        already = {
+            str(p.get("user_id")): p
+            for p in (state.get("participants") or [])
+        }
+        palette = [
+            "#176B67", "#2F6FED", "#C45C26", "#1F8A5B",
+            "#7A3EB1", "#B53A4A", "#2A6F7A", "#8A6B1F",
+            "#3D4F8F", "#E94B78", "#28A4E7", "#71C49D",
+        ]
+        skins = ["foxlove", "pulse", "spotlight", "basechat", "foxlove", "pulse"]
+        colors = ["gold", "rose", "blue", "green", "violet", "base"]
+        # Join missing dummies, and refresh empty styles on ones already seated.
+        targets = [
+            person for person in ROSTER
+            if person["user_id"] not in already
+            or not (already.get(person["user_id"]) or {}).get("style")
+        ]
         joined = 0
-        for person in missing:
+        for person in targets:
+            idx = int(person["user_id"]) % len(palette)
             code, body = client.post(
                 "/team-game/join",
                 {
                     "user_id": person["user_id"],
                     "display_name": person["display_name"],
                     "username": person["username"],
+                    "style": {
+                        "color": colors[idx % len(colors)],
+                        "color_swatch": palette[idx],
+                        "skin": skins[idx % len(skins)],
+                    },
                 },
             )
             if code == 200:
@@ -400,7 +421,7 @@ def _drawing(client: Client) -> None:
             else:
                 log(f"Drawing join {person['display_name']} failed ({code}): {body}")
         if joined:
-            log(f"Drawing join {joined}/{len(missing)} missing dummies")
+            log(f"Drawing join/style refresh {joined}/{len(targets)} dummies")
         return
 
     if status != "running":
