@@ -184,6 +184,27 @@ def _public(row):
         if isinstance(item.get("question_game"), dict):
             template = item.pop("question_game")
             item["question_game_template_id"] = template.get("id")
+        # Host Control only activates question games when kind/type is question_game.
+        # Older rehearsal rows used herd_mentality as the display kind — normalize so
+        # activate starts Herd Mentality instead of leaving the lobby empty.
+        snap = item.get("content_snapshot") if isinstance(item.get("content_snapshot"), dict) else {}
+        label = str(
+            item.get("activity_type_label")
+            or snap.get("activity_type_label")
+            or item.get("title")
+            or ""
+        ).lower()
+        kind = str(item.get("kind") or item.get("type") or "").lower()
+        if "herd" in kind or "herd" in label or str(snap.get("kind") or "").lower() == "herd_mentality":
+            item["kind"] = "question_game"
+            item["type"] = "question_game"
+            if snap:
+                snap = dict(snap)
+                snap["kind"] = "question_game"
+                snap["type"] = "question_game"
+                if not str(snap.get("activity_type_label") or "").strip():
+                    snap["activity_type_label"] = "Herd Mentality"
+                item["content_snapshot"] = snap
         item["starts_at"] = cursor.astimezone(timezone.utc).isoformat()
         duration = max(1, int(item.get("duration_minutes") or 1))
         total += duration

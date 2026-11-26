@@ -285,3 +285,29 @@ class AgendaHttpTests(unittest.TestCase):
         })
         self.assertEqual(bare.status_code, 200, bare.text)
         self.assertEqual(bare.json()["schedule_image_url"], "https://cdn.example/agenda.png")
+
+    def test_herd_mentality_kind_normalizes_to_question_game(self):
+        created = agendas.create_agenda(agendas.AgendaPayload(
+            title="Rehearsal",
+            event_date="2026-08-21",
+            start_time="19:00",
+            timezone="Europe/London",
+            items=[
+                agendas.AgendaItem(
+                    kind="herd_mentality",
+                    title="Herd Mentality",
+                    duration_minutes=15,
+                    content_snapshot={
+                        "type": "question_game",
+                        "kind": "question_game",
+                        "activity_type_label": "Herd Mentality",
+                        "question_game_template_id": "tmpl-herd",
+                    },
+                )
+            ],
+        ))
+        item = created["items"][0]
+        self.assertEqual(item["kind"], "question_game")
+        self.assertEqual(item["type"], "question_game")
+        self.assertEqual(item["content_snapshot"]["kind"], "question_game")
+        self.assertEqual(item["content_snapshot"]["activity_type_label"], "Herd Mentality")

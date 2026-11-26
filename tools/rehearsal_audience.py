@@ -42,15 +42,47 @@ ROSTER = [
 
 DEFAULT_API = "https://alcove-api.onrender.com/api"
 
+# Aligned to Herd Mentality template (pizza / superhero / breakfast / pet /
+# lose / chocolate / holiday / bathroom). Each round mixes a shifting majority
+# with pairs and singles so the herd leaderboard reshuffles between rounds.
 HERD_ANSWERS = [
-    ["Pepperoni", "Pepperoni", "Mushroom", "Pineapple", "Pepperoni", "Olive", "Pepperoni", "Ham", "Pepperoni", "Onion", "Mushroom", "Pepperoni"],
-    ["Blue", "Green", "Blue", "Red", "Blue", "Yellow", "Blue", "Purple", "Blue", "Orange", "Green", "Blue"],
-    ["Toast", "Eggs", "Toast", "Cereal", "Toast", "Porridge", "Toast", "Yoghurt", "Toast", "Fruit", "Eggs", "Toast"],
-    ["Dog", "Cat", "Dog", "Rabbit", "Dog", "Hamster", "Dog", "Fish", "Dog", "Bird", "Cat", "Dog"],
-    ["Tea", "Coffee", "Tea", "Tea", "Chocolate", "Coffee", "Tea", "Water", "Tea", "Juice", "Coffee", "Tea"],
-    ["Spain", "Italy", "Spain", "Greece", "Spain", "France", "Spain", "Portugal", "Spain", "Malta", "Italy", "Spain"],
-    ["Football", "Tennis", "Football", "Rugby", "Football", "Cricket", "Football", "Golf", "Football", "Hockey", "Tennis", "Football"],
-    ["Keys", "Phone", "Keys", "Wallet", "Keys", "Glasses", "Keys", "Watch", "Keys", "Badge", "Phone", "Keys"],
+    # Q1 pizza topping — Pepperoni herd indices 0,2,4,6,10; Mushroom pair 1,8
+    ["Pepperoni", "Mushroom", "Pepperoni", "Pineapple", "Pepperoni", "Olive", "Pepperoni", "Ham", "Mushroom", "Onion", "Pepperoni", "Anchovy"],
+    # Q2 superhero — Batman herd 1,5,7,11; Spider-Man pair 0,8; Superman pair 2,9
+    ["Spider-Man", "Batman", "Superman", "Wonder Woman", "Iron Man", "Batman", "Hulk", "Batman", "Spider-Man", "Superman", "Thor", "Batman"],
+    # Q3 breakfast — Toast herd 2,4,8,9; Eggs pair 0,6; Cereal pair 1,11
+    ["Eggs", "Cereal", "Toast", "Porridge", "Toast", "Yoghurt", "Eggs", "Fruit", "Toast", "Toast", "Pancakes", "Cereal"],
+    # Q4 household pet — Dog herd 1,3,7,9,11; Cat pair 0,5; rest unique
+    ["Cat", "Dog", "Rabbit", "Dog", "Hamster", "Cat", "Fish", "Dog", "Bird", "Dog", "Guinea pig", "Dog"],
+    # Q5 people regularly lose — Keys herd 2,5,8,10; Phone pair 0,4; Wallet pair 3,7
+    ["Phone", "Glasses", "Keys", "Wallet", "Phone", "Keys", "Umbrella", "Wallet", "Keys", "Badge", "Keys", "AirPods"],
+    # Q6 chocolate bar — Mars herd 1,4,6,11; Twix pair 2,8; KitKat pair 5,9
+    ["Dairy Milk", "Mars", "Twix", "Snickers", "Mars", "KitKat", "Mars", "Bounty", "Twix", "KitKat", "Galaxy", "Mars"],
+    # Q7 holiday destination — Italy herd 0,4,7,10; Spain pair 1,6; Greece pair 3,11
+    ["Italy", "Spain", "France", "Greece", "Italy", "Portugal", "Spain", "Italy", "Malta", "Croatia", "Italy", "Greece"],
+    # Q8 bathroom find — Towel herd 1,3,6,9,11; Soap pair 2,7; rest unique
+    ["Toothbrush", "Towel", "Soap", "Towel", "Shampoo", "Mirror", "Towel", "Soap", "Toilet roll", "Towel", "Flannel", "Towel"],
+]
+
+# Quiz: rotating wrong-sets so different dummies miss different rounds (leaderboard moves).
+# Index into ROSTER. ~4–5 wrong each round; overlap shifts so nobody stays on top forever.
+QUIZ_WRONG_BY_ROUND = [
+    {0, 1, 4, 7, 10},
+    {2, 3, 5, 8, 11},
+    {0, 3, 6, 9},
+    {1, 4, 5, 8, 10},
+    {2, 6, 7, 9, 11},
+    {0, 2, 4, 8},
+    {1, 3, 7, 10, 11},
+    {5, 6, 9, 0, 3},
+]
+QUIZ_WRONG_TEXT = [
+    "No idea",
+    "Pass",
+    "Not sure",
+    "Skipped",
+    "Hmm",
+    "Can't remember",
 ]
 
 DEBATE_THOUGHTS = {
@@ -304,10 +336,14 @@ def _question_game(client: Client) -> None:
     questions = state.get("questions") or []
     qrow = questions[round_no - 1] if 0 < round_no <= len(questions) else {}
     ok = 0
+    wrong_set = QUIZ_WRONG_BY_ROUND[(round_no - 1) % len(QUIZ_WRONG_BY_ROUND)]
     for index, person in enumerate(ROSTER):
         if mode == "quiz":
             answers = qrow.get("answers") or ["Paris"]
-            text = answers[0] if index % 2 == 0 else "No idea"
+            if index in wrong_set:
+                text = QUIZ_WRONG_TEXT[index % len(QUIZ_WRONG_TEXT)]
+            else:
+                text = answers[0]
         else:
             bank = HERD_ANSWERS[(round_no - 1) % len(HERD_ANSWERS)]
             text = bank[index % len(bank)]
