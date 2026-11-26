@@ -46,22 +46,22 @@ DEFAULT_API = "https://alcove-api.onrender.com/api"
 # lose / chocolate / holiday / bathroom). Each round mixes a shifting majority
 # with pairs and singles so the herd leaderboard reshuffles between rounds.
 HERD_ANSWERS = [
-    # Q1 pizza topping — Pepperoni herd (5), Mushroom pair, rest unique
+    # Q1 pizza topping — Pepperoni herd indices 0,2,4,6,10; Mushroom pair 1,8
     ["Pepperoni", "Mushroom", "Pepperoni", "Pineapple", "Pepperoni", "Olive", "Pepperoni", "Ham", "Mushroom", "Onion", "Pepperoni", "Anchovy"],
-    # Q2 superhero — Batman herd (4), Spider-Man pair, Superman pair, rest unique
-    ["Batman", "Spider-Man", "Superman", "Batman", "Wonder Woman", "Spider-Man", "Batman", "Iron Man", "Superman", "Hulk", "Batman", "Thor"],
-    # Q3 breakfast — Eggs herd (4), Toast pair, Cereal pair, rest unique
-    ["Eggs", "Toast", "Cereal", "Eggs", "Porridge", "Toast", "Eggs", "Yoghurt", "Cereal", "Fruit", "Eggs", "Pancakes"],
-    # Q4 household pet — Cat herd (5), Dog pair, rest unique
-    ["Cat", "Dog", "Cat", "Rabbit", "Cat", "Hamster", "Dog", "Fish", "Cat", "Bird", "Cat", "Guinea pig"],
-    # Q5 people regularly lose — Phone herd (4), Keys pair, Wallet pair, rest unique
-    ["Phone", "Keys", "Wallet", "Phone", "Glasses", "Keys", "Phone", "Umbrella", "Wallet", "Badge", "Phone", "AirPods"],
-    # Q6 chocolate bar — Dairy Milk herd (3), Mars pair, Twix pair, KitKat pair, rest unique
-    ["Dairy Milk", "Mars", "Twix", "Dairy Milk", "KitKat", "Mars", "Snickers", "Twix", "Dairy Milk", "Bounty", "KitKat", "Galaxy"],
-    # Q7 holiday destination — Spain herd (4), Italy pair, Greece pair, rest unique
-    ["Spain", "Italy", "Greece", "Spain", "France", "Italy", "Spain", "Portugal", "Greece", "Malta", "Spain", "Croatia"],
-    # Q8 bathroom find — Toothbrush herd (5), Towel pair, rest unique
-    ["Toothbrush", "Towel", "Toothbrush", "Soap", "Toothbrush", "Shampoo", "Towel", "Mirror", "Toothbrush", "Toilet roll", "Toothbrush", "Flannel"],
+    # Q2 superhero — Batman herd 1,5,7,11; Spider-Man pair 0,8; Superman pair 2,9
+    ["Spider-Man", "Batman", "Superman", "Wonder Woman", "Iron Man", "Batman", "Hulk", "Batman", "Spider-Man", "Superman", "Thor", "Batman"],
+    # Q3 breakfast — Toast herd 2,4,8,9; Eggs pair 0,6; Cereal pair 1,11
+    ["Eggs", "Cereal", "Toast", "Porridge", "Toast", "Yoghurt", "Eggs", "Fruit", "Toast", "Toast", "Pancakes", "Cereal"],
+    # Q4 household pet — Dog herd 1,3,7,9,11; Cat pair 0,5; rest unique
+    ["Cat", "Dog", "Rabbit", "Dog", "Hamster", "Cat", "Fish", "Dog", "Bird", "Dog", "Guinea pig", "Dog"],
+    # Q5 people regularly lose — Keys herd 2,5,8,10; Phone pair 0,4; Wallet pair 3,7
+    ["Phone", "Glasses", "Keys", "Wallet", "Phone", "Keys", "Umbrella", "Wallet", "Keys", "Badge", "Keys", "AirPods"],
+    # Q6 chocolate bar — Mars herd 1,4,6,11; Twix pair 2,8; KitKat pair 5,9
+    ["Dairy Milk", "Mars", "Twix", "Snickers", "Mars", "KitKat", "Mars", "Bounty", "Twix", "KitKat", "Galaxy", "Mars"],
+    # Q7 holiday destination — Italy herd 0,4,7,10; Spain pair 1,6; Greece pair 3,11
+    ["Italy", "Spain", "France", "Greece", "Italy", "Portugal", "Spain", "Italy", "Malta", "Croatia", "Italy", "Greece"],
+    # Q8 bathroom find — Towel herd 1,3,6,9,11; Soap pair 2,7; rest unique
+    ["Toothbrush", "Towel", "Soap", "Towel", "Shampoo", "Mirror", "Towel", "Soap", "Toilet roll", "Towel", "Flannel", "Towel"],
 ]
 
 # Quiz: rotating wrong-sets so different dummies miss different rounds (leaderboard moves).
