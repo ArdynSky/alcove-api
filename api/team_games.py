@@ -205,11 +205,32 @@ def _clean_style(value):
     return value
 
 
+def _fallback_card_style(user_id):
+    """Deterministic OBS colour/skin when a participant joined without cosmetics."""
+    palette = [
+        "#176B67", "#2F6FED", "#C45C26", "#1F8A5B",
+        "#7A3EB1", "#B53A4A", "#2A6F7A", "#8A6B1F",
+        "#3D4F8F", "#E94B78", "#28A4E7", "#71C49D",
+    ]
+    skins = ["foxlove", "pulse", "spotlight", "basechat"]
+    colors = ["gold", "rose", "blue", "green", "violet", "base"]
+    try:
+        idx = abs(int(str(user_id))) % len(palette)
+    except (TypeError, ValueError):
+        idx = sum(ord(ch) for ch in str(user_id or "")) % len(palette)
+    return {
+        "color": colors[idx % len(colors)],
+        "color_swatch": palette[idx],
+        "skin": skins[idx % len(skins)],
+    }
+
+
 def _participant_style(state, user_id):
     person = _find_participant(state, str(user_id or ""))
     if not person:
-        return {}
-    return _clean_style(person.get("style"))
+        return _fallback_card_style(user_id)
+    style = _clean_style(person.get("style"))
+    return style or _fallback_card_style(user_id)
 
 
 def _decorate_submission(item, state):
@@ -388,7 +409,8 @@ def team_game_join(payload: JoinPayload):
             }
         )
         _save_state(state)
-    elif style and not existing.get("style"):
+    elif style and style != _clean_style(existing.get("style")):
+        # Refresh cosmetics when the member (or rehearsal bot) sends a style.
         existing["style"] = style
         _save_state(state)
     return _public_state(state, uid)
@@ -580,6 +602,11 @@ def team_game_reveal(payload: RevealPayload):
         raise HTTPException(status_code=404, detail="Submission not found")
     state["reveal"] = {"visible": True, "submission_id": sid}
     state["obs_mode"] = "single"
+    # Focusing art (including SHOW WINNING ART) must leave the results board.
+    if state.get("status") == "results":
+        results = dict(state.get("results") or {})
+        results["visible"] = False
+        state["results"] = results
     _save_state(state)
     return _public_state(state)
 
